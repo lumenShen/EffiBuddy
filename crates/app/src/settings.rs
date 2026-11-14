@@ -9,9 +9,9 @@ use effibuddy_agent_core::{
 };
 use effibuddy_computer::ComputerUseMode;
 use effibuddy_ui::{
-    BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, TextInputOptions, TextInputState,
-    TextInputView, Theme, badge, ease_out_cubic, icons, overlay_motion_duration, section_label,
-    switch,
+    BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, Spinner, TextInputOptions,
+    TextInputState, TextInputView, Theme, badge, ease_out_cubic, icons, overlay_motion_duration,
+    section_label, switch,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, Context, Entity, IntoElement, MouseButton, SharedString,
@@ -788,7 +788,7 @@ impl AppView {
             SettingsSection::Agents => self.render_settings_agents(&theme),
             SettingsSection::Archived => self.render_settings_archived(&theme, cx),
             SettingsSection::Appearance => self.render_settings_appearance(&theme, cx),
-            SettingsSection::About => self.render_settings_about(&theme),
+            SettingsSection::About => self.render_settings_about(&theme, cx),
         };
 
         div()
@@ -1312,10 +1312,111 @@ impl AppView {
         )
     }
 
-    fn render_settings_about(&self, theme: &Theme) -> AnyElement {
+    fn render_settings_about(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let current = crate::update::current_version();
+
+        // Version card: running build, then whatever the last check learned.
+        let mut update_rows = vec![stat_row(theme, "当前版本", current)];
+        if self.update.checking {
+            update_rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Spinner::new(theme.accent, 12.0))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .child("正在检查更新…"),
+                    )
+                    .into_any_element(),
+            );
+        } else if let Some(error) = &self.update.error {
+            update_rows.push(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.warning)
+                    .child(error.clone())
+                    .into_any_element(),
+            );
+        } else if let Some(info) = self.available_update() {
+            update_rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .child(format!("最新版本 {}", info.version)),
+                    )
+                    .child(badge(theme, "有可用更新", BadgeTone::Accent))
+                    .into_any_element(),
+            );
+        } else if let Some(latest) = &self.update.latest {
+            update_rows.push(stat_row(
+                theme,
+                "最新版本",
+                &format!("{}（已是最新）", latest.version),
+            ));
+        } else {
+            update_rows.push(stat_row(theme, "最新版本", "尚未检查"));
+        }
+
+        let mut update_buttons = vec![Button::new(
+            "update-check",
+            if self.update.checking {
+                "检查中…"
+            } else {
+                "检查更新"
+            },
+            theme,
+        )
+        .variant(ButtonVariant::Primary)
+        .size(ButtonSize::Sm)
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.start_update_check(cx);
+        }))
+        .into_any_element()];
+        if let Some(info) = self.available_update() {
+            let url = info.html_url.clone();
+            update_buttons.push(
+                Button::new("update-open", "打开发布页", theme)
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        cx.open_url(&url);
+                    }))
+                    .into_any_element(),
+            );
+            update_buttons.push(
+                Button::new("update-skip", "跳过此版本", theme)
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.skip_update(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+
         centered_settings_column(
             div()
                 .child(settings_page_header(theme, "关于", "版本与本地路径"))
+                .child(
+                    settings_card(theme, "版本", "运行中的构建与最新发布")
+                        .children(update_rows)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .children(update_buttons),
+                        ),
+                )
                 .child(
                     settings_card(theme, "运行时", "EffiBuddy · Rust + GPUI")
                         .child(stat_row(theme, "运行时", "effibuddy-agent-core"))

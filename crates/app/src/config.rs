@@ -71,6 +71,18 @@ pub struct AppConfig {
     /// keeps empty workspaces visible and persists them across restarts.
     #[serde(default)]
     pub projects: Vec<PathBuf>,
+    /// Whether the app queries GitHub Releases for a newer version at startup
+    /// (see `update.rs`). The About page offers a manual check regardless.
+    #[serde(default = "default_true")]
+    pub update_check_enabled: bool,
+    /// Release tag the user chose to skip; the update banner stays hidden for
+    /// that version until a newer one is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_skip_version: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_side_bar_open() -> bool {
@@ -123,6 +135,8 @@ impl Default for AppConfig {
             sidebar_collapsed: false,
             sidebar_collapsed_sections: Vec::new(),
             projects: Vec::new(),
+            update_check_enabled: true,
+            update_skip_version: None,
         }
     }
 }
@@ -325,6 +339,29 @@ mod tests {
         assert!(text.contains("\"sidebar_collapsed\":true"));
         let restored: AppConfig = serde_json::from_str(&text).unwrap();
         assert!(restored.sidebar_collapsed);
+    }
+
+    #[test]
+    fn update_fields_roundtrip_and_default() {
+        // Old config files without the keys fall back to enabled + no skip.
+        let legacy: AppConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark"})).unwrap();
+        assert!(legacy.update_check_enabled);
+        assert_eq!(legacy.update_skip_version, None);
+
+        let mut config = AppConfig::default();
+        config.update_check_enabled = false;
+        config.update_skip_version = Some("v0.2.0".to_string());
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("\"update_check_enabled\":false"));
+        assert!(text.contains("\"update_skip_version\":\"v0.2.0\""));
+        let restored: AppConfig = serde_json::from_str(&text).unwrap();
+        assert!(!restored.update_check_enabled);
+        assert_eq!(restored.update_skip_version.as_deref(), Some("v0.2.0"));
+
+        // Skipped version stays out of the file while unset.
+        let plain = serde_json::to_string(&AppConfig::default()).unwrap();
+        assert!(!plain.contains("update_skip_version"));
     }
 
     #[test]

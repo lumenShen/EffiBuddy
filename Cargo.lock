@@ -1725,6 +1725,7 @@ dependencies = [
  "effibuddy-computer",
  "effibuddy-ui",
  "gpui",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",

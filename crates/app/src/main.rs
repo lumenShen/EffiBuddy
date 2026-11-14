@@ -19,6 +19,7 @@ mod store;
 #[cfg(feature = "stress")]
 mod stress;
 mod subagent;
+mod update;
 
 use gpui::{
     App, Application, Bounds, KeyBinding, WindowBounds, WindowOptions, prelude::*, px, size,
@@ -31,6 +32,12 @@ use crate::app::{
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
 
 fn main() {
+    // CI smoke test and packaging scripts read the version headlessly; this
+    // must exit before any window/GPU initialization.
+    if std::env::args().any(|argument| argument == "--version") {
+        println!("effibuddy {}", crate::update::current_version());
+        return;
+    }
     if std::env::args().any(|argument| argument == "--computer-probe") {
         run_computer_probe();
         return;

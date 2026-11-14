@@ -231,6 +231,8 @@ pub struct AppView {
     pub(crate) active: Option<ActiveSession>,
     pub(crate) active_run: Option<ActiveRun>,
     pub(crate) pending_approvals: Vec<PendingApproval>,
+    /// Update check state (see `update.rs`); results arrive via `AppEvent`.
+    pub(crate) update: crate::update::UpdateState,
 
     /// Shared computer-use runtime: consent, frames, pause/stop and the
     /// platform backend. One per app; only the main agent gets the tool.
@@ -541,6 +543,7 @@ impl AppView {
             active,
             active_run: None,
             pending_approvals: Vec::new(),
+            update: Default::default(),
             computer,
             computer_overlay: None,
             self_weak,
@@ -740,6 +743,11 @@ impl AppView {
             }
         })
         .detach();
+
+        // One silent update check per launch, results via the same pump.
+        if view.config.update_check_enabled {
+            view.start_update_check(cx);
+        }
 
         view
     }
@@ -1780,11 +1788,80 @@ impl AppView {
             AppEvent::AgentMessageToMain(message) => self.handle_agent_message_to_main(message, cx),
             AppEvent::AgentMessageDelivered(info) => self.handle_agent_message_delivered(info, cx),
             AppEvent::ComputerOverlay(event) => self.handle_computer_overlay(event, cx),
+            AppEvent::UpdateChecked(result) => self.handle_update_checked(result, cx),
             // Stress deltas are consumed by `stress_observe` above; the arm
             // only keeps the match exhaustive.
             #[cfg(feature = "stress")]
             AppEvent::StressDelta { .. } => {}
         }
+    }
+
+    // --- update check -------------------------------------------------------
+
+    /// Kick off an update check on the shared tokio runtime. The result rides
+    /// the same `AppEvent` pump as harness events, so no extra locking; with
+    /// no runtime (creation failed) this silently does nothing.
+    pub(crate) fn start_update_check(&mut self, cx: &mut Context<Self>) {
+        if self.update.checking {
+            return;
+        }
+        let Some(runtime) = self.runtime.as_ref() else {
+            return;
+        };
+        let client = match crate::update::build_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.update.error = Some(error);
+                cx.notify();
+                return;
+            }
+        };
+        self.update.checking = true;
+        self.update.error = None;
+        self.update.dismissed = false;
+        let tx = self.app_tx.clone();
+        runtime.spawn(async move {
+            let result = crate::update::fetch_latest(&client).await;
+            let _ = tx.send(AppEvent::UpdateChecked(result));
+        });
+        cx.notify();
+    }
+
+    fn handle_update_checked(
+        &mut self,
+        result: Result<Option<crate::update::UpdateInfo>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.update.checking = false;
+        match result {
+            Ok(latest) => {
+                self.update.latest = latest;
+                self.update.error = None;
+            }
+            Err(error) => self.update.error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// The release the banner should offer, if any: strictly newer than the
+    /// running build and not the version the user chose to skip.
+    pub(crate) fn available_update(&self) -> Option<&crate::update::UpdateInfo> {
+        let info = self.update.latest.as_ref()?;
+        if crate::update::is_newer(crate::update::current_version(), &info.version)
+            && self.config.update_skip_version.as_deref() != Some(info.version.as_str())
+        {
+            Some(info)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn skip_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(info) = self.available_update() {
+            self.config.update_skip_version = Some(info.version.clone());
+            let _ = self.config.save();
+        }
+        cx.notify();
     }
 
     // --- computer use overlay ---------------------------------------------
@@ -3065,9 +3142,6 @@ impl AppView {
     }
 
     fn toggle_sidebar_section(&mut self, group: &str, cx: &mut Context<Self>) {
-        // Rows below the section move by its full height; FLIP turns that
-        // layout jump into a paint-time transition.
-        self.motion.begin(MotionSpec::LAYOUT);
         if let Some(index) = self
             .config
             .sidebar_collapsed_sections
@@ -3081,6 +3155,10 @@ impl AppView {
                 .push(group.to_string());
         }
         let _ = self.config.save();
+        // Rows below the section move by its full height; FLIP turns that
+        // layout jump into a paint-time transition. Start after the disk write
+        // so the animation budget is not eaten by config persistence.
+        self.motion.begin(MotionSpec::LAYOUT);
         cx.notify();
     }
 
@@ -4397,6 +4475,66 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Thin one-line update banner above the transcript. Hidden while
+    /// checking, on failure, when the user dismissed it this session, or when
+    /// the release is not newer / was skipped.
+    fn render_update_banner(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let info = self.available_update()?.clone();
+        let theme = self.theme.clone();
+        let url = info.html_url.clone();
+        let banner = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(10.0))
+            .h(px(36.0))
+            .px(px(32.0))
+            .bg(theme.accent_soft)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded(px(999.0))
+                    .bg(theme.accent),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(format!("新版本 {} 可用", info.version)),
+            )
+            .child(
+                Button::new("update-open-release", "查看发布页", &theme)
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(move |_this, _, _, cx| {
+                        cx.open_url(&url);
+                    })),
+            )
+            .child(
+                Button::new("update-skip", "跳过此版本", &theme)
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.skip_update(cx);
+                    })),
+            )
+            .child(
+                IconButton::new("update-dismiss", icons::X, &theme)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.update.dismissed = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element();
+        Some(banner)
+    }
+
     fn render_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme.clone();
         let shared = match self.active_shared() {
@@ -4519,6 +4657,7 @@ impl AppView {
             resolved.model_label().to_string()
         };
 
+        let update_banner = self.render_update_banner(cx);
         let header = div()
             .h(px(52.0))
             .flex()
@@ -4697,6 +4836,7 @@ impl AppView {
             .flex()
             .flex_col()
             .child(header)
+            .children(update_banner)
             .child(body)
             .child(self.render_composer(window, cx))
             .into_any_element()
@@ -5395,7 +5535,7 @@ impl AppView {
             )
             .with_animation(
                 SharedString::from(format!("approval-enter-{}", request.id)),
-                Animation::new(Duration::from_millis(180))
+                Animation::new(overlay_motion_duration())
                     .with_easing(|delta| 1.0 - (1.0 - delta).powi(3)),
                 |element, delta| element.opacity(delta),
             )

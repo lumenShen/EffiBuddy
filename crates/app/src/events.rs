@@ -32,6 +32,10 @@ pub enum AppEvent {
     /// the same pump as harness events so consent/overlay updates stay ordered
     /// with tool results.
     ComputerOverlay(OverlayEvent),
+    /// Update check finished. `Ok(None)` = the repository has no published
+    /// release yet; `Err` = network/rate-limit failure (surfaced only in the
+    /// About page, never as a banner).
+    UpdateChecked(Result<Option<crate::update::UpdateInfo>, String>),
     /// Stress lab (feature `stress`): a sampled sessions-mode harness event
     /// routed through the pump so the dashboard cards can render it.
     #[cfg(feature = "stress")]
