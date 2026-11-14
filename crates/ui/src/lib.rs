@@ -7,6 +7,7 @@
 pub mod assets;
 pub mod button;
 pub mod markdown;
+pub mod motion;
 pub mod primitives;
 pub mod scroll;
 pub mod table;
@@ -19,9 +20,15 @@ pub use markdown::{
     chunk_ranges, markdown_cache_hits, markdown_inline, markdown_source_key, render_markdown,
     render_markdown_chunk, render_markdown_keyed, render_markdown_streaming,
 };
+pub use motion::{
+    CONTROL_MOTION, CubicBezier, Easing, MotionController, MotionFrame, MotionId, MotionItem,
+    MotionSpec, OVERLAY_MOTION, SWITCH_MOTION, ease_out_cubic, mix_color, motion_item,
+    overlay_motion_duration, reduce_motion,
+};
 pub use primitives::{
-    BadgeTone, Spinner, TooltipView, avatar, badge, card, chip, divider, dot, elevated_card,
-    empty_state, kbd, section_label, shadow_float, small_badge, switch, tooltip, vertical_divider,
+    BadgeTone, Spinner, TooltipView, avatar, badge, card, chip, disclosure_chevron, divider, dot,
+    elevated_card, empty_state, kbd, section_label, shadow_float, small_badge, switch, tooltip,
+    vertical_divider,
 };
 pub use scroll::{
     GlideTick, SCROLL_GLIDE_CUTOFF, SCROLL_GLIDE_TAU, ScrollGlide, SmoothScrollHandle,
