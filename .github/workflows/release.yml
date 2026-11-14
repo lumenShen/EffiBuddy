@@ -66,7 +66,26 @@ jobs:
           fi
 
       - name: 构建
-        run: cargo build --release -p effibuddy-app
+        run: |
+          set -o pipefail
+          cargo build --release -p effibuddy-app 2>&1 | tee build.log
+
+      # 匿名拉不到 Actions 日志，把错误尾部写进注解（API 匿名可读）。
+      - name: 失败时输出编译错误注解
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            msg="$(tail -c 3500 build.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':b' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+            echo "::error::Linux 构建失败，日志尾部：%0A$msg"
+          fi
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: 冒烟测试
         run: ./target/release/effibuddy --version
@@ -137,7 +156,27 @@ jobs:
           "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: 构建
-        run: cargo build --release -p effibuddy-app
+        shell: pwsh
+        run: |
+          cargo build --release -p effibuddy-app 2>&1 | Tee-Object -FilePath build.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 失败时输出编译错误注解
+        if: failure()
+        shell: pwsh
+        run: |
+          if (Test-Path build.log) {
+            $log = (Get-Content build.log -Tail 40) -join '%0A'
+            Write-Host "::error::Windows 构建失败，日志尾部：%0A$log"
+          }
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: 冒烟测试
         run: target\release\effibuddy.exe --version
