@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::estimate_tokens;
 use crate::error::ProviderError;
 use crate::ids::new_id;
-use crate::message::{FinishReason, ToolCall, Usage};
+use crate::message::{FinishReason, ImageAttachment, ToolCall, Usage};
 use crate::provider::{ChatRequest, Completion, ModelProvider, ProviderEvent, send_event};
 use crate::providers::{estimate_request_tokens, http_error, sse_data, take_sse_event};
 
@@ -209,16 +209,30 @@ fn build_body(request: &ChatRequest) -> Value {
                     }));
                 }
             }
-            "tool" => input.push(json!({
-                "type": "function_call_output",
-                "call_id": message.tool_call_id.clone().unwrap_or_default(),
-                "output": message.content,
-            })),
+            "tool" => {
+                let output = if message.images.is_empty() {
+                    json!(message.content)
+                } else {
+                    let mut blocks = vec![json!({"type": "input_text", "text": message.content})];
+                    blocks.extend(message.images.iter().map(image_block));
+                    Value::Array(blocks)
+                };
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "output": output,
+                }));
+            }
             _ => {
+                let mut blocks = Vec::new();
                 if !message.content.is_empty() {
+                    blocks.push(json!({"type": "input_text", "text": message.content}));
+                }
+                blocks.extend(message.images.iter().map(image_block));
+                if !blocks.is_empty() {
                     input.push(json!({
                         "role": "user",
-                        "content": [{"type": "input_text", "text": message.content}],
+                        "content": blocks,
                     }));
                 }
             }
@@ -265,6 +279,13 @@ fn build_body(request: &ChatRequest) -> Value {
         body["tool_choice"] = json!("auto");
     }
     body
+}
+
+fn image_block(image: &ImageAttachment) -> Value {
+    json!({
+        "type": "input_image",
+        "image_url": image.data_url(),
+    })
 }
 
 #[derive(Debug)]
@@ -575,6 +596,27 @@ mod tests {
         assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["max_output_tokens"], 256);
         assert_eq!(body["store"], false);
+    }
+
+    #[test]
+    fn wire_body_emits_input_image_parts() {
+        let request = ChatRequest {
+            model: "gpt-5.1".to_string(),
+            messages: vec![ChatMessage::user_with_images(
+                "screenshot",
+                vec![crate::message::ImageAttachment::png("YWJj", 640, 480)],
+            )],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(256),
+            reasoning_effort: None,
+        };
+        let body = build_body(&request);
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(
+            body["input"][0]["content"][1]["image_url"],
+            "data:image/png;base64,YWJj"
+        );
     }
 
     #[test]

@@ -5,10 +5,18 @@ pub mod demo;
 pub mod openai;
 pub mod responses;
 
+// Stress lab (opt-in via the `stress` feature).
+#[cfg(feature = "stress")]
+pub mod stress;
+#[cfg(feature = "stress")]
+pub mod stress_templates;
+
 pub use anthropic::{AnthropicConfig, AnthropicMessagesProvider};
 pub use demo::DemoProvider;
 pub use openai::{OpenAiCompatConfig, OpenAiCompatProvider};
 pub use responses::{OpenAiResponsesConfig, OpenAiResponsesProvider};
+#[cfg(feature = "stress")]
+pub use stress::StressProvider;
 
 use serde_json::Value;
 
@@ -81,6 +89,11 @@ pub(crate) fn estimate_chat_message_tokens(message: &ChatMessage) -> usize {
         total += estimate_tokens(&call.name);
         total += estimate_tokens(&serde_json::to_string(&call.arguments).unwrap_or_default());
     }
+    total += message
+        .images
+        .iter()
+        .map(crate::message::ImageAttachment::estimated_tokens)
+        .sum::<usize>();
     total
 }
 

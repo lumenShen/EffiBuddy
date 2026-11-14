@@ -63,6 +63,44 @@ impl ToolCall {
     }
 }
 
+/// A model-visible image returned by a tool (usually a screenshot).
+///
+/// `data` is base64 so the attachment survives session persistence and can be
+/// embedded in provider payloads without a second encode step. Images are
+/// deliberately kept out of `ToolResult.content`: text truncation must never
+/// cut a raster in half.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    pub mime_type: String,
+    pub data: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+}
+
+impl ImageAttachment {
+    pub fn png(data: impl Into<String>, width: u32, height: u32) -> Self {
+        Self {
+            mime_type: "image/png".to_string(),
+            data: data.into(),
+            width,
+            height,
+        }
+    }
+
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.data)
+    }
+
+    /// Rough vision-token estimate. Anthropic/OpenAI both bill images by
+    /// pixels; 750 pixels/token is the commonly used approximation.
+    pub fn estimated_tokens(&self) -> usize {
+        let pixels = (self.width as usize).saturating_mul(self.height as usize);
+        (pixels / 750).max(85) + 10
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
@@ -75,6 +113,10 @@ pub struct ToolResult {
     /// sees this field; it is not part of the wire request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// Rasters returned by the tool. They are sent to the model as a separate
+    /// image message after the tool result (see `context::build_chat_messages`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl ToolResult {
@@ -86,6 +128,7 @@ impl ToolResult {
             is_error: false,
             duration_ms: None,
             metadata: None,
+            images: Vec::new(),
         }
     }
 
@@ -97,11 +140,17 @@ impl ToolResult {
             is_error: true,
             duration_ms: None,
             metadata: None,
+            images: Vec::new(),
         }
     }
 
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<ImageAttachment>) -> Self {
+        self.images = images;
         self
     }
 

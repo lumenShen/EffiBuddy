@@ -544,11 +544,7 @@ impl AgentHarness {
                 let message_id = self.ensure_assistant(stream);
                 {
                     let mut session = lock_session(&self.session);
-                    if let Some(message) = session
-                        .messages
-                        .iter_mut()
-                        .find(|message| message.id == message_id)
-                    {
+                    if let Some(message) = session.message_by_id(&message_id) {
                         message.push_text(&delta);
                     }
                     session.touch();
@@ -563,11 +559,7 @@ impl AgentHarness {
                 let message_id = self.ensure_assistant(stream);
                 {
                     let mut session = lock_session(&self.session);
-                    if let Some(message) = session
-                        .messages
-                        .iter_mut()
-                        .find(|message| message.id == message_id)
-                    {
+                    if let Some(message) = session.message_by_id(&message_id) {
                         message.push_reasoning(&delta);
                     }
                     session.touch();
@@ -634,11 +626,7 @@ impl AgentHarness {
         let message_id = self.ensure_assistant(stream);
         {
             let mut session = lock_session(&self.session);
-            if let Some(message) = session
-                .messages
-                .iter_mut()
-                .find(|message| message.id == message_id)
-            {
+            if let Some(message) = session.message_by_id(&message_id) {
                 if !final_text.is_empty() {
                     message.set_text(final_text.clone());
                 }
@@ -681,11 +669,7 @@ impl AgentHarness {
         };
         if interrupted {
             let mut session = lock_session(&self.session);
-            if let Some(message) = session
-                .messages
-                .iter_mut()
-                .find(|message| &message.id == message_id)
-            {
+            if let Some(message) = session.message_by_id(message_id) {
                 message.interrupted = true;
             }
             session.touch();
@@ -945,6 +929,7 @@ impl ToolExecutor {
                     ToolResult::success(call, content)
                 };
                 result.metadata = output.metadata;
+                result.images = output.images;
                 result.duration_ms = Some(duration_ms);
                 self.emit(HarnessEvent::ToolCallFinished {
                     result: result.clone(),

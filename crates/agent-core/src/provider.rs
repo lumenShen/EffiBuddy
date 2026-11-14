@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::ProviderError;
-use crate::message::{FinishReason, ToolCall, Usage};
+use crate::message::{FinishReason, ImageAttachment, ToolCall, Usage};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -22,6 +22,11 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ToolCall>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Model-visible images attached to this message. Tool results are emitted
+    /// as text first; `context::build_chat_messages` then appends one user
+    /// message carrying every image from that tool step.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 impl ChatMessage {
@@ -31,6 +36,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -40,6 +46,17 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: None,
+            images: Vec::new(),
+        }
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            images,
         }
     }
 
@@ -49,6 +66,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls,
             tool_call_id: None,
+            images: Vec::new(),
         }
     }
 
@@ -58,6 +76,7 @@ impl ChatMessage {
             content: content.into(),
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
+            images: Vec::new(),
         }
     }
 }

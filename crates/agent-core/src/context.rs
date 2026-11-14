@@ -6,7 +6,7 @@
 
 use chrono::Utc;
 
-use crate::message::{ContentBlock, Message, Role, truncate_chars};
+use crate::message::{ContentBlock, ImageAttachment, Message, Role, truncate_chars};
 use crate::provider::ChatMessage;
 use crate::session::{CompactionRecord, SessionState};
 
@@ -38,6 +38,11 @@ pub fn estimate_message_tokens(message: &Message) -> usize {
             }
             ContentBlock::ToolResult { result } => {
                 total += estimate_tokens(&result.content);
+                total += result
+                    .images
+                    .iter()
+                    .map(ImageAttachment::estimated_tokens)
+                    .sum::<usize>();
                 total += 8;
             }
         }
@@ -68,21 +73,30 @@ pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<C
         )));
     }
 
+    // Images from consecutive tool results must not be interleaved between
+    // tool messages: OpenAI requires every tool result for an assistant
+    // tool-call turn to follow one another. We collect rasters and flush them
+    // as one user message after the whole tool-result run.
+    let mut pending_images: Vec<(String, Vec<ImageAttachment>)> = Vec::new();
+
     for message in session.visible_messages() {
         match message.role {
             Role::System => {
+                flush_tool_images(&mut messages, &mut pending_images);
                 let text = message.text();
                 if !text.is_empty() {
                     messages.push(ChatMessage::system(text));
                 }
             }
             Role::User => {
+                flush_tool_images(&mut messages, &mut pending_images);
                 let text = message.text();
                 if !text.is_empty() {
                     messages.push(ChatMessage::user(text));
                 }
             }
             Role::Assistant => {
+                flush_tool_images(&mut messages, &mut pending_images);
                 let text = message.text();
                 let calls = message.tool_calls();
                 if text.is_empty() && calls.is_empty() {
@@ -92,13 +106,39 @@ pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<C
             }
             Role::Tool => {
                 if let Some(result) = message.tool_result() {
-                    messages.push(ChatMessage::tool(result.call_id, result.content));
+                    messages.push(ChatMessage::tool(
+                        result.call_id.clone(),
+                        result.content.clone(),
+                    ));
+                    if !result.images.is_empty() {
+                        pending_images.push((result.call_id.clone(), result.images.clone()));
+                    }
                 }
             }
         }
     }
+    flush_tool_images(&mut messages, &mut pending_images);
 
     messages
+}
+
+fn flush_tool_images(
+    messages: &mut Vec<ChatMessage>,
+    pending: &mut Vec<(String, Vec<ImageAttachment>)>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let call_ids: Vec<String> = pending.iter().map(|(id, _)| id.clone()).collect();
+    let images: Vec<ImageAttachment> = pending.drain(..).flat_map(|(_, images)| images).collect();
+    messages.push(ChatMessage::user_with_images(
+        format!(
+            "Image output for tool call(s) {}. These are the pixels the next computer action \
+             coordinates refer to; always use the frame_id returned with the screenshot.",
+            call_ids.join(", ")
+        ),
+        images,
+    ));
 }
 
 /// Compact old turns into a rolling summary if the estimated context is above
@@ -279,5 +319,37 @@ mod tests {
     fn estimates_wide_characters_conservatively() {
         assert!(estimate_tokens("你好世界") >= 4);
         assert!(estimate_tokens("hello world") >= 2);
+    }
+
+    #[test]
+    fn tool_images_are_grouped_after_all_tool_results() {
+        let mut session = SessionState::new(PathBuf::from("."), "test-model");
+        session.push_message(Message::user("take a look"));
+        let mut assistant = Message::assistant();
+        let first = ToolCall::new("computer", serde_json::json!({"action": "screenshot"}))
+            .with_id("call_1");
+        let second = ToolCall::new("computer", serde_json::json!({"action": "screenshot"}))
+            .with_id("call_2");
+        assistant.push_tool_call(first.clone());
+        assistant.push_tool_call(second.clone());
+        session.push_message(assistant);
+        session.push_message(Message::from_tool_result(
+            ToolResult::success(&first, "{\"ok\":1}")
+                .with_images(vec![ImageAttachment::png("YQ==", 100, 80)]),
+        ));
+        session.push_message(Message::from_tool_result(
+            ToolResult::success(&second, "{\"ok\":2}")
+                .with_images(vec![ImageAttachment::png("Yg==", 100, 80)]),
+        ));
+
+        let messages = build_chat_messages(&session, "system");
+        // system, user, assistant, tool, tool, one grouped image user message
+        assert_eq!(messages.len(), 6);
+        assert_eq!(messages[3].role, "tool");
+        assert_eq!(messages[4].role, "tool");
+        assert_eq!(messages[5].role, "user");
+        assert_eq!(messages[5].images.len(), 2);
+        assert!(messages[5].content.contains("call_1"));
+        assert!(messages[5].content.contains("call_2"));
     }
 }

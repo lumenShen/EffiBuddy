@@ -233,9 +233,9 @@ impl ModelProvider for OpenAiCompatProvider {
 }
 
 fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
-    messages
-        .iter()
-        .map(|message| match message.role.as_str() {
+    let mut wire = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message.role.as_str() {
             "assistant" => {
                 let calls: Vec<Value> = message
                     .tool_calls
@@ -264,19 +264,52 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
                 if !calls.is_empty() {
                     value["tool_calls"] = Value::Array(calls);
                 }
-                value
+                wire.push(value);
             }
-            "tool" => json!({
-                "role": "tool",
-                "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
-                "content": message.content,
-            }),
-            role => json!({
+            "tool" => {
+                wire.push(json!({
+                    "role": "tool",
+                    "tool_call_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": message.content,
+                }));
+                // Defensive: a tool message carrying pixels is unusual (the
+                // context layer normally groups them into a user message), but
+                // never drop them.
+                if !message.images.is_empty() {
+                    wire.push(user_content_message(message));
+                }
+            }
+            "user" => wire.push(user_content_message(message)),
+            role => wire.push(json!({
                 "role": role,
                 "content": message.content,
-            }),
-        })
-        .collect()
+            })),
+        }
+    }
+    wire
+}
+
+fn user_content_message(message: &ChatMessage) -> Value {
+    if message.images.is_empty() {
+        return json!({
+            "role": "user",
+            "content": message.content,
+        });
+    }
+    let mut parts = Vec::new();
+    if !message.content.is_empty() {
+        parts.push(json!({"type": "text", "text": message.content}));
+    }
+    for image in &message.images {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {"url": image.data_url()},
+        }));
+    }
+    json!({
+        "role": "user",
+        "content": parts,
+    })
 }
 
 enum SseOutcome {
@@ -541,5 +574,20 @@ mod tests {
         let wire = wire_messages(&messages);
         assert!(wire[0]["content"].is_null());
         assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "read_file");
+    }
+
+    #[test]
+    fn wire_messages_emit_image_parts_for_user_messages() {
+        let messages = vec![ChatMessage::user_with_images(
+            "screenshot",
+            vec![crate::message::ImageAttachment::png("YWJj", 640, 480)],
+        )];
+        let wire = wire_messages(&messages);
+        assert_eq!(wire[0]["content"][0]["type"], "text");
+        assert_eq!(wire[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            wire[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,YWJj"
+        );
     }
 }

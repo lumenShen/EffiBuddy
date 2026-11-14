@@ -337,6 +337,9 @@ pub struct ToolOutput {
     /// UI-facing structured data. The harness copies this onto the resulting
     /// [`crate::message::ToolResult`]; it is never sent to the model.
     pub metadata: Option<Value>,
+    /// Model-visible rasters (screenshots). Kept out of `content` so output
+    /// truncation never corrupts an image.
+    pub images: Vec<crate::message::ImageAttachment>,
     /// Tools that completed but failed semantically (for example a subagent
     /// that returned a failed report) mark the observation as an error.
     pub is_error: bool,
@@ -348,6 +351,7 @@ impl ToolOutput {
             content: content.into(),
             effects: Vec::new(),
             metadata: None,
+            images: Vec::new(),
             is_error: false,
         }
     }
@@ -359,6 +363,16 @@ impl ToolOutput {
 
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    pub fn with_image(mut self, image: crate::message::ImageAttachment) -> Self {
+        self.images.push(image);
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<crate::message::ImageAttachment>) -> Self {
+        self.images.extend(images);
         self
     }
 

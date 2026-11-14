@@ -36,6 +36,14 @@ pub mod subagent;
 pub mod tool;
 pub mod workflow_spec;
 
+// Stress lab (opt-in via the `stress` feature): RAM-backed workspaces,
+// process metrics and the virtual `StressProvider`. Compiled out of default
+// builds entirely.
+#[cfg(feature = "stress")]
+pub mod ramfs;
+#[cfg(feature = "stress")]
+pub mod sys_metrics;
+
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -43,8 +51,8 @@ pub use contract::{extract_json_value, validate_json};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use harness::{AgentHandle, AgentHarness, HarnessConfig, HarnessEvent};
 pub use message::{
-    AgentMessageMeta, ContentBlock, FinishReason, Message, Role, TodoItem, TodoStatus, ToolCall,
-    ToolResult, Usage,
+    AgentMessageMeta, ContentBlock, FinishReason, ImageAttachment, Message, Role, TodoItem,
+    TodoStatus, ToolCall, ToolResult, Usage,
 };
 pub use model_config::{
     ApiFormat, DEFAULT_MODEL_ID, DEFAULT_PROVIDER_ID, MODEL_CONFIG_SCHEMA_VERSION,
@@ -65,6 +73,10 @@ pub use providers::{
     AnthropicConfig, AnthropicMessagesProvider, DemoProvider, OpenAiCompatConfig,
     OpenAiCompatProvider, OpenAiResponsesConfig, OpenAiResponsesProvider,
 };
+#[cfg(feature = "stress")]
+pub use providers::{StressProvider, stress::user_prompt as stress_user_prompt};
+#[cfg(feature = "stress")]
+pub use ramfs::RamDir;
 pub use session::{
     ChildRunRecord, CompactionRecord, RunOutcome, RunStatus, SessionState, SharedSession,
     lock_session, new_shared_session,
@@ -74,6 +86,8 @@ pub use subagent::{
     SubagentRequest, SubagentSpawner, SubagentStatus, builtin_subagent_profiles, find_profile,
     normalize_profile_name,
 };
+#[cfg(feature = "stress")]
+pub use sys_metrics::{SysMonitor, SysSample};
 pub use tool::{
     ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, AutoApprovalGate,
     BrokerApprovalGate, DenyApprovalGate, NestedToolInvoker, Tool, ToolContext, ToolEffect,

@@ -8,6 +8,10 @@ description = "Provider-agnostic agent runtime: messages, tools, harness loop"
 
 [features]
 testing = []
+# Stress lab: virtual model provider, RAM-backed workspaces and process
+# metrics. Opt-in only — the default build (including release) contains no
+# stress code at all.
+stress = []
 
 [dependencies]
 async-trait.workspace = true

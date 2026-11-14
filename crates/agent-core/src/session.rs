@@ -5,6 +5,7 @@
 //! sections and emits fine-grained events for things the UI must react to
 //! immediately (stream deltas, approval requests, run lifecycle).
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -167,6 +168,13 @@ pub struct SessionState {
     /// projected over this record by the UI.
     #[serde(default)]
     pub graph: AgentGraphRecord,
+    /// Runtime `message_id → index into messages` map. `messages` is
+    /// append-only (compaction moves `compacted_upto`, never removes), so the
+    /// map stays valid without rebuilds; streamed deltas use it for O(1)
+    /// lookups instead of a linear scan per token. Derived state — rebuilt on
+    /// load, never persisted.
+    #[serde(skip)]
+    pub message_index: HashMap<String, usize>,
 }
 
 fn default_model() -> String {
@@ -202,6 +210,7 @@ impl SessionState {
             agent_description: None,
             child_run: None,
             graph: AgentGraphRecord::default(),
+            message_index: HashMap::new(),
         }
     }
 
@@ -235,8 +244,18 @@ impl SessionState {
         if message.role == Role::User {
             self.maybe_set_title(&message.text());
         }
+        self.message_index
+            .insert(message.id.clone(), self.messages.len());
         self.messages.push(message);
         self.touch();
+    }
+
+    /// O(1) message lookup by id. Falls back to a scan miss when the id is
+    /// stale (the index is rebuilt on load and maintained on push).
+    pub fn message_by_id(&mut self, message_id: &str) -> Option<&mut Message> {
+        let index = *self.message_index.get(message_id)?;
+        let message = self.messages.get_mut(index)?;
+        (message.id == message_id).then_some(message)
     }
 
     fn maybe_set_title(&mut self, text: &str) {
@@ -299,6 +318,14 @@ impl SessionState {
         self.status = RunStatus::Idle;
         self.updated_at = Utc::now();
         self.repair_dangling_tool_calls();
+        self.rebuild_message_index();
+    }
+
+    fn rebuild_message_index(&mut self) {
+        self.message_index.clear();
+        for (index, message) in self.messages.iter().enumerate() {
+            self.message_index.insert(message.id.clone(), index);
+        }
     }
 
     fn repair_dangling_tool_calls(&mut self) {
@@ -320,7 +347,10 @@ impl SessionState {
         for call in calls {
             let result =
                 ToolResult::failure(&call, "Tool execution was interrupted before completion.");
-            self.messages.push(Message::from_tool_result(result));
+            let message = Message::from_tool_result(result);
+            self.message_index
+                .insert(message.id.clone(), self.messages.len());
+            self.messages.push(message);
         }
         if self.compacted_upto > self.messages.len() {
             self.compacted_upto = 0;

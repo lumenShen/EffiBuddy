@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::context::estimate_tokens;
 use crate::error::ProviderError;
 use crate::ids::new_id;
-use crate::message::{FinishReason, ToolCall, Usage};
+use crate::message::{FinishReason, ImageAttachment, ToolCall, Usage};
 use crate::provider::{ChatRequest, Completion, ModelProvider, ProviderEvent, send_event};
 use crate::providers::{estimate_request_tokens, http_error, sse_data, take_sse_event};
 
@@ -225,18 +225,30 @@ fn build_body(request: &ChatRequest) -> Value {
                 }
             }
             "tool" => {
+                let content = if message.images.is_empty() {
+                    json!(message.content)
+                } else {
+                    let mut blocks = vec![json!({"type": "text", "text": message.content})];
+                    blocks.extend(message.images.iter().map(image_block));
+                    Value::Array(blocks)
+                };
                 pending_tool_results.push(json!({
                     "type": "tool_result",
                     "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
-                    "content": message.content,
+                    "content": content,
                 }));
             }
             _ => {
                 flush_tool_results(&mut messages, &mut pending_tool_results);
+                let mut blocks = Vec::new();
                 if !message.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": message.content}));
+                }
+                blocks.extend(message.images.iter().map(image_block));
+                if !blocks.is_empty() {
                     messages.push(json!({
                         "role": "user",
-                        "content": [{"type": "text", "text": message.content}],
+                        "content": blocks,
                     }));
                 }
             }
@@ -273,6 +285,17 @@ fn build_body(request: &ChatRequest) -> Value {
         body["tool_choice"] = json!({"type": "auto"});
     }
     body
+}
+
+fn image_block(image: &ImageAttachment) -> Value {
+    json!({
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": image.mime_type,
+            "data": image.data,
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -510,6 +533,28 @@ mod tests {
         assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["max_tokens"], 128);
+    }
+
+    #[test]
+    fn wire_messages_emit_anthropic_image_blocks() {
+        let request = ChatRequest {
+            model: "claude".to_string(),
+            messages: vec![ChatMessage::user_with_images(
+                "screenshot",
+                vec![crate::message::ImageAttachment::png("YWJj", 640, 480)],
+            )],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: Some(128),
+            reasoning_effort: None,
+        };
+        let body = build_body(&request);
+        assert_eq!(body["messages"][0]["content"][1]["type"], "image");
+        assert_eq!(
+            body["messages"][0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(body["messages"][0]["content"][1]["source"]["data"], "YWJj");
     }
 
     #[test]
