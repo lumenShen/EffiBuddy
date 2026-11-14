@@ -1313,7 +1313,12 @@ impl AppView {
                             .iter()
                             .zip(&summaries)
                             .any(|(old, new)| old.id != new.id);
-                    if grouping_dirty || order_changed {
+                    if grouping_dirty {
+                        // Pin/unpin crosses sidebar groups: a long move that
+                        // users often repeat rapidly — give it the critically
+                        // damped spring so interruption keeps momentum.
+                        this.motion.begin(MotionSpec::SPRING_LAYOUT);
+                    } else if order_changed {
                         // Snapshot the last painted row positions before the
                         // new ordering lands; `MotionItem` turns the delta into
                         // a paint-time FLIP offset.
@@ -3155,10 +3160,11 @@ impl AppView {
                 .push(group.to_string());
         }
         let _ = self.config.save();
-        // Rows below the section move by its full height; FLIP turns that
-        // layout jump into a paint-time transition. Start after the disk write
-        // so the animation budget is not eaten by config persistence.
-        self.motion.begin(MotionSpec::LAYOUT);
+        // Rows below the section move by its full height; a critically damped
+        // spring turns that layout jump into a paint-time transition and
+        // survives rapid toggling. Start after the disk write so the animation
+        // budget is not eaten by config persistence.
+        self.motion.begin(MotionSpec::SPRING_LAYOUT);
         cx.notify();
     }
 
@@ -4525,11 +4531,12 @@ impl AppView {
                     })),
             )
             .child(
-                IconButton::new("update-dismiss", icons::X, &theme)
-                    .on_click(cx.listener(|this, _, _, cx| {
+                IconButton::new("update-dismiss", icons::X, &theme).on_click(cx.listener(
+                    |this, _, _, cx| {
                         this.update.dismissed = true;
                         cx.notify();
-                    })),
+                    },
+                )),
             )
             .into_any_element();
         Some(banner)

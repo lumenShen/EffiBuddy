@@ -22,7 +22,7 @@ pub use markdown::{
 };
 pub use motion::{
     CONTROL_MOTION, CubicBezier, Easing, MotionController, MotionFrame, MotionId, MotionItem,
-    MotionSpec, OVERLAY_MOTION, SWITCH_MOTION, ease_out_cubic, mix_color, motion_item,
+    MotionSpec, OVERLAY_MOTION, SWITCH_MOTION, Spring, ease_out_cubic, mix_color, motion_item,
     overlay_motion_duration, reduce_motion,
 };
 pub use primitives::{

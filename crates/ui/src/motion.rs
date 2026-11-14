@@ -28,6 +28,16 @@
 //! exposes [`MotionController::bounds`] so a ghost can be painted at the last
 //! seen position while it fades out.
 //!
+//! # Curves
+//!
+//! [`MotionSpec::LAYOUT`] uses a fixed 220ms cubic ease-out — the right fit
+//! for short, frequent moves. [`MotionSpec::SPRING_LAYOUT`] swaps in a
+//! critically damped [`Spring`] (no overshoot) whose velocity survives
+//! retargeting, which reads better on long moves that users repeat rapidly,
+//! such as pin/unpin across sidebar groups. Underdamped springs are reserved
+//! for tiny controls (the switch knob via `Spring::SWITCH`); never use them
+//! for lists, menus or transcripts.
+//!
 //! ```ignore
 //! // before mutating the data that drives the list
 //! self.motion.begin(MotionSpec::LAYOUT);
@@ -217,11 +227,131 @@ impl Easing {
     }
 }
 
+/// A damped spring, SwiftUI-style: `response` is the natural period and
+/// `damping_fraction` (ζ) controls the settle.
+///
+/// `ζ = 1.0` is critically damped — the fastest settle with no overshoot;
+/// that is the default for layout transitions. Values below 1 overshoot and
+/// read as playful; use them sparingly (a switch knob), never for lists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spring {
+    pub response: f32,
+    pub damping_fraction: f32,
+}
+
+impl Spring {
+    /// Critically damped layout spring: fast start, natural settle, and
+    /// safe under interruption because velocity carries across retargets.
+    pub const LAYOUT: Self = Self {
+        response: 0.30,
+        damping_fraction: 1.0,
+    };
+
+    /// Slight overshoot for the switch knob only: ~7% of the travel, well
+    /// under a visual wobble.
+    pub const SWITCH: Self = Self {
+        response: 0.24,
+        damping_fraction: 0.65,
+    };
+
+    pub const fn new(response: f32, damping_fraction: f32) -> Self {
+        Self {
+            response,
+            damping_fraction,
+        }
+    }
+
+    fn omega(self) -> f32 {
+        core::f32::consts::TAU / self.response.max(1e-4)
+    }
+
+    /// Rough time until the spring visually settles. Springs have no fixed
+    /// duration; this estimate drives opacity entrances, which must not
+    /// overshoot and therefore use an ease over this window instead.
+    pub fn settle_duration(self) -> Duration {
+        let seconds = (4.0 / (self.damping_fraction.max(0.1) * self.omega())).clamp(0.08, 0.6);
+        Duration::from_secs_f32(seconds)
+    }
+}
+
+/// One spring simulation per animated value. Integrates semi-implicit Euler
+/// and keeps velocity across steps, so retargeting mid-flight stays smooth.
+#[derive(Clone, Debug)]
+pub struct SpringValue {
+    position: f32,
+    velocity: f32,
+    last: Option<Instant>,
+}
+
+const SPRING_SETTLE_EPSILON: f32 = 0.001;
+/// Cap the integration step so a stalled frame loop cannot explode the
+/// simulation; the next real frame continues from wherever it left off.
+const SPRING_MAX_STEP: f32 = 0.05;
+
+impl SpringValue {
+    pub fn at(position: f32) -> Self {
+        Self {
+            position,
+            velocity: 0.0,
+            last: None,
+        }
+    }
+
+    /// Jump to a position and drop the velocity (used by reduced motion).
+    pub fn reset(&mut self, position: f32) {
+        self.position = position;
+        self.velocity = 0.0;
+        self.last = None;
+    }
+
+    /// Advance toward `target`; returns the new position and whether the
+    /// spring has settled (the caller can then stop requesting frames).
+    pub fn step(&mut self, target: f32, spring: Spring, now: Instant) -> (f32, bool) {
+        if (self.position - target).abs() < SPRING_SETTLE_EPSILON
+            && self.velocity.abs() < SPRING_SETTLE_EPSILON
+        {
+            self.position = target;
+            self.velocity = 0.0;
+            self.last = Some(now);
+            return (target, true);
+        }
+
+        let dt = self
+            .last
+            .map(|last| {
+                now.saturating_duration_since(last)
+                    .as_secs_f32()
+                    .min(SPRING_MAX_STEP)
+            })
+            .unwrap_or(0.0);
+        self.last = Some(now);
+
+        if dt > 0.0 {
+            let omega = spring.omega();
+            let stiffness = omega * omega;
+            let damping = 2.0 * spring.damping_fraction * omega;
+            self.velocity += (stiffness * (target - self.position) - damping * self.velocity) * dt;
+            self.position += self.velocity * dt;
+
+            if (self.position - target).abs() < SPRING_SETTLE_EPSILON
+                && self.velocity.abs() < SPRING_SETTLE_EPSILON
+            {
+                self.position = target;
+                self.velocity = 0.0;
+                return (target, true);
+            }
+        }
+        (self.position, false)
+    }
+}
+
 /// Timing for a layout transition.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MotionSpec {
     pub duration: Duration,
     pub easing: Easing,
+    /// When set, positions follow this spring instead of `duration`/`easing`.
+    pub spring: Option<Spring>,
 }
 
 impl MotionSpec {
@@ -230,10 +360,31 @@ impl MotionSpec {
     pub const LAYOUT: Self = Self {
         duration: Duration::from_millis(220),
         easing: Easing::EaseOut,
+        spring: None,
+    };
+
+    /// Critically damped spring for long moves that users can interrupt:
+    /// pin/unpin across sidebar groups, section collapse, future drags.
+    pub const SPRING_LAYOUT: Self = Self {
+        duration: Duration::ZERO,
+        easing: Easing::EaseOut,
+        spring: Some(Spring::LAYOUT),
     };
 
     pub const fn new(duration: Duration, easing: Easing) -> Self {
-        Self { duration, easing }
+        Self {
+            duration,
+            easing,
+            spring: None,
+        }
+    }
+
+    pub const fn spring(spring: Spring) -> Self {
+        Self {
+            duration: Duration::ZERO,
+            easing: Easing::EaseOut,
+            spring: Some(spring),
+        }
     }
 }
 
@@ -348,6 +499,10 @@ struct MotionStore {
     old_bounds: HashMap<MotionId, Bounds<Pixels>>,
     /// Last painted bounds, updated every frame.
     visual_bounds: HashMap<MotionId, Bounds<Pixels>>,
+    /// Per-key spring simulations, present only while a spring transition is
+    /// running. Velocity survives retargeting so interrupted moves keep their
+    /// momentum instead of restarting from rest.
+    springs: HashMap<MotionId, SpringValue>,
 }
 
 impl MotionStore {
@@ -355,11 +510,23 @@ impl MotionStore {
         if self.visual_bounds.is_empty() {
             self.started_at = None;
             self.old_bounds.clear();
+            self.springs.clear();
             return false;
         }
+        let switching_curve = self.spec.spring.is_some() != spec.spring.is_some();
         self.old_bounds = self.visual_bounds.clone();
         self.spec = spec;
         self.started_at = Some(now);
+        if switching_curve || self.spec.spring.is_none() {
+            self.springs.clear();
+        } else {
+            // Interrupted spring: restart progress at the new "from" origin
+            // but keep the velocity so the motion reads as one continuous move.
+            for value in self.springs.values_mut() {
+                value.position = 0.0;
+                value.last = None;
+            }
+        }
         true
     }
 
@@ -369,7 +536,13 @@ impl MotionStore {
         };
         let elapsed = now.saturating_duration_since(started_at);
         let local = elapsed.saturating_sub(delay);
-        let duration = self.spec.duration.as_secs_f32();
+        // Spring transitions have no fixed duration. Opacity entrances must
+        // not overshoot, so they ease across the spring's settle window.
+        let duration = match self.spec.spring {
+            Some(spring) => spring.settle_duration(),
+            None => self.spec.duration,
+        };
+        let duration = duration.as_secs_f32();
         let linear = if duration <= f32::EPSILON {
             1.0
         } else {
@@ -386,8 +559,9 @@ impl MotionStore {
         delay: Duration,
         enter_offset: Point<Pixels>,
     ) -> MotionFrame {
-        let Some(started_at) = self.started_at else {
+        let Some(_started_at) = self.started_at else {
             self.visual_bounds.insert(id.clone(), layout);
+            self.springs.remove(id);
             return MotionFrame {
                 offset: Point::default(),
                 progress: 1.0,
@@ -395,15 +569,30 @@ impl MotionStore {
             };
         };
 
-        let elapsed = now.saturating_duration_since(started_at);
-        let local = elapsed.saturating_sub(delay);
-        let duration = self.spec.duration.as_secs_f32();
-        let linear = if duration <= f32::EPSILON {
-            1.0
+        let (progress, animating) = if let Some(spring) = self.spec.spring {
+            let (progress, settled) = match self.springs.get_mut(id) {
+                Some(value) => value.step(1.0, spring, now),
+                None => {
+                    let mut value = SpringValue::at(0.0);
+                    let result = value.step(1.0, spring, now);
+                    self.springs.insert(id.clone(), value);
+                    result
+                }
+            };
+            // A settled entry stays parked at the target in the map so the
+            // next frame settles immediately instead of restarting from 0.
+            (progress, !settled)
         } else {
-            (local.as_secs_f32() / duration).clamp(0.0, 1.0)
+            let elapsed = now.saturating_duration_since(_started_at);
+            let local = elapsed.saturating_sub(delay);
+            let duration = self.spec.duration.as_secs_f32();
+            let linear = if duration <= f32::EPSILON {
+                1.0
+            } else {
+                (local.as_secs_f32() / duration).clamp(0.0, 1.0)
+            };
+            (self.spec.easing.ease(linear), linear < 1.0)
         };
-        let progress = self.spec.easing.ease(linear);
 
         // An item that existed when the transition began starts from its last
         // painted origin. A new item starts from `enter_offset` relative to its
@@ -430,7 +619,7 @@ impl MotionStore {
         MotionFrame {
             offset,
             progress,
-            animating: linear < 1.0,
+            animating,
         }
     }
 }
@@ -548,7 +737,7 @@ impl Element for MotionItem {
             window.request_animation_frame();
         }
 
-        let defer = self.overlay && frame.progress < 1.0;
+        let defer = self.overlay && (frame.progress < 1.0 || frame.animating);
         if defer {
             let child = self
                 .child
@@ -634,6 +823,142 @@ mod tests {
         let value = Easing::EaseOut.ease(0.5);
         assert!(value > 0.5, "ease-out should be past halfway, got {value}");
         assert!(value <= 1.0);
+    }
+
+    #[test]
+    fn ease_out_cubic_helper_matches_the_chat_entrance_curve() {
+        assert_eq!(ease_out_cubic(0.0), 0.0);
+        assert_eq!(ease_out_cubic(1.0), 1.0);
+        assert!(ease_out_cubic(0.5) > 0.5);
+    }
+
+    #[test]
+    fn mix_color_interpolates_the_track() {
+        let middle = mix_color(gpui::black(), gpui::white(), 0.5);
+        assert!((middle.l - 0.5).abs() < 1e-6);
+        assert_eq!(mix_color(gpui::black(), gpui::white(), 0.0).l, 0.0);
+        assert_eq!(mix_color(gpui::black(), gpui::white(), 1.0).l, 1.0);
+    }
+
+    /// Step a spring toward 1.0 in 16ms frames; returns the peak position and
+    /// whether it settled inside the budget.
+    fn run_spring(spring: Spring, steps: usize) -> (f32, bool, f32) {
+        let mut value = SpringValue::at(0.0);
+        let mut now = Instant::now();
+        let mut peak = 0.0f32;
+        for _ in 0..steps {
+            now += Duration::from_millis(16);
+            let (position, settled) = value.step(1.0, spring, now);
+            peak = peak.max(position);
+            if settled {
+                return (peak, true, position);
+            }
+        }
+        (peak, false, value.position)
+    }
+
+    #[test]
+    fn critically_damped_spring_never_overshoots() {
+        let (peak, settled, final_position) = run_spring(Spring::LAYOUT, 120);
+        assert!(settled, "0.3s critical spring should settle within ~2s");
+        assert!(
+            peak <= 1.0 + 1e-3,
+            "critical damping must not overshoot, peak was {peak}"
+        );
+        assert!((final_position - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn underdamped_spring_overshoots_then_settles() {
+        let (peak, settled, final_position) = run_spring(Spring::SWITCH, 120);
+        assert!(settled, "switch spring should settle within ~2s");
+        assert!(
+            peak > 1.02,
+            "ζ=0.65 should overshoot visibly but mildly, peak was {peak}"
+        );
+        assert!(peak < 1.2, "overshoot must stay tasteful, peak was {peak}");
+        assert!((final_position - 1.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn spring_settle_duration_is_bounded() {
+        for spring in [Spring::LAYOUT, Spring::SWITCH] {
+            let settle = spring.settle_duration();
+            assert!(settle >= Duration::from_millis(80));
+            assert!(settle <= Duration::from_millis(600));
+        }
+    }
+
+    #[test]
+    fn spring_layout_transition_moves_and_settles() {
+        let base = Instant::now();
+        let mut store = MotionStore::default();
+        let a = id("a");
+        seed(&mut store, &a, bounds(0.0, 0.0, 10.0, 10.0), base);
+        assert!(store.begin_at(base, MotionSpec::SPRING_LAYOUT));
+
+        let target = bounds(0.0, 30.0, 10.0, 10.0);
+        let mut now = base;
+        let mut settled = false;
+        let mut saw_motion = false;
+        for _ in 0..120 {
+            now += Duration::from_millis(16);
+            let frame = store.frame_at(now, &a, target, Duration::ZERO, Point::default());
+            if frame.animating {
+                saw_motion = true;
+                assert!(
+                    frame.offset.y <= px(0.0),
+                    "row must travel downward from above, offset was {}",
+                    frame.offset.y
+                );
+            } else {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "spring FLIP must settle");
+        assert!(saw_motion, "spring FLIP must produce intermediate offsets");
+        let last = store.frame_at(now, &a, target, Duration::ZERO, Point::default());
+        assert_eq!(last.offset, Point::default());
+        assert!(!last.animating);
+    }
+
+    #[test]
+    fn interrupted_spring_keeps_momentum() {
+        let base = Instant::now();
+        let mut store = MotionStore::default();
+        let a = id("a");
+        seed(&mut store, &a, bounds(0.0, 0.0, 10.0, 10.0), base);
+        assert!(store.begin_at(base, MotionSpec::SPRING_LAYOUT));
+
+        // Halfway into the first move, retarget further down.
+        let mut now = base;
+        for _ in 0..6 {
+            now += Duration::from_millis(16);
+            store.frame_at(
+                now,
+                &a,
+                bounds(0.0, 20.0, 10.0, 10.0),
+                Duration::ZERO,
+                Point::default(),
+            );
+        }
+
+        assert!(store.begin_at(now, MotionSpec::SPRING_LAYOUT));
+        let frame = store.frame_at(
+            now,
+            &a,
+            bounds(0.0, 80.0, 10.0, 10.0),
+            Duration::ZERO,
+            Point::default(),
+        );
+        // Restarting from the painted position must not teleport the row.
+        assert!(
+            frame.offset.y < px(-20.0),
+            "interrupted spring should start from the painted origin, offset {}",
+            frame.offset.y
+        );
+        assert!(frame.animating);
     }
 
     #[test]

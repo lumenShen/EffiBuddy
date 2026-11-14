@@ -32,8 +32,8 @@ use effibuddy_agent_core::{
 };
 use effibuddy_ui::{
     BadgeTone, GlideTick, IconButton, ScrollGlide, Spinner, Theme, badge, chunk_ranges,
-    disclosure_chevron, icons, markdown_source_key, render_markdown_chunk, render_markdown_keyed,
-    shadow_float, wheel_capture_overlay,
+    disclosure_chevron, icons, markdown_source_key, reduce_motion, render_markdown_chunk,
+    render_markdown_keyed, shadow_float, wheel_capture_overlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -1382,7 +1382,8 @@ pub(crate) fn render_chat_item(
         _ => div().into_any_element(),
     };
 
-    let fresh = !matches!(item.kind, ChatItemKind::RunStatus(_) | ChatItemKind::Empty)
+    let fresh = !reduce_motion()
+        && !matches!(item.kind, ChatItemKind::RunStatus(_) | ChatItemKind::Empty)
         && item.entered_at.elapsed() < ENTER_WINDOW;
     let last_part = view
         .slots

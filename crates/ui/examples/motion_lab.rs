@@ -14,7 +14,7 @@
 use std::time::Duration;
 
 use effibuddy_ui::motion::{MotionController, MotionSpec, motion_item};
-use effibuddy_ui::{Theme, radius};
+use effibuddy_ui::{Theme, disclosure_chevron, radius, switch};
 use gpui::{
     AnyElement, App, Application, Bounds, Context, IntoElement, Render, SharedString, Window,
     WindowBounds, WindowOptions, div, point, prelude::*, px, size,
@@ -26,6 +26,11 @@ struct MotionLab {
     right: Vec<u32>,
     next_id: u32,
     overlay_item: Option<u32>,
+    enabled: bool,
+    expanded: bool,
+    /// A/B switch: critically damped spring vs fixed 220ms ease-out for the
+    /// layout moves, and a slight knob overshoot for the switch.
+    spring: bool,
 }
 
 impl MotionLab {
@@ -36,11 +41,22 @@ impl MotionLab {
             right: vec![2],
             next_id: 3,
             overlay_item: None,
+            enabled: false,
+            expanded: false,
+            spring: false,
+        }
+    }
+
+    fn spec(&self) -> MotionSpec {
+        if self.spring {
+            MotionSpec::SPRING_LAYOUT
+        } else {
+            MotionSpec::LAYOUT
         }
     }
 
     fn swap_parent(&mut self, cx: &mut Context<Self>) {
-        self.motion.begin(MotionSpec::LAYOUT);
+        self.motion.begin(self.spec());
         if let Some(index) = self.left.iter().position(|id| *id == 0) {
             self.left.remove(index);
             self.right.push(0);
@@ -53,18 +69,23 @@ impl MotionLab {
     }
 
     fn reorder(&mut self, cx: &mut Context<Self>) {
-        self.motion.begin(MotionSpec::LAYOUT);
+        self.motion.begin(self.spec());
         self.left.reverse();
         self.overlay_item = None;
         cx.notify();
     }
 
     fn add(&mut self, cx: &mut Context<Self>) {
-        self.motion.begin(MotionSpec::LAYOUT);
+        self.motion.begin(self.spec());
         let id = self.next_id;
         self.next_id += 1;
         self.left.push(id);
         self.overlay_item = None;
+        cx.notify();
+    }
+
+    fn toggle_spring(&mut self, cx: &mut Context<Self>) {
+        self.spring = !self.spring;
         cx.notify();
     }
 
@@ -170,9 +191,10 @@ impl Render for MotionLab {
                         div()
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
-                            .child(
-                                "FLIP reorder, cross-parent swap, enter offset. Layout stays put.",
-                            ),
+                            .child(match self.spring {
+                                false => "Ease: 220ms cubic ease-out · switch knob snaps",
+                                true => "Spring: 0.30s critically damped · knob overshoots ~7%",
+                            }),
                     ),
             )
             .child(
@@ -189,7 +211,64 @@ impl Render for MotionLab {
                     .gap(px(8.0))
                     .child(self.button("swap-parent", "Swap parent", &theme, cx, Self::swap_parent))
                     .child(self.button("reorder", "Reorder", &theme, cx, Self::reorder))
-                    .child(self.button("add", "Add item", &theme, cx, Self::add)),
+                    .child(self.button("add", "Add item", &theme, cx, Self::add))
+                    .child(self.button(
+                        "toggle-spring",
+                        if self.spring {
+                            "Curve: Spring"
+                        } else {
+                            "Curve: Ease"
+                        },
+                        &theme,
+                        cx,
+                        Self::toggle_spring,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(16.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child("Animated switch"),
+                    )
+                    .child({
+                        let mut toggle = switch(&theme, self.enabled).id("lab-switch");
+                        if self.spring {
+                            toggle = toggle.bouncy();
+                        }
+                        toggle.on_click(cx.listener(|this, _, _, cx| {
+                            this.enabled = !this.enabled;
+                            cx.notify();
+                        }))
+                    })
+                    .child(
+                        div()
+                            .id("lab-disclosure")
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.expanded = !this.expanded;
+                                cx.notify();
+                            }))
+                            .child(disclosure_chevron(
+                                "lab-chevron",
+                                self.expanded,
+                                theme.text_muted,
+                                12.0,
+                            ))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Disclosure"),
+                            ),
+                    ),
             )
     }
 }
@@ -199,7 +278,7 @@ fn main() {
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(500.0), px(430.0)),
+                size(px(500.0), px(470.0)),
                 cx,
             ))),
             titlebar: None,
@@ -219,7 +298,13 @@ fn main() {
                         .timer(Duration::from_millis(1200))
                         .await;
                     if handle
-                        .update(cx, |view, _, cx| view.swap_parent(cx))
+                        .update(cx, |view, _, cx| {
+                            // Alternate curves so both paths get exercised.
+                            view.spring = !view.spring;
+                            view.enabled = !view.enabled;
+                            view.expanded = !view.expanded;
+                            view.swap_parent(cx);
+                        })
                         .is_err()
                     {
                         break;

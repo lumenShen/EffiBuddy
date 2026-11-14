@@ -11,7 +11,9 @@ use gpui::{
 };
 
 use crate::assets::icons;
-use crate::motion::{CONTROL_MOTION, SWITCH_MOTION, ease_out_cubic, mix_color, reduce_motion};
+use crate::motion::{
+    CONTROL_MOTION, SWITCH_MOTION, Spring, SpringValue, ease_out_cubic, mix_color, reduce_motion,
+};
 use crate::theme::{Theme, alpha_color, radius, text as text_size};
 
 #[derive(IntoElement)]
@@ -268,6 +270,7 @@ pub fn switch(theme: &Theme, on: bool) -> Switch {
         id: SharedString::from("switch"),
         theme: theme.clone(),
         on,
+        spring: None,
         on_click: None,
     }
 }
@@ -276,6 +279,8 @@ struct SwitchState {
     start: Instant,
     from: f32,
     to: f32,
+    /// Present only when the switch was built with [`Switch::bouncy`].
+    spring: Option<SpringValue>,
 }
 
 impl SwitchState {
@@ -287,19 +292,30 @@ impl SwitchState {
     }
 }
 
+type SwitchClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
+
 /// An animated toggle. The track color crossfades, and the knob travels 14px
 /// (the same 3px border+padding inset the old flex layout used). A stable id
-/// is required for the animation state to survive re-renders.
+/// is required for the animation state to survive re-renders. Opt into a
+/// slight knob overshoot with [`Switch::bouncy`].
 pub struct Switch {
     id: SharedString,
     theme: Theme,
     on: bool,
-    on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
+    spring: Option<Spring>,
+    on_click: Option<SwitchClickHandler>,
 }
 
 impl Switch {
     pub fn id(mut self, id: impl Into<SharedString>) -> Self {
         self.id = id.into();
+        self
+    }
+
+    /// Give the knob a slight spring overshoot (`Spring::SWITCH`, ~7% of the
+    /// travel). Off by default: settings toggles read better without bounce.
+    pub fn bouncy(mut self) -> Self {
+        self.spring = Some(Spring::SWITCH);
         self
     }
 
@@ -377,6 +393,7 @@ impl Element for Switch {
         let target = if self.on { 1.0 } else { 0.0 };
         let now = Instant::now();
         let reduce = reduce_motion();
+        let spring_curve = self.spring;
         let (value, animating) = window.with_element_state(
             global_id.expect("switch requires an element id"),
             |state, _window| {
@@ -385,27 +402,49 @@ impl Element for Switch {
                     start: now - SWITCH_MOTION,
                     from: target,
                     to: target,
+                    spring: spring_curve.map(|_| SpringValue::at(target)),
                 });
-                if state.to != target {
+                if let Some(knob) = state.spring.as_mut() {
+                    let curve = spring_curve.unwrap_or(Spring::SWITCH);
                     if reduce {
+                        knob.reset(target);
                         state.from = target;
                         state.to = target;
                         state.start = now - SWITCH_MOTION;
+                        ((target, false), state)
                     } else {
-                        state.from = state.value_at(now);
-                        state.to = target;
+                        if state.to != target {
+                            state.to = target;
+                        }
+                        // Velocity carries across retargets, so rapid clicks
+                        // keep momentum instead of restarting from rest.
+                        let (position, settled) = knob.step(state.to, curve, now);
+                        state.from = position;
                         state.start = now;
+                        ((position, !settled), state)
                     }
-                }
-                let t = (now.saturating_duration_since(state.start).as_secs_f32()
-                    / SWITCH_MOTION.as_secs_f32())
-                .clamp(0.0, 1.0);
-                let value = if reduce {
-                    target
                 } else {
-                    state.from + (state.to - state.from) * ease_out_cubic(t)
-                };
-                ((value, !reduce && state.from != state.to && t < 1.0), state)
+                    if state.to != target {
+                        if reduce {
+                            state.from = target;
+                            state.to = target;
+                            state.start = now - SWITCH_MOTION;
+                        } else {
+                            state.from = state.value_at(now);
+                            state.to = target;
+                            state.start = now;
+                        }
+                    }
+                    let t = (now.saturating_duration_since(state.start).as_secs_f32()
+                        / SWITCH_MOTION.as_secs_f32())
+                    .clamp(0.0, 1.0);
+                    let value = if reduce {
+                        target
+                    } else {
+                        state.from + (state.to - state.from) * ease_out_cubic(t)
+                    };
+                    ((value, !reduce && state.from != state.to && t < 1.0), state)
+                }
             },
         );
         if animating {
