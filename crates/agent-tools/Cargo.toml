@@ -8,8 +8,10 @@ description = "Built-in tools for the EffiBuddy agent runtime"
 
 [dependencies]
 async-trait.workspace = true
+base64 = "0.22"
 effibuddy-agent-core.workspace = true
 effibuddy-agent-js.workspace = true
+effibuddy-computer.workspace = true
 futures.workspace = true
 regex.workspace = true
 serde_json.workspace = true
@@ -17,7 +19,12 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[features]
+# Stress lab: virtual tool set and the RAM-rooted real-tool set. Opt-in only.
+stress = ["effibuddy-agent-core/stress"]
+
 [dev-dependencies]
 effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
+effibuddy-computer = { path = "../computer-use", features = ["testing"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

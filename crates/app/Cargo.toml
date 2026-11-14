@@ -18,6 +18,7 @@ chrono.workspace = true
 dirs.workspace = true
 effibuddy-agent-core.workspace = true
 effibuddy-agent-tools.workspace = true
+effibuddy-computer.workspace = true
 effibuddy-ui.workspace = true
 gpui.workspace = true
 serde.workspace = true
@@ -26,6 +27,12 @@ similar = { version = "2", features = ["inline"] }
 tokio.workspace = true
 tokio-util.workspace = true
 
+[features]
+# Stress lab: in-app 1000-session/subagent concurrency mode. Opt-in only —
+# the default build contains no stress code.
+stress = ["effibuddy-agent-core/stress", "effibuddy-agent-tools/stress"]
+
 [dev-dependencies]
 effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
+effibuddy-computer = { path = "../computer-use", features = ["testing"] }
 tempfile.workspace = true

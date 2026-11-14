@@ -1,0 +1,42 @@
+[package]
+name = "effibuddy-computer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Screen capture, input injection and desktop isolation for EffiBuddy Computer Use"
+
+[features]
+# Exposes FakeBackend for downstream tests and the UI preview mode.
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+base64 = "0.22"
+futures.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd = { version = "0.12", default-features = false, features = ["async-std"] }
+x11rb = { version = "0.13", features = ["xtest", "composite"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+winapi = { version = "0.3", features = [
+    "basetsd",
+    "handleapi",
+    "libloaderapi",
+    "minwindef",
+    "processthreadsapi",
+    "psapi",
+    "shellapi",
+    "winbase",
+    "windef",
+    "wingdi",
+    "winnt",
+    "winuser",
+] }

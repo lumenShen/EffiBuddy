@@ -4,6 +4,7 @@ mod agents;
 mod app;
 mod chat;
 mod chat_agent;
+mod computer;
 mod config;
 mod events;
 mod graph;
@@ -13,7 +14,10 @@ mod perf;
 mod settings;
 mod side_pane;
 mod smooth;
+// Stress lab — opt-in only (`--features stress`); compiled out of default builds.
 mod store;
+#[cfg(feature = "stress")]
+mod stress;
 mod subagent;
 
 use gpui::{
@@ -27,6 +31,11 @@ use crate::app::{
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--computer-probe") {
+        run_computer_probe();
+        return;
+    }
+
     Application::new()
         .with_assets(EffiBuddyAssets)
         .run(|cx: &mut App| {
@@ -69,7 +78,94 @@ fn main() {
                 if std::env::args().any(|argument| argument == "--preview-composer") {
                     view.seed_composer_preview(window, cx);
                 }
+                if std::env::args().any(|argument| argument == "--preview-computer") {
+                    view.seed_computer_preview(window, cx);
+                }
             });
             cx.activate(true);
         });
+}
+
+/// Headless-ish developer probe for the computer backend:
+///
+/// ```text
+/// cargo run -p effibuddy-app -- --computer-probe status
+/// cargo run -p effibuddy-app -- --computer-probe displays
+/// cargo run -p effibuddy-app -- --computer-probe windows
+/// cargo run -p effibuddy-app -- --computer-probe screenshot --out /tmp/shot.png
+/// ```
+///
+/// On Wayland the first screenshot triggers the desktop portal permission
+/// dialog; this bypasses the agent/consent UI on purpose.
+fn run_computer_probe() {
+    let args: Vec<String> = std::env::args().collect();
+    let action = args.get(2).map(String::as_str).unwrap_or("status");
+    let out = args
+        .iter()
+        .position(|argument| argument == "--out")
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+        .unwrap_or_else(|| "/tmp/effibuddy-computer.png".to_string());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("computer probe runtime");
+    runtime.block_on(async move {
+        let backend = effibuddy_computer::create_backend();
+        match action {
+            "status" => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&backend.platform_info())
+                        .unwrap_or_else(|_| "{}".to_string())
+                );
+            }
+            "displays" => match backend.list_displays().await {
+                Ok(displays) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
+                ),
+                Err(error) => {
+                    eprintln!("displays failed: {error}");
+                    std::process::exit(2);
+                }
+            },
+            "windows" => match backend.list_windows().await {
+                Ok(windows) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&windows).unwrap_or_else(|_| "[]".to_string())
+                ),
+                Err(error) => {
+                    eprintln!("windows failed: {error}");
+                    std::process::exit(2);
+                }
+            },
+            "screenshot" => match backend.capture_screen(None, Some(1280)).await {
+                Ok(capture) => {
+                    if let Err(error) = std::fs::write(&out, &capture.png) {
+                        eprintln!("cannot write {}: {error}", out);
+                        std::process::exit(2);
+                    }
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "saved": out,
+                            "frame": capture.frame,
+                            "bytes": capture.png.len(),
+                        }))
+                        .unwrap_or_else(|_| "{}".to_string())
+                    );
+                }
+                Err(error) => {
+                    eprintln!("screenshot failed: {error}");
+                    std::process::exit(2);
+                }
+            },
+            other => {
+                eprintln!("unknown probe action `{other}`; use status, windows or screenshot");
+                std::process::exit(2);
+            }
+        }
+    });
 }

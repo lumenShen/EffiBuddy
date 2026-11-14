@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod args;
+pub mod computer;
 mod files;
 mod grep;
 pub mod messaging;
@@ -23,7 +24,12 @@ mod todo;
 pub mod workflow;
 pub mod workspace;
 
+// Stress lab (opt-in via the `stress` feature).
+#[cfg(feature = "stress")]
+pub mod stress_tools;
+
 pub use agent::AgentTool;
+pub use computer::ComputerTool;
 pub use files::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use messaging::{AgentListTool, AgentSendTool};
@@ -32,6 +38,9 @@ pub use shell::ShellTool;
 pub use todo::TodoWriteTool;
 pub use workflow::WorkflowTool;
 pub use workspace::Workspace;
+
+#[cfg(feature = "stress")]
+pub use stress_tools::{VirtualWorkspace, stress_real_tools, stress_tools};
 
 use std::path::PathBuf;
 

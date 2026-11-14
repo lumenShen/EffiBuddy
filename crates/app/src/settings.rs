@@ -7,13 +7,15 @@ use effibuddy_agent_core::{
     ApiFormat, ChatMessage, ChatRequest, ModelCapabilities, ModelConfig, ProfileSource,
     ProviderConfig, ResolvedModel, SubagentProfile, list_models, merged_subagent_profiles,
 };
+use effibuddy_computer::ComputerUseMode;
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, TextInputOptions, TextInputState,
-    TextInputView, Theme, badge, icons, section_label, switch,
+    TextInputView, Theme, badge, ease_out_cubic, icons, overlay_motion_duration, section_label,
+    switch,
 };
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, MouseButton, SharedString, Window, div, prelude::*,
-    px, svg,
+    Animation, AnimationExt, AnyElement, Context, Entity, IntoElement, MouseButton, SharedString,
+    Window, div, prelude::*, px, svg,
 };
 use std::path::PathBuf;
 use tokio::sync::mpsc::unbounded_channel;
@@ -98,6 +100,7 @@ pub(crate) struct SettingsState {
     pub workspace: Entity<TextInputState>,
     pub workspace_view: Entity<TextInputView>,
     pub default_mode: PermissionMode,
+    pub computer_use_mode: ComputerUseMode,
     pub demo: bool,
     pub status: Option<(bool, String)>,
     /// Armed session id for the two-step delete on the 归档 page.
@@ -168,6 +171,7 @@ impl SettingsState {
             workspace,
             workspace_view,
             default_mode: config.effective_default_mode(),
+            computer_use_mode: config.computer_use_mode,
             demo: config.use_demo,
             status: None,
             archived_delete_confirm: None,
@@ -240,6 +244,7 @@ impl AppView {
         self.model_menu.open = false;
         self.settings.section = section;
         self.settings.default_mode = self.config.effective_default_mode();
+        self.settings.computer_use_mode = self.config.computer_use_mode;
         self.settings.demo = self.config.use_demo;
         self.settings.status = None;
         self.settings.archived_delete_confirm = None;
@@ -277,7 +282,9 @@ impl AppView {
         // Keep the legacy flag in sync for hand-edited configs; approval itself
         // now goes through ModeApprovalGate.
         self.config.auto_approve_tools = self.settings.default_mode == PermissionMode::FullAccess;
+        self.config.computer_use_mode = self.settings.computer_use_mode;
         self.config.use_demo = self.settings.demo;
+        self.computer.set_mode(self.settings.computer_use_mode);
         match self.config.save() {
             Ok(()) => {
                 self.settings.status = Some((true, "已保存。新任务会使用这些设置。".to_string()));
@@ -928,6 +935,7 @@ impl AppView {
                 .child(
                     settings_card(theme, "行为", "默认安全优先")
                         .child(permission_mode_row(theme, self.settings.default_mode, cx))
+                        .child(computer_use_row(theme, self.settings.computer_use_mode, cx))
                         .child(toggle_row(
                             theme,
                             "强制离线 Demo",
@@ -1312,6 +1320,15 @@ impl AppView {
                     settings_card(theme, "运行时", "EffiBuddy · Rust + GPUI")
                         .child(stat_row(theme, "运行时", "effibuddy-agent-core"))
                         .child(stat_row(theme, "PTC 引擎", "Boa (纯 Rust JavaScript)"))
+                        .child(stat_row(
+                            theme,
+                            "数据环境",
+                            if cfg!(debug_assertions) {
+                                "开发调试（EffiBuddy-Dev）"
+                            } else {
+                                "正式用户（EffiBuddy）"
+                            },
+                        ))
                         .child(stat_row(
                             theme,
                             "会话目录",
@@ -2151,7 +2168,17 @@ impl AppView {
                                 .absolute()
                                 .inset_0(),
                             )
-                        }),
+                        })
+                        .with_animation(
+                            "model-editor-panel-enter",
+                            Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                            |element, delta| element.mt(px(6.0 * (1.0 - delta))),
+                        ),
+                )
+                .with_animation(
+                    "model-editor-backdrop-enter",
+                    Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                    |element, delta| element.opacity(delta),
                 )
                 .into_any_element(),
         )
@@ -2366,6 +2393,95 @@ fn permission_mode_row(
                 .text_size(px(11.5))
                 .text_color(theme.text_faint)
                 .child(description),
+        )
+        .into_any_element()
+}
+
+/// Computer-use preference: off / ask once per conversation / allow by
+/// default. The consent gate enforces the chosen level; this row only stores it.
+fn computer_use_row(
+    theme: &Theme,
+    selected: ComputerUseMode,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    const MODES: [(ComputerUseMode, &str); 3] = [
+        (ComputerUseMode::Off, "关闭"),
+        (ComputerUseMode::Session, "会话内准许"),
+        (ComputerUseMode::Always, "默认准许"),
+    ];
+    let description = match selected {
+        ComputerUseMode::Off => "不注册 computer 工具；输入框不会出现键鼠提示。",
+        ComputerUseMode::Session => {
+            "首次使用时弹一次审批卡；允许后本会话内免打扰。输入框会显示授权状态。"
+        }
+        ComputerUseMode::Always => "所有新会话默认允许，仍可用悬浮条随时接管或停止。",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .py_1()
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child("电脑操作（键鼠模拟）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child("读取屏幕并模拟鼠标键盘 · 仅主代理可用"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .children(MODES.map(|(mode, label)| {
+                    let active = selected == mode;
+                    Button::new(
+                        SharedString::from(format!("computer-mode-{label}")),
+                        label,
+                        theme,
+                    )
+                    .size(ButtonSize::Sm)
+                    .variant(if active {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.computer_use_mode = mode;
+                        cx.notify();
+                    }))
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_faint)
+                        .child(description),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.warning)
+                        .child("需要模型开启视觉能力，截图才能发给模型；Wayland 仅支持全屏。"),
+                ),
         )
         .into_any_element()
 }

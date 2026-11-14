@@ -4,8 +4,10 @@ members = [
     "crates/agent-core",
     "crates/agent-tools",
     "crates/agent-js",
+    "crates/computer-use",
     "crates/ui",
     "crates/app",
+    "crates/stress",
 ]
 
 [workspace.package]
@@ -20,6 +22,7 @@ authors = ["EffiBuddy contributors"]
 effibuddy-agent-core = { path = "crates/agent-core" }
 effibuddy-agent-tools = { path = "crates/agent-tools" }
 effibuddy-agent-js = { path = "crates/agent-js" }
+effibuddy-computer = { path = "crates/computer-use" }
 effibuddy-ui = { path = "crates/ui" }
 
 gpui = "0.2.2"

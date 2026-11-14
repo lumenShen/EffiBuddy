@@ -9,6 +9,7 @@ use std::time::Instant;
 use effibuddy_agent_core::{
     AgentMessage, AgentVisibility, HarnessEvent, SharedSession, SubagentColor, SubagentReport,
 };
+use effibuddy_computer::OverlayEvent;
 
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -27,6 +28,17 @@ pub enum AppEvent {
     /// A message delivered to a child agent. Used by the graph to draw message
     /// edges and update the inspector.
     AgentMessageDelivered(AgentMessageDeliveredInfo),
+    /// Floating computer-use control bar state. Sent from the tool runtime on
+    /// the same pump as harness events so consent/overlay updates stay ordered
+    /// with tool results.
+    ComputerOverlay(OverlayEvent),
+    /// Stress lab (feature `stress`): a sampled sessions-mode harness event
+    /// routed through the pump so the dashboard cards can render it.
+    #[cfg(feature = "stress")]
+    StressDelta {
+        index: usize,
+        event: HarnessEvent,
+    },
 }
 
 #[derive(Clone)]
