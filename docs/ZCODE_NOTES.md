@@ -190,3 +190,38 @@ ZCode 的核心决策，以及 EffiBuddy 的移植方式：
 - 渲染缓存：每次渲染全量重算 diff 解析、词级标注与折叠——列入第 5 节。
 
 验证：`cargo test --workspace` 全部通过，离线 155 个测试（agent-core 65、agent-js 7、agent-tools 21、ui 10、app 52），另有 4 个真实模型测试默认 ignored。本轮新增测试覆盖：权限门决策矩阵与会话 serde 往返（agent-core）、默认模式与面板 MRU（config）、面板评分与排序（app）、表格收集/量宽/导出转义（ui）、diff 解析/词级/折叠纯函数（app side_pane）。
+
+## 8. Computer Use：ZCode 的 a11y-first 与 EffiBuddy 的 visual-first v1
+
+参考：ZCode Computer Use 插件的 `skills/computer-use/SKILL.md` 与 `docs/computer-use.md`（0.6.5）。它面向 macOS/Windows/Linux，核心不是“点坐标”，而是：
+
+- **辅助功能优先**：先观察 AX 树，按 role/title/value 找元素，用元素 index 执行 click/setValue/performAction；坐标只是 canvas/游戏/Electron 的最后手段。
+- **窗口级 observation**：capture 永远绑定一个 app 的一个 window；`window_id` 决定观察和动作的目标，modal 出现时窗口解析会变化。
+- **raster 与坐标绑定**：坐标是“最新返回的 raster”的像素，不是全局屏幕坐标；frame 过期会拒绝，不由模型处理 frame id 变换。
+- **动作后重新观察**：每次动作后必须 `getAXState`，用 diff 减少 token；不要在没有动作时重复观察。
+- **strategy 分层**：`auto/a11y/event`；event 路径要求目标已在前台，后台应用会被 `FOREGROUND_REQUIRED` 拒绝。
+- **单一控制器与停止**：`CONTROLLER_BUSY` 防止多会话抢输入；`stop` / kill switch / 权限拒绝后立即停止，不能换另一种自动化技术绕过。
+- **后台不抢焦点**：观察后台 app（含截图）不抢焦点；只有 Windows 启动非打包 app / 恢复最小化窗口会抢焦点。
+
+EffiBuddy v1 的取舍：
+
+| ZCode 决策 | EffiBuddy 落地 |
+| --- | --- |
+| AX 树优先 | v1 没有 UIA/AT-SPI，先做截图 + 坐标；`ComputerBackend` 预留语义层，后续可加 |
+| 窗口绑定 | X11/Windows 提供窗口级截图；Wayland 只有全屏，`status` 明确降级 |
+| 最新 raster 坐标 | `frame_id` + `FrameInfo`（图像/原生尺寸、原点、缩放）；stale frame 失败关闭 |
+| 动作后观察 | 工具描述强制“截图→动作→再截图”；不自动附加截图，避免每步双倍图片 |
+| a11y/event strategy | v1 用 `auto/background/foreground`；Windows 停车窗口走后台消息，忽略消息时回退前台 SendInput |
+| 单一控制器 | 只有一个主代理 `computer` 工具；子代理被显式过滤；运行时有 stopped/paused |
+| 随时停止 | 悬浮条“接管操作 / 我帮你点好了 / 停止操作”；停止撤销授权并 `interrupt` |
+| 后台不打扰 | X11 专用 EWMH workspace；Windows 后台停车位；Wayland 当前桌面（无法隔离） |
+| 授权 | 独立 `ComputerApprovalGate`：Session 首次必弹卡，FullAccess 也不能绕过；Plan 拒绝修改类动作 |
+
+刻意没做的：
+
+- UIA/AT-SPI 元素树与语义动作（v2）；
+- PipeWire ScreenCast 窗口流（Wayland 窗口级读图）；
+- Windows 未公开的虚拟桌面 COM（改用后台停车位）；
+- 自动截图回传（模型显式 `screenshot`，避免上下文被图片淹没）。
+
+验证：`cargo test --workspace` 242 个离线测试全绿；在 Fedora 45/GNOME Wayland 上用 `--computer-probe screenshot` 实际走通 xdg-desktop-portal 截图（2560×1600 → 1280×800），并用 `--preview-computer` 目视确认悬浮条与输入框提示；Windows 后端因当前环境没有交叉工具链，未实机编译验证。

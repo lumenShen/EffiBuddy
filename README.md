@@ -4,9 +4,9 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust)
 ![GPUI](https://img.shields.io/badge/UI-GPUI-18181B)
-![Platform](https://img.shields.io/badge/platform-Windows-0078D4?logo=windows)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
-![Tests](https://img.shields.io/badge/tests-156%20offline-brightgreen)
+![Tests](https://img.shields.io/badge/tests-242%20offline-brightgreen)
 
 ![EffiBuddy 聊天界面](docs/screenshots/light-chat.png)
 
@@ -36,6 +36,7 @@
 - **原生桌面 UI（GPUI）**：无 WebView。自绘标题栏、可折叠（`Ctrl+B`）为图标栏的会话侧栏、聊天流、紧凑工具行、可关闭/重开/搜索的右侧页签侧栏、设置页、Markdown 渲染、多行输入框与 IME 支持。
 - **ZCode 风格的聊天流**：虚拟列表只布局可视区域；流式回答按帧平滑吐字并带光标；思考与工具调用以紧凑活动行呈现，连续工具调用自动分组；右上状态胶囊与上下文仪表；`Ctrl K` 命令面板；自动吸底，上滚时暂停跟随并浮出「回到底部」按钮。
 - **完整的 agent loop**：持久 transcript、step = 模型调用 + 工具调用、无步数上限（持续运行直到模型不再请求工具）、可中断、四档权限模式（Shift+Tab 循环：默认询问 / 自动编辑 / 计划模式 / 完全访问）与工具审批、超时/panic 隔离、输出截断、只在可见输出前重试、按用户轮次滚动压缩上下文、reasoning 与正文分离。
+- **Computer Use（桌面读图与键鼠）**：主代理可截图、找窗口、模拟鼠标键盘；窗口/全屏画面以 `frame_id` 绑定坐标，动作后重新观察。默认“会话内准许”授权，首次使用弹审批卡；运行时显示顶部悬浮条，可随时“接管操作 / 我帮你点好了 / 停止操作”。X11 支持窗口级读图与专用 EWMH 工作区，Windows 使用 PrintWindow + 后台停车位，Wayland 通过 portal 支持全屏读图与键鼠。
 - **代理网络**：子代理可命名、可自定义提示词/工具、可继续派生孙代理；`agent_send` / `agent_list` 支持代理间文本与结构化数据；每个代理对象可选私有（仅创建者）或公开（会话内可复用），只读父代理不会派生出可写子代理。
 - **智能体组与关系图**：`workflow_run` 用 JSON 或 JavaScript builder 定义带类型化输入/输出契约的 DAG（支持批量输入）；标题栏「智能体关系图」提供可平移缩放的画布、委派/消息/数据连线、组框与节点检查器。
 - **PTC 工具调用**：模型写一段同步 JavaScript，通过 `tools.*` 编排多次工具调用，只把聚合结果带回上下文。解释器是纯 Rust 的 Boa，无 C/C++ 依赖。
@@ -52,16 +53,19 @@
 
 | 依赖 | 要求 |
 | --- | --- |
-| 系统 | Windows 10/11 x64（当前主要验证平台） |
-| Rust | 1.90+，MSVC 工具链（本项目在 1.96 上验证） |
-| C++ 构建工具 | Visual Studio 2022 Build Tools，勾选「使用 C++ 的桌面开发」与 Windows SDK |
+| 系统 | Windows 10/11 x64；Linux（X11 完整能力，Wayland 全屏能力） |
+| Rust | 1.90+（Windows 使用 MSVC 工具链；Linux 使用发行版 Rust） |
+| C++ 构建工具 | Windows 需要 Visual Studio 2022 Build Tools，勾选「使用 C++ 的桌面开发」与 Windows SDK |
+| Linux 依赖 | X11 需要 `libxcb`/`libxkbcommon`；Wayland 需要 xdg-desktop-portal（GNOME/KDE 均可） |
 
-不需要 Node.js，也不需要 WebView2。
+不需要 Node.js，也不需要 WebView2。Computer Use 在 Windows 上使用 Win32 API，在 Linux 上使用 X11/XTest 或 XDG Portal；默认 DeepSeek 模型不支持视觉，需要切换到支持图片输入的模型。
 
 ```bash
 cargo run -p effibuddy-app            # 调试运行
 cargo run -p effibuddy-app --release  # 发布构建
 ```
+
+开发与用户数据自动隔离：调试构建（默认 `cargo run`）的数据写入 `<数据目录>/EffiBuddy-Dev/`，`--release` 构建才使用 `<数据目录>/EffiBuddy/`（Windows 即 `%LOCALAPPDATA%`），互不干扰。不做自动迁移——想把已有历史带进开发目录，手动搬文件夹或设 `EFFIBUDDY_DATA_DIR` 即可。
 
 没有 API Key 时会自动进入离线 **Demo 模式**，可以完整走通 UI 与工具卡片交互。
 
@@ -130,11 +134,23 @@ cargo run -p effibuddy-app -- --preview --preview-models    # 模型供应商设
 cargo run -p effibuddy-app -- --preview --preview-sidepane-files    # 右侧「文件」页签
 cargo run -p effibuddy-app -- --preview --preview-sidepane-changes  # 右侧「变更」页签
 cargo run -p effibuddy-app -- --preview-composer            # 输入框塞入超长文本，验证裁剪与滚动
-cargo run -p effibuddy-app -- --preview-empty               # 空状态 / 欢迎页
-cargo run -p effibuddy-app -- --settings                    # 直接打开设置页
-cargo run -p effibuddy-app -- --settings-models             # 直接打开设置 → 模型
-cargo run -p effibuddy-app -- --preview --dark              # 强制深色
+cargo run -p effibuddy-app -- --preview-computer             # 电脑操作悬浮条 + 输入框提示（FakeBackend）
+cargo run -p effibuddy-app -- --preview-empty                # 空状态 / 欢迎页
+cargo run -p effibuddy-app -- --settings                     # 直接打开设置页
+cargo run -p effibuddy-app -- --settings-models              # 直接打开设置 → 模型
+cargo run -p effibuddy-app -- --preview --dark               # 强制深色
 ```
+
+### Computer Use 自检
+
+```bash
+cargo run -p effibuddy-app -- --computer-probe status              # 平台/后端/能力
+cargo run -p effibuddy-app -- --computer-probe displays            # 显示器（Wayland 首次会弹 portal）
+cargo run -p effibuddy-app -- --computer-probe windows             # 窗口列表（X11/Windows）
+cargo run -p effibuddy-app -- --computer-probe screenshot --out /tmp/effi.png
+```
+
+Wayland 首次截图会触发 xdg-desktop-portal 的屏幕读取授权；输入则额外需要“远程控制”授权。详见 [docs/COMPUTER_USE.md](docs/COMPUTER_USE.md)。
 
 ## 工作区结构
 
@@ -146,6 +162,8 @@ crates/
   agent-tools/   内置工具、workspace 路径沙箱、PTC 的 run_js 工具、
                  agent 委派 / agent_send / agent_list / workflow_run
   agent-js/      Boa 沙箱：同步 JS、console 捕获、工具桥、限额与取消
+  computer-use/  桌面读图与键鼠：ComputerRuntime（授权/frame/暂停/停止）、
+                 X11 / Wayland / Windows 后端、FakeBackend
   ui/            中性白灰黑设计系统：theme tokens、Button、TextInput、
                  Markdown、Spinner、Card、Badge 等
   app/           GPUI 应用壳：窗口、侧边栏、虚拟化聊天流（chat.rs）、
@@ -153,7 +171,7 @@ crates/
                  代理消息卡片（chat_agent.rs）、侧页签、设置页、事件泵、本地持久化
 ```
 
-依赖方向严格单向：`app → agent-tools → agent-js`，`app / agent-tools → agent-core`，`app → ui`。`agent-core` 不依赖 UI，也不依赖具体工具。`app` 内部按职责拆分：`agents/` 只负责执行与寻址，`graph/` 只负责可视化，二者通过事件与会话里的 `AgentGraphRecord` 解耦。
+依赖方向严格单向：`app → agent-tools → agent-js`，`agent-tools → computer-use`，`app / agent-tools → agent-core`，`app → ui`。`agent-core` 不依赖 UI，也不依赖具体工具或平台后端。`app` 内部按职责拆分：`agents/` 只负责执行与寻址，`graph/` 只负责可视化，`computer.rs` 只负责悬浮条与电脑授权门，二者通过事件与会话里的 `AgentGraphRecord` 解耦。
 
 ## Agent Loop
 
@@ -338,36 +356,50 @@ return g.spec;
 | `agent_send` | 自动 | 向 name/id 发送文本或 JSON；空闲目标会被唤醒 |
 | `agent_list` | 自动 | 列出调用者可见的代理与组 |
 | `workflow_run` | 询问 | 执行智能体组 DAG（JSON 或 JS builder），带类型化输入/输出与批量运行 |
+| `computer` | 询问* | 桌面读图与键鼠模拟（仅主代理）；首次使用由独立电脑授权门控制，详见 [docs/COMPUTER_USE.md](docs/COMPUTER_USE.md) |
 
-所有文件工具都被限制在 workspace 内（路径规范化后校验前缀），`..` 越界会被拒绝。
+所有文件工具都被限制在 workspace 内（路径规范化后校验前缀），`..` 越界会被拒绝。`computer` 的“询问*”不是普通权限模式：会话内首次使用必定弹审批卡，完全访问模式也不能跳过。
 
 ## 配置与持久化
 
+数据根目录按构建类型分离（Linux 为 `~/.local/share`，Windows 为 `%LOCALAPPDATA%`；`EFFIBUDDY_DATA_DIR` 环境变量可整体覆盖）：
+
+| 构建 | 数据根目录 |
+| --- | --- |
+| 调试（默认 `cargo run` / `cargo test`） | `<数据目录>\EffiBuddy-Dev\` |
+| 发布（`--release`，即交付用户的构建） | `<数据目录>\EffiBuddy\` |
+
+数据根目录下的具体文件：
+
 | 内容 | 位置 |
 | --- | --- |
-| 配置 | `%LOCALAPPDATA%\EffiBuddy\config.json` |
-| 模型注册表 | `%LOCALAPPDATA%\EffiBuddy\providers.json` |
-| 会话 | `%LOCALAPPDATA%\EffiBuddy\sessions\<uuid>.json` |
+| 配置 | `<数据根目录>\config.json` |
+| 模型注册表 | `<数据根目录>\providers.json` |
+| 会话 | `<数据根目录>\sessions\<uuid>.json` |
 | 子代理会话 | 同一目录，带 `parent_id`，不进入顶层会话列表 |
-| API Key 文件 | `%LOCALAPPDATA%\EffiBuddy\deepseekAPIKey.env` |
+| 用户级代理档案 | `<数据根目录>\agents\*.md` |
+| API Key 文件 | `<数据根目录>\deepseekAPIKey.env` |
 | 兜底目录 | 本地数据目录不可写时回退到 `<cwd>\.effibuddy\sessions` |
+
+两个目录互不迁移：调试产生的会话/配置不会混入正式数据，正式版数据也不会被调试构建读写。需要把已有历史带进另一个目录时，手动搬文件夹或设置 `EFFIBUDDY_DATA_DIR` 即可。设置 →「关于」页的「数据环境」一行会显示当前构建实际使用的目录。
 
 设置页分为「通用 / 模型 / 外观 / 关于」：通用页修改工作区、是否强制 Demo、是否自动批准工具；模型页管理供应商与模型；外观页切换主题。左侧栏的折叠状态，以及右侧页签侧栏的打开状态、宽度、页签顺序与最近关闭记录，都保存在 `config.json`。预览模式创建的会话不会写入磁盘。
 
 ## 测试
 
 ```bash
-cargo test --workspace   # 155 个离线测试
-cargo build --workspace  # 无警告
+cargo test --workspace   # 242 个离线测试
+cargo build --workspace  # 构建通过（gpui 自带 future-incompat 提示）
 ```
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 65 | loop、压缩、provider 请求体/SSE、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
+| `agent-core` | 81 | loop、压缩、provider 请求体/SSE、图片附件 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 `run_js` 禁止 |
-| `agent-tools` | 21 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流 |
-| `ui` | 10 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护 |
-| `app` | 52 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠 |
+| `agent-tools` | 32 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
+| `ui` | 35 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
+| `app` | 70 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门 |
 
 真实 DeepSeek 测试默认忽略，需要 Key：
 
@@ -389,19 +421,33 @@ cargo test -p effibuddy-agent-tools --test deepseek_live -- --ignored --nocaptur
 - 会话与配置只写入本机 `%LOCALAPPDATA%\EffiBuddy\`，没有遥测与外部上报。
 - 应用不会自动执行模型给出的 shell 命令；shell 一定经过审批门。
 - 文件工具被限制在工作区内，路径规范化后拒绝越界。
+- 电脑操作默认“会话内准许”：首次使用必须显式批准；完全访问模式也不能跳过。点击/输入可随时用悬浮条接管或停止，停止会立即中断当前任务。
+- Wayland 截图走系统 Screenshot portal；输入额外需要 RemoteDesktop 授权。应用不会绕过系统权限对话框。
 
 ## 已知边界
 
-- 目前以 Windows 为主要目标平台（GPUI 在 Windows 上验证）；代码通过 GPUI 抽象保持可移植。
+- 目前以 Windows 与 Linux 为目标平台；Linux 下 X11 具备完整窗口级能力，Wayland 仅全屏读图/输入。Windows 代码在本仓库的 Linux 开发环境中无法实机编译验证，需要 Windows 机器过一遍 `cargo check` 与 probe。
+- Computer Use v1 没有辅助功能树（UIA/AT-SPI），复杂自绘界面依赖视觉坐标；Wayland 不支持窗口枚举/窗口级截图/桌面隔离；悬浮条在 Wayland 无法保证置顶或顶部居中。
+- 默认 DeepSeek 模型没有视觉能力；需要在设置 → 模型中启用支持图片输入的模型，截图才能发给模型。
 - Boa 无抢占式中断，恶意脚本可能耗尽 CPU，直到循环/超时限制触发。
 - 子代理在同一进程内运行、共享同一个模型 Provider；暂不支持 fork、worktree 隔离、远程子代理或子代理再派生子代理。
 - 后台子代理的通知只会唤醒创建它的父会话；应用重启后，历史子会话仍可读取，但任务面板不会自动恢复运行状态。
 - 上下文压缩是启发式摘要，极端长会话仍可能丢失细节。
 - 项目处于早期阶段（0.1.0），接口与数据格式仍可能变化。
 
+## 压测实验室
+
+**1000 路并发会话/子代理 × 每路 500 tok/s × 虚拟模型数据 × 内存工作区（零硬盘写入）**，用于后端与前端性能的极限测试。默认构建不含压测代码（独立 crate `crates/stress` + `stress` feature 门控）。模式、旗标、指标解读与实测基准见 [docs/STRESS_LAB.md](docs/STRESS_LAB.md)。
+
+```bash
+cargo run --release -p effibuddy-stress -- --mode sessions --n 1000 --seconds 30   # headless 后端极限
+cargo run --release -p effibuddy-app --features stress -- --stress 1000            # 应用内（真实 UI 泵）
+```
+
 ## 文档
 
 - [架构说明](docs/ARCHITECTURE.md)
+- [Computer Use 使用与平台矩阵](docs/COMPUTER_USE.md)
 - [ZCode 学习笔记与移植清单](docs/ZCODE_NOTES.md)
 - [环境变量示例](.env.example)
 - 截图：[docs/screenshots](docs/screenshots)

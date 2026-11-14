@@ -15,7 +15,7 @@ EffiBuddy 是一个**单进程、可派生子代理**的桌面工具：
 - 所有工具默认在工作区路径沙箱内运行，写操作经过审批门；
 - 会话与配置本地持久化，不上报任何数据。
 
-暂不包含：子代理的 fork/worktree 隔离、远程执行、插件系统、Windows 之外平台的实机验证。
+暂不包含：子代理的 fork/worktree 隔离、远程执行、插件系统；Windows 之外的完整平台实机验证（Linux X11/Wayland 已完成开发机验证，Windows 仍以 Windows 机器为准）。
 
 ## 2. 分层
 
@@ -445,6 +445,7 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - **每帧分配削减**：助手项在 rebuild 时预计算 `text`/`reasoning`/`char_count`/`text_key`；思考正文只在展开时构建；工具行折叠时不再 `serde_json` 美化参数、不再整段克隆工具输出（MB 级）；工具组折叠时不构建内部行。
 - **侧板**：文件预览与文件树改用 `uniform_list` 虚拟化（预览行在 `open_file` 时一次性切好，树行按需缓存展开态快照）；diff 的解析 + 词级 diff + 折叠按内容哈希缓存，展开 hunk 状态在渲染期应用。
 - **UI 线程无阻塞 I/O**：会话持久化只在前台克隆 + 序列化快照，写盘走串行后台队列（`SessionStore::stage` → `PendingSave`，按发送顺序写保证最后赢）；会话列表扫描在后台线程执行，代际计数防止旧结果覆盖新结果；设置「智能体」页的档案目录扫描在打开期间缓存。
+- **并发压测**：1000 路会话/子代理、虚拟模型与内存工作区见 [STRESS_LAB.md](STRESS_LAB.md)。
 - **度量**：`EFFIBUDDY_PERF=1 cargo run -p effibuddy-app` 每 2 秒向 stderr 输出一次 render 耗时 p50/p95 与 markdown 缓存命中数（`ui::markdown_cache_hits`）。测量表明元素构建是每帧成本的大头（约 0.5ms/7KB 消息，release），markdown 缓存削减的是其上的解析部分，收益随消息变长而增大。
 
 ### 活动行
@@ -505,9 +506,19 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 ### 持久化
 
-- 会话：`%LOCALAPPDATA%\EffiBuddy\sessions\<uuid>.json`，每次结构变化后落盘；子代理会话也在同一目录，但带 `parent_id`，不进入顶层列表；
-- 配置：`%LOCALAPPDATA%\EffiBuddy\config.json`（工作区、审批、默认权限模式、命令面板最近使用、主题、左侧栏折叠状态、右侧栏页签/宽度）；
-- 模型注册表：`%LOCALAPPDATA%\EffiBuddy\providers.json`（供应商、模型、默认选择；损坏时保留原文件并回退内置配置）；
+数据根目录由 `config.rs` 的 `base_dir()` 统一解析（所有消费点——sessions、config.json、providers.json、agents 目录、API Key 兜底——都经过它），并按构建类型分离开发与用户数据：
+
+- 调试构建（`cfg!(debug_assertions)`，即默认 `cargo run` / `cargo test`）：`<数据目录>\EffiBuddy-Dev\`；
+- 发布构建（`--release`）：`<数据目录>\EffiBuddy\`（Windows 为 `%LOCALAPPDATA%`，Linux 为 `~/.local/share`）；
+- `EFFIBUDDY_DATA_DIR` 环境变量非空时整体覆盖上述两者（CI、多实例隔离、性能实验用）；
+- 两个目录互不迁移：调试数据不会混入正式数据，反之亦然；需要搬迁时手动移动文件夹或设置环境变量。设置 →「关于」页的「数据环境」一行显示当前构建实际使用的目录。
+
+数据根目录下的内容：
+
+- 会话：`<数据根目录>\sessions\<uuid>.json`，每次结构变化后落盘；子代理会话也在同一目录，但带 `parent_id`，不进入顶层列表；
+- 配置：`<数据根目录>\config.json`（工作区、审批、默认权限模式、命令面板最近使用、主题、左侧栏折叠状态、右侧栏页签/宽度）；
+- 模型注册表：`<数据根目录>\providers.json`（供应商、模型、默认选择；损坏时保留原文件并回退内置配置）；
+- 用户级代理档案：`<数据根目录>\agents\*.md`（项目级 `<workspace>/.effibuddy/agents/*.md` 不受构建类型影响，随仓库分发）；
 - 预览模式创建的会话不会写入磁盘；
 - 目录创建失败时回退到 `.effibuddy/sessions`，不会 panic。
 
@@ -515,11 +526,12 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 65 | loop、压缩、三种 provider 请求体/SSE、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
+| `agent-core` | 81 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 run_js 禁止 |
-| `agent-tools` | 21 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流 |
-| `ui` | 10 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护 |
-| `app` | 52 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠 |
+| `agent-tools` | 32 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
+| `ui` | 35 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
+| `app` | 70 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、电脑授权门 |
 | `deepseek_live` | 4（ignored） | 1-token 探针、单次聊天、工具 loop、PTC loop |
 
 真实 API 测试默认不跑，避免 CI 依赖外部服务；探针用例只断言通路与返回结构，不使用 `max_tokens = 1` 的输出去评估模型质量。
@@ -543,3 +555,61 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - **为什么子代理只回传报告**：完整子 transcript 可能比父会话还长；只回传最终报告能让父上下文保持可控，同时把证据留给 UI 的只读面板。
 - **为什么后台通知用 synthetic user 消息**：OpenAI 兼容接口没有“系统事件”角色；user 角色是唯一不会破坏 tool-call/result 配对的注入点。`synthetic` 标记把“模型可见”和“用户可见”分开。
 - **为什么子代理取消要跨任务转发**：`ToolExecutor` 在父取消时会 drop 工具 future；如果子任务直接借父 future 执行，就会留下半完成状态。`SubagentService` 把子任务 spawn 到 runtime，并用 watcher 转发取消令牌，保证清理与终态事件一定会发生。
+
+## 15. Computer Use（桌面读图与键鼠）
+
+### 分层
+
+```
+computer 工具（agent-tools）
+    │  参数校验 / 输出 JSON / 截图转 ImageAttachment
+    ▼
+ComputerRuntime（effibuddy-computer）
+    │  会话授权 / frame 登记 / 坐标映射 / 暂停、接管、停止
+    ▼
+ComputerBackend（x11 / wayland / win32 / fake）
+    │  窗口枚举、截图、输入注入、隔离桌面
+```
+
+`effibuddy-computer` 不依赖 agent-core 或 UI。`computer` 工具只在主代理的 registry 里注册；`SubagentService::child_tools` 明确过滤掉它，所以子代理永远拿不到屏幕/输入权限。
+
+### 授权门
+
+主 harness 使用 app 层的 `ComputerApprovalGate` 包住 `ModeApprovalGate`：
+
+- 非 `computer` 工具原样委托；
+- `Off` → 拒绝；
+- `Always` → 直接批准并写入会话授权；
+- `Session` 且本会话未授权 → **直接调用 BrokerApprovalGate 弹真实卡片**，不经过 ModeApprovalGate，因此 FullAccess 也无法跳过；
+- `ApproveForSession` → 写入 runtime 的会话授权表（跨 turn 有效，切换会话清除）；
+- Plan 模式 → 修改类 action 直接拒绝，只读截图/列表仍可询问。
+
+`computer` 的 `ApprovalPolicy` 固定为 `Ask`，这样 harness 一定会咨询上述门。
+
+### Frame 与坐标
+
+- `screenshot` 返回 PNG（最长边默认 1280）和 `FrameInfo`：id、目标窗口/屏幕、图像尺寸、原生尺寸、原点、缩放。
+- `click/drag/scroll/move` 的坐标是图像像素，必须匹配最近帧；动作携带 `frame_id` 时只接受该帧。
+- runtime 在窗口帧动作前读取当前窗口 `client_bounds`，与截图时的 bounds 比较；移动/缩放超过 2px 返回 `STALE_FRAME`。
+- 图像像素 → 原生坐标由 `frame::map_frame` 完成；X11/Windows 再用窗口客户区原点转屏幕坐标。
+
+### 暂停与悬浮条
+
+`ComputerRuntime` 为每个会话维护 `paused/stopped/Notify`：
+
+- `take_over` 置 paused，下一次动作在 `wait_turn` 里等待；
+- `resume` 唤醒；
+- `stop` 置 stopped、撤销授权、唤醒等待者；工具返回 `CONTROL_STOPPED`，悬浮条同时触发 `AppView::interrupt`；
+- `finish_session` 恢复停车窗口/隔离工作区、隐藏悬浮条；正常结束保留会话授权，显式停止则删除会话。
+
+悬浮条是独立的 `ComputerOverlayView` 窗口。事件通过 `AppEvent::ComputerOverlay` 走现有前台泵，和 harness 事件保持顺序。全屏截图前由 runtime 发 `CaptureHide`，截图后重新 `Show`，避免悬浮条进入给模型的画面。Wayland 没有 layer-shell，GPUI 也无法拿到 output 列表，因此位置由合成器决定；X11/Windows 使用 PopUp + ABOVE/TOPMOST。
+
+### 隔离
+
+- **X11**：EWMH workspace。`lock_desktop` 找/建 `EffiBuddy` workspace，`move_window_to_desktop` 移窗口，`switch_desktop` 切过去；结束时切回原桌面。
+- **Windows**：后台停车位。保存窗口原 bounds，`SetWindowPos` 移到虚拟屏幕外；截图用 PrintWindow，输入用 `PostMessage(WM_*)`；`end_isolation` 恢复所有窗口。对忽略消息的应用可改 `strategy=foreground`。
+- **Wayland**：仅当前桌面，`lock_desktop` 返回 `UNSUPPORTED`。
+
+### 图片管线
+
+`ToolOutput.images` → `ToolResult.images`（绕过文本截断）→ `context::build_chat_messages` 把连续 tool 结果之后的图片合并成一条 user 消息（避免 OpenAI 在多个 tool 消息之间插入 user 消息）→ 三种 provider 分别序列化为 `image_url` / Anthropic `image` / Responses `input_image`。token 估算按像素计入。模型无视觉能力时截图落盘并返回路径。
