@@ -1,0 +1,19 @@
+[package]
+name = "effibuddy-stress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless concurrency stress lab for the EffiBuddy agent runtime"
+
+[[bin]]
+name = "effibuddy-stress"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+effibuddy-agent-core = { path = "../agent-core", features = ["stress"] }
+effibuddy-agent-tools = { path = "../agent-tools", features = ["stress"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["signal"] }
+tokio-util.workspace = true
