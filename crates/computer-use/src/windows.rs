@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use winapi::shared::minwindef::{BOOL, DWORD, FALSE, LPARAM, TRUE, UINT, WPARAM};
 use winapi::shared::windef::{HBITMAP, HDC, HWND, POINT, RECT};
 use winapi::um::handleapi::CloseHandle;
-use winapi::um::processthreadsapi::{GetCurrentProcessId, GetWindowThreadProcessId, OpenProcess};
+// GetWindowThreadProcessId lives in winuser (pulled in by the glob below);
+// processthreadsapi only exports GetCurrentProcessId / OpenProcess.
+use winapi::um::processthreadsapi::{GetCurrentProcessId, OpenProcess};
 use winapi::um::winbase::QueryFullProcessImageNameW;
 use winapi::um::wingdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,

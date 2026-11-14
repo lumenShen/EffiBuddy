@@ -72,5 +72,9 @@ opt-level = 1
 
 # Vendored gpui adds EFFIBUDDY_GPU_SLOW_MS (low-performance GPU emulation in
 # the present/fence wait) for the performance lab; see vendor/gpui.
+# Vendored xattr is the fixed 0.2.3 variant whose Linux branch maps ENOATTR to
+# libc::ENODATA — the registry 0.2.3 references libc::ENOATTR, which modern
+# libc removed on Linux, breaking any fresh build (CI included). See vendor/xattr.
 [patch.crates-io]
 gpui = { path = "vendor/gpui" }
+xattr = { path = "vendor/xattr" }
