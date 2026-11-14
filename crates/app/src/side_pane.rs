@@ -16,12 +16,13 @@ use std::time::Instant;
 use effibuddy_agent_core::{AgentVisibility, SubagentStatus, TodoStatus, Usage, lock_session};
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, Spinner, TextInputOptions,
-    TextInputState, TextInputView, Theme, badge, divider, empty_state, icons, radius,
-    section_label, shadow_float, small_badge,
+    TextInputState, TextInputView, Theme, badge, disclosure_chevron, divider, ease_out_cubic,
+    empty_state, icons, overlay_motion_duration, radius, section_label, shadow_float, small_badge,
 };
 use gpui::{
-    AnyElement, Context, Entity, HighlightStyle, IntoElement, MouseButton, Point, SharedString,
-    StyledText, Window, anchored, div, point, prelude::*, px, svg, transparent_black, uniform_list,
+    Animation, AnimationExt, AnyElement, Context, Entity, HighlightStyle, IntoElement, MouseButton,
+    Point, SharedString, StyledText, Window, anchored, div, point, prelude::*, px, svg,
+    transparent_black, uniform_list,
 };
 use similar::{ChangeTag, TextDiff};
 
@@ -2384,6 +2385,8 @@ impl AppView {
                 .map(|(offset, row)| {
                     let index = range_start + offset;
                     let path = row.path.clone();
+                    let chevron_id =
+                        SharedString::from(format!("file-tree-chevron-{}", path.display()));
                     let is_dir = row.is_dir;
                     let expanded = row.expanded;
                     let view = view.clone();
@@ -2408,25 +2411,17 @@ impl AppView {
                                 cx.notify();
                             });
                         })
-                        .child(
+                        .child(if is_dir {
+                            disclosure_chevron(chevron_id, expanded, row_theme.text_muted, 10.0)
+                                .into_any_element()
+                        } else {
                             svg()
-                                .path(if is_dir {
-                                    if expanded {
-                                        icons::CHEVRON_DOWN
-                                    } else {
-                                        icons::CHEVRON_RIGHT
-                                    }
-                                } else {
-                                    icons::FILE
-                                })
-                                .size(px(if is_dir { 10.0 } else { 12.0 }))
-                                .text_color(if is_dir {
-                                    row_theme.text_muted
-                                } else {
-                                    row_theme.text_faint
-                                })
-                                .flex_none(),
-                        )
+                                .path(icons::FILE)
+                                .size(px(12.0))
+                                .text_color(row_theme.text_faint)
+                                .flex_none()
+                                .into_any_element()
+                        })
                         .child(
                             div()
                                 .min_w(px(0.0))
@@ -2904,7 +2899,15 @@ impl AppView {
                                 .flex_col()
                                 .gap(px(2.0))
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                                .child(menu),
+                                .child(menu)
+                                .with_animation(
+                                    "side-overlay-menu-enter",
+                                    Animation::new(overlay_motion_duration())
+                                        .with_easing(ease_out_cubic),
+                                    |element, delta| {
+                                        element.opacity(delta).mt(px(4.0 * (1.0 - delta)))
+                                    },
+                                ),
                         ),
                 )
                 .into_any_element(),

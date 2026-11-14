@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use effibuddy_agent_core::tool::PermissionMode;
+use effibuddy_computer::ComputerUseMode;
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
@@ -30,6 +31,11 @@ pub struct AppConfig {
     /// explicitly, so legacy `auto_approve_tools` configs still migrate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_permission_mode: Option<PermissionMode>,
+    /// Whether the model may read the screen and simulate keyboard/mouse.
+    /// `session` asks once per conversation; `always` permits new
+    /// conversations up front; `off` hides the computer tool entirely.
+    #[serde(default)]
+    pub computer_use_mode: ComputerUseMode,
     /// Most recently used command palette item ids (commands and sessions) in
     /// MRU order; the palette pins matching entries to the top.
     #[serde(default)]
@@ -60,6 +66,11 @@ pub struct AppConfig {
     /// `tasks`, or `project:<path>` for a single project.
     #[serde(default)]
     pub sidebar_collapsed_sections: Vec<String>,
+    /// Workspaces registered from the sidebar's "添加工作区" button. Projects
+    /// that already own sessions are derived from those sessions; this list
+    /// keeps empty workspaces visible and persists them across restarts.
+    #[serde(default)]
+    pub projects: Vec<PathBuf>,
 }
 
 fn default_side_bar_open() -> bool {
@@ -99,6 +110,7 @@ impl Default for AppConfig {
             use_demo: false,
             auto_approve_tools: false,
             default_permission_mode: None,
+            computer_use_mode: ComputerUseMode::Session,
             palette_recent: Vec::new(),
             theme: default_theme(),
             workspace: None,
@@ -110,6 +122,7 @@ impl Default for AppConfig {
             side_bar_active: default_side_bar_active(),
             sidebar_collapsed: false,
             sidebar_collapsed_sections: Vec::new(),
+            projects: Vec::new(),
         }
     }
 }
@@ -203,11 +216,28 @@ impl AppConfig {
     }
 }
 
+/// 应用数据目录名：debug 构建（`cargo run` / `cargo test` 默认配置）使用
+/// Dev 后缀，release 构建使用正式名，使开发调试数据与真实用户数据互不干扰。
+pub fn app_dir_name() -> &'static str {
+    if cfg!(debug_assertions) {
+        "EffiBuddy-Dev"
+    } else {
+        "EffiBuddy"
+    }
+}
+
 pub fn base_dir() -> PathBuf {
+    // 显式覆盖：CI、多实例隔离或性能实验时把数据目录整体重定向。
+    if let Ok(dir) = std::env::var("EFFIBUDDY_DATA_DIR") {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     dirs::data_local_dir()
         .or_else(dirs::config_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("EffiBuddy")
+        .join(app_dir_name())
 }
 
 fn discover_api_key(workspace: Option<&Path>) -> Option<String> {
@@ -337,5 +367,57 @@ mod tests {
             1,
             "re-selecting an entry must move it, not duplicate it",
         );
+    }
+
+    #[test]
+    fn app_dir_name_follows_build_profile() {
+        // Locks the dev/prod separation contract: debug builds (including this
+        // test run unless executed with --release) isolate into EffiBuddy-Dev.
+        if cfg!(debug_assertions) {
+            assert_eq!(app_dir_name(), "EffiBuddy-Dev");
+        } else {
+            assert_eq!(app_dir_name(), "EffiBuddy");
+        }
+    }
+
+    #[test]
+    fn computer_use_mode_defaults_to_session_and_roundtrips() {
+        let config = AppConfig::default();
+        assert_eq!(config.computer_use_mode, ComputerUseMode::Session);
+
+        let mut json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["computer_use_mode"], "session");
+        json["computer_use_mode"] = serde_json::json!("always");
+        let parsed: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.computer_use_mode, ComputerUseMode::Always);
+
+        // Old config files without the key fall back to Session.
+        let parsed: AppConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark"})).unwrap();
+        assert_eq!(parsed.computer_use_mode, ComputerUseMode::Session);
+    }
+
+    #[test]
+    fn effibuddy_data_dir_env_overrides_base_dir() {
+        // The only test touching this variable, so no cross-test races.
+        let override_dir = std::env::temp_dir().join(format!(
+            "effibuddy-data-dir-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // SAFETY: single-threaded use of this variable within the test suite.
+        unsafe { std::env::set_var("EFFIBUDDY_DATA_DIR", &override_dir) };
+        assert_eq!(base_dir(), override_dir);
+
+        // An empty value must fall through to the normal resolution.
+        unsafe { std::env::set_var("EFFIBUDDY_DATA_DIR", "   ") };
+        assert_ne!(base_dir(), PathBuf::from("   "));
+        assert!(base_dir().ends_with(app_dir_name()));
+
+        unsafe { std::env::remove_var("EFFIBUDDY_DATA_DIR") };
+        assert!(base_dir().ends_with(app_dir_name()));
+        let _ = std::fs::remove_dir_all(&override_dir);
     }
 }

@@ -17,6 +17,10 @@ use crate::graph::model::{GraphFrame, GraphNode, GraphProjection, GraphStatus};
 
 use super::{GraphSelection, ViewMode};
 
+/// Above this many *visible* nodes the graph switches to simplified node
+/// strips (no spinner, badges or per-node handlers).
+const LOD_NODE_LIMIT: usize = 140;
+
 impl AppView {
     pub(crate) fn set_view_mode(&mut self, mode: ViewMode, cx: &mut Context<Self>) {
         if self.view_mode == mode {
@@ -266,19 +270,31 @@ impl AppView {
                 )
             })
             .collect();
-        let nodes: Vec<AnyElement> = projection
+        // Level of detail: the full node card carries a spinner, badges and
+        // interaction handlers (~15 styled elements each). Fit-zoom over a
+        // 1000-child graph would rebuild tens of thousands of elements per
+        // frame; above the limit, draw a compact strip instead.
+        let visible_nodes: Vec<&GraphNode> = projection
             .nodes
             .iter()
             .filter(|node| visible(node.x, node.y, node.w, node.h))
+            .collect();
+        let simplified = visible_nodes.len() > LOD_NODE_LIMIT;
+        let nodes: Vec<AnyElement> = visible_nodes
+            .into_iter()
             .map(|node| {
-                render_node(
-                    node,
-                    selected.as_ref() == Some(&GraphSelection::Node(node.id.clone())),
-                    zoom,
-                    pan,
-                    &theme,
-                    cx,
-                )
+                if simplified {
+                    render_node_simplified(node, zoom, pan, &theme)
+                } else {
+                    render_node(
+                        node,
+                        selected.as_ref() == Some(&GraphSelection::Node(node.id.clone())),
+                        zoom,
+                        pan,
+                        &theme,
+                        cx,
+                    )
+                }
             })
             .collect();
 
@@ -409,6 +425,81 @@ fn truncate(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+/// Compact node strip for high node counts: 4 styled elements instead of the
+/// full card's ~15, and a static status dot instead of an animated spinner.
+fn render_node_simplified(node: &GraphNode, zoom: f32, pan: [f32; 2], theme: &Theme) -> AnyElement {
+    let color = if node.is_main() {
+        theme.text
+    } else {
+        agent_color(theme, node.color)
+    };
+    let status_color = match node.status {
+        GraphStatus::Running => theme.agent_blue,
+        GraphStatus::WaitingApproval => theme.warning,
+        GraphStatus::Completed => theme.success,
+        GraphStatus::Failed => theme.danger,
+        GraphStatus::Cancelled | GraphStatus::Idle => theme.text_faint,
+    };
+    let font = (11.0 * zoom).clamp(8.0, 13.0);
+    let name = truncate(&node.name, (22.0 / zoom.max(0.5)) as usize);
+
+    div()
+        .absolute()
+        .left(px(node.x * zoom + pan[0]))
+        .top(px(node.y * zoom + pan[1]))
+        .w(px(node.w * zoom))
+        .h(px(node.h * zoom))
+        .rounded(px(6.0 * zoom))
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.border)
+        .overflow_hidden()
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .bottom_0()
+                .w(px(3.0 * zoom.max(0.6)))
+                .bg(color),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .h_full()
+                .pl(px(8.0 * zoom))
+                .gap(px(2.0 * zoom))
+                .child(
+                    div()
+                        .text_size(px(font))
+                        .text_color(theme.text)
+                        .whitespace_nowrap()
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0 * zoom))
+                        .child(
+                            div()
+                                .size(px(6.0 * zoom.max(0.6)))
+                                .rounded(px(999.0))
+                                .bg(status_color),
+                        )
+                        .child(
+                            div()
+                                .text_size(px((10.0 * zoom).clamp(7.0, 11.0)))
+                                .text_color(theme.text_faint)
+                                .child(node.status.label().to_string()),
+                        ),
+                ),
+        )
+        .into_any_element()
 }
 
 fn render_node(

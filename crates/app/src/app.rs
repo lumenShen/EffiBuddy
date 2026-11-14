@@ -15,16 +15,20 @@ use effibuddy_agent_core::{
     SubagentProfile, SubagentReport, SubagentSpawner, SubagentStatus, TodoStatus, ToolCall,
     ToolResult, lock_session, new_shared_session,
 };
-use effibuddy_agent_tools::builtin_tools;
+use effibuddy_agent_tools::{ComputerTool, builtin_tools};
+use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{
-    BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, Spinner, TextInputOptions,
-    TextInputState, TextInputView, Theme, divider, empty_state, icons, kbd, radius, shadow_float,
-    small_badge,
+    BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, MotionController, MotionSpec,
+    Spinner, TextInputOptions, TextInputState, TextInputView, Theme, disclosure_chevron, divider,
+    ease_out_cubic, empty_state, icons, kbd, motion_item, overlay_motion_duration, radius,
+    shadow_float, small_badge,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, ClipboardItem, Context, DispatchPhase, Entity,
-    IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, SharedString,
-    Window, actions, anchored, div, list, point, prelude::*, px, svg, transparent_black,
+    Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Div,
+    Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
+    Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, actions, anchored, div, list, point, prelude::*, px, size, svg,
+    transparent_black,
 };
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -33,6 +37,7 @@ use crate::chat::{
     AgentCard, ChatList, RunSnapshot, agent_color, render_chat_item, render_scroll_to_bottom,
     render_scrollbar,
 };
+use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, SubagentSpawnedInfo};
 use crate::graph::{GraphView, ViewMode, persist as graph_persist};
@@ -49,11 +54,9 @@ use crate::store::{PendingSave, SessionStore, SessionSummary};
 use crate::subagent::SubagentService;
 
 /// Expanded left sidebar width. The titlebar brand block mirrors it so the
-/// two form one continuous column.
+/// two form one continuous column; when collapsed the sidebar is removed
+/// entirely and only the main column remains.
 const SIDEBAR_WIDTH: f32 = 272.0;
-/// Collapsed left sidebar width: a narrow icon rail that keeps the primary
-/// session actions reachable.
-const SIDEBAR_RAIL_WIDTH: f32 = 52.0;
 
 actions!(
     effibuddy_app,
@@ -69,6 +72,19 @@ actions!(
         CyclePermissionMode
     ]
 );
+
+/// True when `--stress` was passed (feature `stress` only; always false
+/// otherwise). Used to scale the agent runtime for 1000-stream runs.
+fn stress_requested() -> bool {
+    #[cfg(feature = "stress")]
+    {
+        std::env::args().any(|argument| argument == "--stress")
+    }
+    #[cfg(not(feature = "stress"))]
+    {
+        false
+    }
+}
 
 #[derive(Clone)]
 enum PaletteAction {
@@ -207,7 +223,7 @@ pub struct AppView {
     pub(crate) models: ModelConfigStore,
     pub(crate) store: SessionStore,
     pub(crate) runtime: Option<tokio::runtime::Runtime>,
-    app_tx: UnboundedSender<AppEvent>,
+    pub(crate) app_tx: UnboundedSender<AppEvent>,
 
     sessions: Vec<SessionSummary>,
     /// Conversations archived from the sidebar; listed in Settings → 归档.
@@ -216,7 +232,23 @@ pub struct AppView {
     pub(crate) active_run: Option<ActiveRun>,
     pub(crate) pending_approvals: Vec<PendingApproval>,
 
+    /// Shared computer-use runtime: consent, frames, pause/stop and the
+    /// platform backend. One per app; only the main agent gets the tool.
+    pub(crate) computer: Arc<effibuddy_computer::ComputerRuntime>,
+    /// Floating top-center control bar, open only while computer access is in
+    /// progress.
+    pub(crate) computer_overlay: Option<WindowHandle<ComputerOverlayView>>,
+    /// Weak self used by the overlay's stop button to interrupt the run.
+    pub(crate) self_weak: WeakEntity<AppView>,
+    /// Keeps the window-closed observer alive. If the user closes the floating
+    /// control bar with the window manager, computer control is stopped.
+    _window_closed_subscription: gpui::Subscription,
+
     pub(crate) subagent_tasks: Vec<AgentTask>,
+    /// `agent_id → index into subagent_tasks`. Tasks are append-only (cleared
+    /// on session reset), so the map stays valid without rebuilds; per-event
+    /// lookups must be O(1) once 1000 children stream concurrently.
+    subagent_task_index: HashMap<String, usize>,
     /// How many terminal (history) agent rows the side pane shows before the
     /// “加载更多” button; live rows are never cut.
     pub(crate) subagent_history_limit: usize,
@@ -248,6 +280,12 @@ pub struct AppView {
     /// notify when a displayed second actually rolled over.
     run_tick_stamp: u64,
     agent_tick_stamp: u64,
+    /// Stress lab (feature `stress`): the active/finished stress run.
+    #[cfg(feature = "stress")]
+    pub(crate) stress: Option<crate::stress::StressState>,
+    /// Heartbeat guard for the stress dashboard ticker.
+    #[cfg(feature = "stress")]
+    pub(crate) stress_ticker_active: bool,
     /// Cached subagent catalog for the settings Agents section. The page used
     /// to rescan the agents directory on every render — i.e. per keystroke,
     /// since the section's inputs notify the whole view.
@@ -291,10 +329,17 @@ pub struct AppView {
     pub(crate) chat_dirty: bool,
     /// Smooth-scroll handles for every overflow region outside the transcript.
     pub(crate) scrolls: SmoothScrollers,
+    /// Keyed FLIP state for the sidebar session list. Reorders are cheap paint
+    /// offsets, not per-frame re-layout.
+    pub(crate) motion: MotionController,
+    /// Set by pin/unpin: the raw session order may not change (pinning does
+    /// not touch `updated_at`), but the rendered grouping does. The next
+    /// `refresh_sessions` consumes this to start the FLIP at assignment time.
+    sidebar_grouping_dirty: bool,
     /// Guards against scheduling more than one smooth-scroll frame at a time.
     scroll_frame_scheduled: bool,
     run_ticker_active: bool,
-    last_error: Option<String>,
+    pub(crate) last_error: Option<String>,
     pub(crate) notice: Option<String>,
     pub(crate) preview_mode: bool,
     /// `--preview-sidebar-hover` forces hover affordances on one project
@@ -332,6 +377,7 @@ impl AppView {
                 || argument == "--preview-models"
                 || argument == "--preview-sidepane-files"
                 || argument == "--preview-sidepane-changes"
+                || argument == "--preview-computer"
         });
         let state = if preview_launch {
             models.new_session_state(config.workspace())
@@ -356,13 +402,59 @@ impl AppView {
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
+            .worker_threads(if stress_requested() {
+                // Stress lab: 1000 concurrent streams starve a 2-worker
+                // runtime; scale it, but keep the default app untouched.
+                std::thread::available_parallelism()
+                    .map(|n| n.get().min(8))
+                    .unwrap_or(4)
+            } else {
+                2
+            })
             .enable_all()
             .thread_name("effibuddy-agent")
             .build()
             .ok();
 
         let (app_tx, mut app_rx) = unbounded_channel::<AppEvent>();
+
+        // Computer use shares the same foreground pump as harness events so
+        // consent cards, tool results and overlay updates keep their order.
+        let self_weak = cx.entity().downgrade();
+        let computer = Arc::new(effibuddy_computer::ComputerRuntime::with_artifact_dir(
+            effibuddy_computer::create_backend(),
+            crate::config::base_dir().join("computer"),
+        ));
+        computer.set_mode(config.computer_use_mode);
+        {
+            let tx = app_tx.clone();
+            computer.set_overlay_emitter(Arc::new(move |event| {
+                let _ = tx.send(AppEvent::ComputerOverlay(event));
+            }));
+        }
+        let window_closed_subscription = cx.on_window_closed({
+            let weak = self_weak.clone();
+            move |cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    let Some(handle) = this.computer_overlay else {
+                        return;
+                    };
+                    if handle.update(cx, |_, _, _| {}).is_ok() {
+                        return;
+                    }
+                    // The floating bar was closed by the user/window manager.
+                    this.computer_overlay = None;
+                    if let Some(session_id) = this
+                        .active
+                        .as_ref()
+                        .map(|active| lock_session(&active.shared).id.clone())
+                    {
+                        this.computer.stop(&session_id);
+                    }
+                    this.interrupt(cx);
+                });
+            }
+        });
 
         let composer_state = cx.new(|cx| {
             TextInputState::new(
@@ -449,7 +541,12 @@ impl AppView {
             active,
             active_run: None,
             pending_approvals: Vec::new(),
+            computer,
+            computer_overlay: None,
+            self_weak,
+            _window_closed_subscription: window_closed_subscription,
             subagent_tasks: Vec::new(),
+            subagent_task_index: HashMap::new(),
             subagent_history_limit: 30,
             subagent_services: Vec::new(),
             side,
@@ -490,12 +587,18 @@ impl AppView {
             chat: ChatList::new(),
             chat_dirty: true,
             scrolls: SmoothScrollers::new(),
+            motion: MotionController::new(),
+            sidebar_grouping_dirty: false,
             scroll_frame_scheduled: false,
             run_ticker_active: false,
             last_error: None,
             notice: None,
             preview_mode: false,
             preview_sidebar_hover: false,
+            #[cfg(feature = "stress")]
+            stress: None,
+            #[cfg(feature = "stress")]
+            stress_ticker_active: false,
         };
 
         view.chat.install_scroll_handler(cx.entity().downgrade());
@@ -543,6 +646,13 @@ impl AppView {
         if std::env::args().any(|argument| argument == "--preview-graph") {
             view.seed_graph_preview(cx);
         }
+
+        // Stress lab: `--stress [N]` launches the in-app concurrency run after
+        // every other startup step (feature `stress` only).
+        #[cfg(feature = "stress")]
+        if let Some(launch) = crate::stress::parse_stress_args() {
+            view.begin_stress(launch, cx);
+        }
         if std::env::args().any(|argument| argument == "--preview-empty") {
             view.preview_mode = true;
         }
@@ -589,9 +699,15 @@ impl AppView {
         if std::env::args().any(|argument| argument == "--preview-project-menu") {
             view.preview_mode = true;
             let project = view
-                .sessions
-                .iter()
-                .find_map(|summary| summary.project.clone())
+                .config
+                .projects
+                .first()
+                .cloned()
+                .or_else(|| {
+                    view.sessions
+                        .iter()
+                        .find_map(|summary| summary.project.clone())
+                })
                 .unwrap_or_else(|| view.config.workspace());
             view.project_menu.project = Some(project);
             view.project_menu.position = Some(point(px(240.0), px(300.0)));
@@ -869,7 +985,7 @@ impl AppView {
         child.usage.completion_tokens = 520;
         child.touch();
         let child_shared = new_shared_session(child.clone());
-        self.subagent_tasks.push(AgentTask {
+        self.push_subagent_task(AgentTask {
             agent_id: "agent_preview".to_string(),
             name: "path-reviewer".to_string(),
             profile: "reviewer".to_string(),
@@ -923,7 +1039,7 @@ impl AppView {
             );
             running_assistant.set_text("正在搜索 `ToolRegistry::register` 的调用点…");
             running_child.push_message(running_assistant);
-            self.subagent_tasks.push(AgentTask {
+            self.push_subagent_task(AgentTask {
                 agent_id: "agent_preview_running".to_string(),
                 name: "tool-scout".to_string(),
                 profile: "explore".to_string(),
@@ -1097,8 +1213,34 @@ impl AppView {
     /// background executor: they used to run on the UI thread, which stalled
     /// the frame for megabyte-scale transcripts. Throttled with a trailing
     /// flush so bursty runs coalesce into one write per quiet period.
+    /// Non-stress builds never show the stress dashboard; the render call site
+    /// is compiled either way.
+    #[cfg(not(feature = "stress"))]
+    pub(crate) fn stress_dashboard_active(&self) -> bool {
+        false
+    }
+
+    /// Stress dashboard content (feature `stress`).
+    #[cfg(feature = "stress")]
+    fn stress_content(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        self.render_stress(theme, cx)
+    }
+
+    /// Non-stress builds never reach this: [`Self::stress_dashboard_active`]
+    /// is always false, so an empty element is a safe placeholder.
+    #[cfg(not(feature = "stress"))]
+    fn stress_content(&mut self, _theme: &Theme, _cx: &mut Context<Self>) -> AnyElement {
+        div().into_any_element()
+    }
+
     pub(crate) fn persist_active(&mut self, cx: &mut Context<Self>) {
         if self.preview_mode {
+            return;
+        }
+        // Stress lab: the active session must keep its pre-stress disk state;
+        // stress children persist through the swapped RAM store instead.
+        #[cfg(feature = "stress")]
+        if self.stress.is_some() {
             return;
         }
         let Some(active) = &self.active else {
@@ -1138,7 +1280,7 @@ impl AppView {
     }
 
     /// Re-list sessions on a background thread; the newest scan wins.
-    fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_sessions(&mut self, cx: &mut Context<Self>) {
         self.refresh_generation += 1;
         let generation = self.refresh_generation;
         let store = self.store.clone();
@@ -1149,6 +1291,26 @@ impl AppView {
                 .await;
             weak.update(cx, |this, cx| {
                 if this.refresh_generation == generation {
+                    // Only open a transition when the sidebar ordering really
+                    // changes. A session's title/updated_at metadata often
+                    // changes without moving it; starting a 220ms frame loop
+                    // for those refreshes would re-render the whole view for
+                    // no visible reason. Pin/unpin sets `sidebar_grouping_dirty`
+                    // because it changes the rendered groups without changing
+                    // the raw updated-at order.
+                    let grouping_dirty = std::mem::take(&mut this.sidebar_grouping_dirty);
+                    let order_changed = this.sessions.len() != summaries.len()
+                        || this
+                            .sessions
+                            .iter()
+                            .zip(&summaries)
+                            .any(|(old, new)| old.id != new.id);
+                    if grouping_dirty || order_changed {
+                        // Snapshot the last painted row positions before the
+                        // new ordering lands; `MotionItem` turns the delta into
+                        // a paint-time FLIP offset.
+                        this.motion.begin(MotionSpec::LAYOUT);
+                    }
                     this.sessions = summaries;
                     cx.notify();
                 }
@@ -1226,7 +1388,7 @@ impl AppView {
                 }
             }
         };
-        let tools = match builtin_tools(&workspace) {
+        let mut tools = match builtin_tools(&workspace) {
             Ok(tools) => tools,
             Err(error) => {
                 self.last_error = Some(format!("无法打开工作区 {}：{error}", workspace.display()));
@@ -1234,6 +1396,15 @@ impl AppView {
                 return;
             }
         };
+        // Computer use is a main-agent-only capability: child_tools() builds a
+        // fresh registry from builtin_tools(), so subagents never inherit it.
+        if self.config.computer_use_mode.is_enabled() {
+            tools.register(ComputerTool::new(
+                self.computer.clone(),
+                resolved.model.capabilities.vision,
+            ));
+        }
+        let computer_session_id = session_id.clone();
 
         // The old two-state switch is gone: approval decisions now flow through
         // ModeApprovalGate, so the harness always consults the gate and the
@@ -1286,15 +1457,29 @@ impl AppView {
         // a Shift+Tab mid-run takes effect on the next tool call. The UI keeps
         // responding to the inner broker gate; locally decided calls never
         // reach it and never show an approval card.
-        let mode_gate = Arc::new(ModeApprovalGate::new(approval.clone(), {
+        let permission_mode_provider: Arc<dyn Fn() -> PermissionMode + Send + Sync> = {
             let shared = shared.clone();
             Arc::new(move || lock_session(&shared).permission_mode)
-        }));
+        };
+        let mode_gate = Arc::new(ModeApprovalGate::new(
+            approval.clone(),
+            permission_mode_provider.clone(),
+        ));
+        // Computer consent is layered *outside* the mode gate: FullAccess must
+        // not silently grant screen control, and Plan mode must block mutating
+        // computer actions even if the user would approve the card.
+        let approval_gate = Arc::new(ComputerApprovalGate::new(
+            mode_gate,
+            approval.clone(),
+            self.computer.clone(),
+            computer_session_id,
+            permission_mode_provider,
+        ));
         let harness = AgentHarness::new(
             shared.clone(),
             provider,
             Arc::new(tools),
-            mode_gate,
+            approval_gate,
             harness_config,
             harness_tx,
         )
@@ -1393,6 +1578,19 @@ impl AppView {
         if let Some(run) = &self.active_run {
             run.handle.interrupt();
             run.approval.deny_all();
+        }
+        if let Some(session_id) = self
+            .active
+            .as_ref()
+            .map(|active| lock_session(&active.shared).id.clone())
+        {
+            self.computer.stop(&session_id);
+            if let Some(runtime) = &self.runtime {
+                let computer = self.computer.clone();
+                runtime.spawn(async move {
+                    computer.finish_session(&session_id).await;
+                });
+            }
         }
         for pending in self.pending_approvals.drain(..) {
             if let Some(agent_id) = &pending.agent_id {
@@ -1507,6 +1705,21 @@ impl AppView {
                 self.active_run = None;
                 self.pending_approvals
                     .retain(|pending| pending.agent_id.is_some());
+                // Hide the control bar and restore parked windows/workspace.
+                // Consent is retained for the conversation unless the user hit
+                // Stop (which revokes it in runtime.stop()).
+                if let Some(session_id) = self
+                    .active
+                    .as_ref()
+                    .map(|active| lock_session(&active.shared).id.clone())
+                {
+                    if let Some(runtime) = &self.runtime {
+                        let computer = self.computer.clone();
+                        runtime.spawn(async move {
+                            computer.finish_session(&session_id).await;
+                        });
+                    }
+                }
                 self.chat.end_stream();
                 self.persist_active(cx);
                 self.refresh_sessions(cx);
@@ -1552,6 +1765,11 @@ impl AppView {
     // --- subagent events --------------------------------------------------
 
     fn handle_app_event(&mut self, event: AppEvent, cx: &mut Context<Self>) {
+        // Stress lab observes (and may fully consume) pump traffic first.
+        #[cfg(feature = "stress")]
+        if self.stress_observe(&event) {
+            return;
+        }
         match event {
             AppEvent::Main(event) => self.handle_event(event, cx),
             AppEvent::SubagentSpawned(info) => self.handle_subagent_spawned(info, cx),
@@ -1561,6 +1779,147 @@ impl AppView {
             AppEvent::SubagentFinished(report) => self.handle_subagent_finished(report, cx),
             AppEvent::AgentMessageToMain(message) => self.handle_agent_message_to_main(message, cx),
             AppEvent::AgentMessageDelivered(info) => self.handle_agent_message_delivered(info, cx),
+            AppEvent::ComputerOverlay(event) => self.handle_computer_overlay(event, cx),
+            // Stress deltas are consumed by `stress_observe` above; the arm
+            // only keeps the match exhaustive.
+            #[cfg(feature = "stress")]
+            AppEvent::StressDelta { .. } => {}
+        }
+    }
+
+    // --- computer use overlay ---------------------------------------------
+
+    fn handle_computer_overlay(&mut self, event: OverlayEvent, cx: &mut Context<Self>) {
+        let active_session = self
+            .active
+            .as_ref()
+            .map(|active| lock_session(&active.shared).id.clone());
+        match &event.kind {
+            OverlayEventKind::Hide | OverlayEventKind::CaptureHide => {
+                self.close_computer_overlay(cx);
+            }
+            OverlayEventKind::Show { .. } | OverlayEventKind::Update { .. } => {
+                if active_session.as_deref() != Some(event.session_id.as_str()) {
+                    return;
+                }
+                let Some(handle) = self.ensure_computer_overlay(cx) else {
+                    return;
+                };
+                if handle
+                    .update(cx, |view, _, cx| view.apply(&event, cx))
+                    .is_err()
+                {
+                    // The user may have closed the bar with the window
+                    // manager; drop the stale handle and reopen once.
+                    self.computer_overlay = None;
+                    if let Some(handle) = self.ensure_computer_overlay(cx) {
+                        let _ = handle.update(cx, |view, _, cx| view.apply(&event, cx));
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_computer_overlay(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<WindowHandle<ComputerOverlayView>> {
+        if let Some(handle) = self.computer_overlay {
+            return Some(handle);
+        }
+        // GPUI's Wayland backend reports no primary display and may not have
+        // populated outputs yet; Wayland ignores the requested origin anyway.
+        // X11/Windows still get a true top-center position.
+        let width = px(500.0);
+        let height = px(64.0);
+        let origin = match cx
+            .primary_display()
+            .or_else(|| cx.displays().into_iter().next())
+        {
+            Some(display) => {
+                let display_bounds = display.bounds();
+                let centered_offset = (display_bounds.size.width - width) * 0.5;
+                point(
+                    display_bounds.origin.x + centered_offset,
+                    display_bounds.origin.y + px(24.0),
+                )
+            }
+            None => point(px(0.0), px(24.0)),
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                origin,
+                size(width, height),
+            ))),
+            titlebar: None,
+            focus: false,
+            is_movable: false,
+            is_resizable: false,
+            is_minimizable: false,
+            kind: WindowKind::PopUp,
+            app_id: Some("effibuddy-computer".to_string()),
+            ..WindowOptions::default()
+        };
+
+        let runtime = self.computer.clone();
+        let app = self.self_weak.clone();
+        let theme = self.theme.clone();
+        let handle = match cx.open_window(options, move |window, cx| {
+            window.set_window_title("EffiBuddy Computer Use");
+            window.set_app_id("effibuddy-computer");
+            cx.new(|_| ComputerOverlayView::new(runtime, app, theme))
+        }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.notice = Some(format!("无法显示电脑操作悬浮条：{error}"));
+                cx.notify();
+                return None;
+            }
+        };
+        self.computer_overlay = Some(handle);
+
+        // Topmost/sticky is platform-specific; do it after the native window
+        // exists, and don't block the UI thread.
+        if let Some(runtime) = &self.runtime {
+            let computer = self.computer.clone();
+            runtime.spawn(async move {
+                // The native window may not be mapped yet; retry once after
+                // the compositor/WM has had time to see it.
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                computer.pin_overlay("EffiBuddy Computer Use").await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                computer.pin_overlay("EffiBuddy Computer Use").await;
+            });
+        }
+        Some(handle)
+    }
+
+    fn close_computer_overlay(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.computer_overlay.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+    }
+
+    /// Leaving a conversation ends its computer session: parked windows and
+    /// the isolated workspace are restored, and the one-time consent is
+    /// revoked so another conversation cannot inherit it.
+    fn retire_computer_session(&mut self, cx: &mut Context<Self>) {
+        self.close_computer_overlay(cx);
+        let Some(session_id) = self
+            .active
+            .as_ref()
+            .map(|active| lock_session(&active.shared).id.clone())
+        else {
+            return;
+        };
+        let computer = self.computer.clone();
+        if let Some(runtime) = &self.runtime {
+            runtime.spawn(async move {
+                computer.restore_isolation(&session_id).await;
+                computer.forget_consent(&session_id);
+            });
+        } else {
+            computer.forget_consent(&session_id);
         }
     }
 
@@ -1633,11 +1992,7 @@ impl AppView {
     }
 
     fn handle_subagent_spawned(&mut self, info: SubagentSpawnedInfo, cx: &mut Context<Self>) {
-        if self
-            .subagent_tasks
-            .iter()
-            .any(|task| task.agent_id == info.agent_id)
-        {
+        if self.subagent_task_index.contains_key(&info.agent_id) {
             return;
         }
         if let Some(shared) = self.active_shared() {
@@ -1645,7 +2000,7 @@ impl AppView {
             graph_persist::record_spawn(&mut session.graph, &info);
             session.touch();
         }
-        self.subagent_tasks.push(AgentTask {
+        self.push_subagent_task(AgentTask {
             agent_id: info.agent_id,
             name: info.name,
             profile: info.profile,
@@ -1695,16 +2050,18 @@ impl AppView {
     ) {
         let viewing = self.side.agent_views.contains_key(agent_id);
         let mut structural = false;
+        // Only topology/status changes redraw the graph. Per-step churn
+        // (steps, assistant messages, tool calls, todos) invalidates nothing:
+        // under a 1000-child stress run that would rebuild the projection and
+        // re-layout every frame.
+        let mut graph_relevant = false;
         match &event {
             HarnessEvent::RunStarted { .. } => {
-                if let Some(task) = self
-                    .subagent_tasks
-                    .iter_mut()
-                    .find(|task| task.agent_id == agent_id)
-                {
+                if let Some(task) = self.subagent_task_mut(agent_id) {
                     task.status = SubagentStatus::Running;
                 }
                 structural = true;
+                graph_relevant = true;
             }
             HarnessEvent::StepStarted { .. } => structural = true,
             HarnessEvent::AssistantStarted { message_id } => {
@@ -1756,26 +2113,20 @@ impl AppView {
                         request: request.clone(),
                     });
                 }
-                if let Some(task) = self
-                    .subagent_tasks
-                    .iter_mut()
-                    .find(|task| task.agent_id == agent_id)
-                {
+                if let Some(task) = self.subagent_task_mut(agent_id) {
                     task.waiting_approval = true;
                 }
                 structural = true;
+                graph_relevant = true;
             }
             HarnessEvent::ApprovalResolved { request_id, .. } => {
                 self.pending_approvals
                     .retain(|pending| &pending.request.id != request_id);
-                if let Some(task) = self
-                    .subagent_tasks
-                    .iter_mut()
-                    .find(|task| task.agent_id == agent_id)
-                {
+                if let Some(task) = self.subagent_task_mut(agent_id) {
                     task.waiting_approval = false;
                 }
                 structural = true;
+                graph_relevant = true;
             }
             HarnessEvent::ToolCallStarted { .. } => {
                 structural = true;
@@ -1799,7 +2150,9 @@ impl AppView {
         }
         if structural {
             self.chat_dirty = true;
-            self.graph.invalidate();
+            if graph_relevant {
+                self.graph.invalidate();
+            }
             if let Some(view) = self.side.agent_views.get_mut(agent_id) {
                 view.dirty = true;
             }
@@ -1818,11 +2171,7 @@ impl AppView {
         let active_id = self.active_id();
         let mut belongs_to_active = false;
         let mut known = false;
-        if let Some(task) = self
-            .subagent_tasks
-            .iter_mut()
-            .find(|task| task.agent_id == agent_id)
-        {
+        if let Some(task) = self.subagent_task_mut(&agent_id) {
             known = true;
             belongs_to_active =
                 active_id.as_deref() == Some(task.parent_session_id.as_str()) || task.depth > 0;
@@ -2200,7 +2549,7 @@ impl AppView {
             let model = child.model.clone();
             let provider_id = child.provider_id.clone();
             let shared = new_shared_session(child);
-            self.subagent_tasks.push(AgentTask {
+            self.push_subagent_task(AgentTask {
                 agent_id,
                 name,
                 profile,
@@ -2244,6 +2593,7 @@ impl AppView {
         }
         self.subagent_services.clear();
         self.subagent_tasks.clear();
+        self.subagent_task_index.clear();
         self.side.agent_views.clear();
         let ids: Vec<String> = self
             .side
@@ -2258,6 +2608,19 @@ impl AppView {
         self.pending_subagent_notifications.clear();
         self.pending_approvals
             .retain(|pending| pending.agent_id.is_none());
+    }
+
+    /// Append a task and register its index. All task inserts go through
+    /// here so [`Self::subagent_task_mut`] stays O(1).
+    fn push_subagent_task(&mut self, task: AgentTask) {
+        self.subagent_task_index
+            .insert(task.agent_id.clone(), self.subagent_tasks.len());
+        self.subagent_tasks.push(task);
+    }
+
+    fn subagent_task_mut(&mut self, agent_id: &str) -> Option<&mut AgentTask> {
+        let index = *self.subagent_task_index.get(agent_id)?;
+        self.subagent_tasks.get_mut(index)
     }
 
     fn agent_cards(&self) -> HashMap<String, AgentCard> {
@@ -2393,6 +2756,7 @@ impl AppView {
             return;
         }
         self.persist_active(cx);
+        self.retire_computer_session(cx);
         let workspace = project.clone().unwrap_or_else(|| self.config.workspace());
         let mut session = self.models.new_session_state(workspace);
         session.permission_mode = self.config.effective_default_mode();
@@ -2423,6 +2787,62 @@ impl AppView {
         cx.notify();
     }
 
+    /// Native folder picker behind the projects header's "+" button. The
+    /// chosen folder is registered as a workspace; canceling is a no-op.
+    fn pick_project_folder(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("添加工作区".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(result) = receiver.await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| match result {
+                Ok(Some(paths)) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        this.add_project_workspace(path, cx);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    this.last_error = Some(format!("无法打开文件夹选择器：{error}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Register a folder as a project. A project with no sessions would not
+    /// exist in the derived list, so the path is also persisted in the config.
+    fn add_project_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
+        let known = self.config.projects.iter().any(|project| project == &path)
+            || self
+                .sessions
+                .iter()
+                .any(|summary| summary.project.as_deref() == Some(path.as_path()));
+        if known {
+            self.notice = Some(format!("工作区已在项目中：{}", project_display_name(&path)));
+            cx.notify();
+            return;
+        }
+        self.config.projects.push(path.clone());
+        // A freshly added workspace should be visible immediately.
+        self.config
+            .sidebar_collapsed_sections
+            .retain(|group| group != "projects" && group != &project_group_key(&path));
+        let _ = self.config.save();
+        self.notice = Some(format!(
+            "已添加工作区：{}。悬停项目可新建任务。",
+            project_display_name(&path)
+        ));
+        cx.notify();
+    }
+
     fn select_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_id().as_deref() == Some(id) {
             return;
@@ -2433,6 +2853,7 @@ impl AppView {
             return;
         }
         self.persist_active(cx);
+        self.retire_computer_session(cx);
         let Some(mut state) = self.store.load(id) else {
             self.last_error = Some("无法读取该会话。".to_string());
             cx.notify();
@@ -2494,6 +2915,9 @@ impl AppView {
             } else {
                 "已取消置顶。".to_string()
             });
+            // Pinning changes the rendered groups even when the raw order is
+            // unchanged; let the next summary assignment start the FLIP.
+            self.sidebar_grouping_dirty = true;
         }
         self.refresh_sessions(cx);
         cx.notify();
@@ -2641,6 +3065,9 @@ impl AppView {
     }
 
     fn toggle_sidebar_section(&mut self, group: &str, cx: &mut Context<Self>) {
+        // Rows below the section move by its full height; FLIP turns that
+        // layout jump into a paint-time transition.
+        self.motion.begin(MotionSpec::LAYOUT);
         if let Some(index) = self
             .config
             .sidebar_collapsed_sections
@@ -2709,10 +3136,15 @@ impl AppView {
         cx.notify();
     }
 
-    /// Collapse the left sidebar into a narrow icon rail (or restore it).
-    /// Persisted app-wide so the shell reopens in the layout the user chose.
+    /// Hide the entire left sidebar (or restore it), leaving only the main
+    /// column. Persisted app-wide so the shell reopens in the chosen layout.
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.config.sidebar_collapsed = !self.config.sidebar_collapsed;
+        if self.config.sidebar_collapsed {
+            // The project popover is anchored to a sidebar row that no longer
+            // exists once the column is gone.
+            self.project_menu = ProjectMenuState::default();
+        }
         let _ = self.config.save();
         cx.notify();
     }
@@ -2770,6 +3202,34 @@ impl AppView {
         ]
         .join("\n");
         self.fill_composer(&text, window, cx);
+    }
+
+    /// Show the floating computer-use bar and the composer hint without
+    /// touching the real desktop (`--preview-computer`).
+    pub fn seed_computer_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_mode = true;
+        self.config.computer_use_mode = ComputerUseMode::Always;
+        self.computer.set_mode(ComputerUseMode::Always);
+        let Some(session_id) = self
+            .active
+            .as_ref()
+            .map(|active| lock_session(&active.shared).id.clone())
+        else {
+            return;
+        };
+        self.computer.grant(&session_id);
+        self.handle_computer_overlay(
+            OverlayEvent {
+                session_id,
+                kind: OverlayEventKind::Show {
+                    message: "正在读取窗口「示例编辑器」…".to_string(),
+                    paused: false,
+                },
+            },
+            cx,
+        );
+        self.composer_focus_handle(cx).focus(window);
+        cx.notify();
     }
 
     // --- command palette --------------------------------------------------
@@ -2864,11 +3324,16 @@ impl AppView {
             PaletteItem {
                 id: "cmd-sidebar".to_string(),
                 title: if self.config.sidebar_collapsed {
-                    "展开左侧栏".to_string()
+                    "显示左侧栏".to_string()
                 } else {
-                    "折叠左侧栏".to_string()
+                    "隐藏左侧栏".to_string()
                 },
-                subtitle: "会话列表与工作区 · Ctrl B".to_string(),
+                subtitle: if self.config.sidebar_collapsed {
+                    "恢复会话侧栏 · Ctrl B"
+                } else {
+                    "整个左栏收起，只保留主窗口 · Ctrl B"
+                }
+                .to_string(),
                 icon: icons::PANEL_LEFT,
                 group: PaletteGroup::Panel,
                 keywords: &["sidebar", "left sidebar", "collapse", "会话", "侧栏"],
@@ -3033,11 +3498,6 @@ impl AppView {
             .filter(|task| task.status == SubagentStatus::Running)
             .count();
         let sidebar_collapsed = self.config.sidebar_collapsed;
-        let sidebar_width = if sidebar_collapsed {
-            SIDEBAR_RAIL_WIDTH
-        } else {
-            SIDEBAR_WIDTH
-        };
         div()
             .h(px(52.0))
             .flex()
@@ -3046,47 +3506,51 @@ impl AppView {
             .bg(theme.bg)
             .border_b_1()
             .border_color(theme.border)
-            .child(
-                div()
-                    .w(px(sidebar_width))
-                    .h_full()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .when(!sidebar_collapsed, |element| element.px_4())
-                    .when(sidebar_collapsed, |element| element.justify_center())
-                    .bg(theme.sidebar)
-                    .border_r_1()
-                    .border_color(theme.border)
-                    .when(!sidebar_collapsed, |element| {
-                        element
-                            .child(
-                                svg()
-                                    .path(icons::SPARKLES)
-                                    .size(px(16.0))
-                                    .text_color(theme.text),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.5))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child("EffiBuddy"),
-                            )
-                            .child(div().flex_1())
-                    })
-                    .child(
-                        IconButton::new("sidebar-toggle", icons::PANEL_LEFT, theme)
-                            .size(26.0, 13.0)
-                            .tooltip(if sidebar_collapsed {
-                                "展开侧栏 (Ctrl B)"
-                            } else {
-                                "折叠侧栏 (Ctrl B)"
-                            })
+            .when(!sidebar_collapsed, |element| {
+                element.child(
+                    div()
+                        .w(px(SIDEBAR_WIDTH))
+                        .h_full()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .px_4()
+                        .bg(theme.sidebar)
+                        .border_r_1()
+                        .border_color(theme.border)
+                        .child(
+                            svg()
+                                .path(icons::SPARKLES)
+                                .size(px(16.0))
+                                .text_color(theme.text),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child("EffiBuddy"),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            IconButton::new("sidebar-toggle", icons::PANEL_LEFT, theme)
+                                .size(26.0, 13.0)
+                                .tooltip("隐藏左侧栏 (Ctrl B)")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        ),
+                )
+            })
+            .when(sidebar_collapsed, |element| {
+                element.child(
+                    div().ml(px(8.0)).child(
+                        IconButton::new("sidebar-expand", icons::PANEL_LEFT, theme)
+                            .size(28.0, 14.0)
+                            .tooltip("显示左侧栏 (Ctrl B)")
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     ),
-            )
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -3211,6 +3675,37 @@ impl AppView {
                     }
                 },
             ))
+            .when(sidebar_collapsed, |element| {
+                element.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(1.0))
+                        .mr(px(6.0))
+                        .child(
+                            IconButton::new(
+                                "titlebar-theme-toggle",
+                                if theme.is_dark() {
+                                    icons::SUN
+                                } else {
+                                    icons::MOON
+                                },
+                                theme,
+                            )
+                            .size(28.0, 14.0)
+                            .tooltip("切换主题 (Ctrl+Shift+T)")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                        )
+                        .child(
+                            IconButton::new("titlebar-settings", icons::SETTINGS, theme)
+                                .size(28.0, 14.0)
+                                .tooltip("设置 (Ctrl+Shift+S)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(window, cx)
+                                })),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex()
@@ -3274,103 +3769,6 @@ impl AppView {
             .into_any_element()
     }
 
-    /// The collapsed sidebar: a narrow icon rail that keeps the primary
-    /// session actions (new, search), the workspace context and the bottom
-    /// utilities reachable while the session list is hidden.
-    fn render_sidebar_rail(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = &self.theme;
-        let running = self.active_run.is_some();
-        let workspace_path = self.config.workspace().display().to_string();
-
-        let mut rail = div()
-            .w(px(SIDEBAR_RAIL_WIDTH))
-            .h_full()
-            .flex()
-            .flex_none()
-            .flex_col()
-            .items_center()
-            .gap(px(4.0))
-            .pt(px(8.0))
-            .pb(px(10.0))
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(
-                div()
-                    .id("rail-new-session")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .size(px(32.0))
-                    .rounded(px(radius::MD))
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.surface)
-                    .cursor_pointer()
-                    .hover(|style| style.bg(theme.surface_alt))
-                    .tooltip(effibuddy_ui::tooltip(theme, "新建任务 (Ctrl N)"))
-                    .on_click(cx.listener(|this, _, window, cx| this.new_session(window, cx)))
-                    .child(
-                        svg()
-                            .path(icons::PLUS)
-                            .size(px(14.0))
-                            .text_color(theme.text),
-                    ),
-            )
-            .child(
-                IconButton::new("rail-search", icons::SEARCH, theme)
-                    .size(30.0, 14.0)
-                    .tooltip("搜索任务与命令 (Ctrl K)")
-                    .on_click(cx.listener(|this, _, window, cx| this.open_palette(window, cx))),
-            )
-            .child(div().flex_1());
-
-        if running {
-            rail = rail.child(Spinner::new(theme.accent, 12.0));
-        }
-
-        rail.child(
-            div()
-                .id("rail-workspace")
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .size(px(30.0))
-                .rounded(px(radius::SM))
-                .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
-                .child(
-                    svg()
-                        .path(icons::FOLDER)
-                        .size(px(14.0))
-                        .text_color(theme.text_faint),
-                ),
-        )
-        .child(div().w(px(28.0)).h(px(1.0)).bg(theme.border).my(px(2.0)))
-        .child(
-            IconButton::new(
-                "rail-theme-toggle",
-                if theme.is_dark() {
-                    icons::SUN
-                } else {
-                    icons::MOON
-                },
-                theme,
-            )
-            .size(30.0, 14.0)
-            .tooltip("切换主题 (Ctrl+Shift+T)")
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
-        )
-        .child(
-            IconButton::new("rail-settings", icons::SETTINGS, theme)
-                .size(30.0, 14.0)
-                .tooltip("设置")
-                .on_click(cx.listener(|this, _, window, cx| this.open_settings(window, cx))),
-        )
-        .into_any_element()
-    }
-
     /// Popover for a project's "more" button: new task, reveal the folder,
     /// copy its path and collapse/expand the group.
     fn render_project_menu(
@@ -3393,7 +3791,13 @@ impl AppView {
         let path_text = project.display().to_string();
         let project_for_new = project.clone();
         let project_for_reveal = project.clone();
+        let project_for_remove = project.clone();
         let path_for_copy = path_text.clone();
+        let project_in_use = self
+            .sessions
+            .iter()
+            .chain(self.archived_sessions.iter())
+            .any(|summary| summary.project.as_deref() == Some(project.as_path()));
 
         Some(
             div()
@@ -3542,6 +3946,48 @@ impl AppView {
                                             this.toggle_sidebar_section(&key, cx);
                                         },
                                     )),
+                                )
+                                .when(!project_in_use, |element| {
+                                    element
+                                        .child(div().h(px(1.0)).bg(theme.border).my(px(2.0)))
+                                        .child(
+                                            project_menu_row(
+                                                &theme,
+                                                "project-menu-remove",
+                                                icons::X,
+                                                "从项目列表移除",
+                                            )
+                                            .on_click(
+                                                cx.listener(move |this, _, _, cx| {
+                                                    this.config.projects.retain(|candidate| {
+                                                        candidate != &project_for_remove
+                                                    });
+                                                    this.config.sidebar_collapsed_sections.retain(
+                                                        |group| {
+                                                            group
+                                                                != &project_group_key(
+                                                                    &project_for_remove,
+                                                                )
+                                                        },
+                                                    );
+                                                    let _ = this.config.save();
+                                                    this.project_menu = ProjectMenuState::default();
+                                                    this.notice = Some(format!(
+                                                        "已移除工作区：{}",
+                                                        project_display_name(&project_for_remove)
+                                                    ));
+                                                    cx.notify();
+                                                }),
+                                            ),
+                                        )
+                                })
+                                .with_animation(
+                                    "project-menu-enter",
+                                    Animation::new(overlay_motion_duration())
+                                        .with_easing(ease_out_cubic),
+                                    |element, delta| {
+                                        element.opacity(delta).mt(px(4.0 * (1.0 - delta)))
+                                    },
                                 ),
                         ),
                 )
@@ -3550,10 +3996,8 @@ impl AppView {
     }
 
     fn render_sidebar(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.config.sidebar_collapsed {
-            return self.render_sidebar_rail(cx);
-        }
         let theme = &self.theme;
+        let motion = self.motion.clone();
         let scroll_entity = cx.entity().downgrade();
         let active_id = self.active_id();
         let running = self.active_run.is_some();
@@ -3589,6 +4033,13 @@ impl AppView {
                 None => tasks.push(summary),
             }
         }
+        // Manually registered workspaces stay visible before their first task
+        // exists. Projects that own sessions already came from the scan above.
+        for project in &self.config.projects {
+            if !projects.iter().any(|(candidate, _)| candidate == project) {
+                projects.push((project.clone(), Vec::new()));
+            }
+        }
 
         let pinned_collapsed = self.sidebar_section_collapsed("pinned");
         let projects_collapsed = self.sidebar_section_collapsed("projects");
@@ -3597,21 +4048,42 @@ impl AppView {
         // a real pointer: project 1's header and project 2's first row.
         let mut preview_header_pending = self.preview_sidebar_hover;
         let mut preview_row_pending = self.preview_sidebar_hover;
+        let add_workspace = sidebar_icon_button(
+            theme,
+            SharedString::from("project-add-workspace"),
+            icons::PLUS,
+            theme.text_faint,
+            "添加工作区",
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            cx.stop_propagation();
+            this.pick_project_folder(cx);
+        }))
+        .into_any_element();
 
         let mut rows: Vec<AnyElement> =
             Vec::with_capacity(self.sessions.len() + projects.len() * 2 + 4);
         if !pinned.is_empty() {
-            rows.push(sidebar_section_header(
-                theme,
-                "pinned",
-                "置顶",
-                pinned.len(),
-                pinned_collapsed,
-                cx,
-            ));
+            rows.push(
+                motion_item(
+                    &motion,
+                    SharedString::from("sidebar-section-pinned"),
+                    sidebar_section_header(
+                        theme,
+                        "pinned",
+                        "置顶",
+                        pinned.len(),
+                        pinned_collapsed,
+                        None,
+                        cx,
+                    ),
+                )
+                .into_any_element(),
+            );
             if !pinned_collapsed {
                 for summary in &pinned {
-                    rows.push(sidebar_session_row(
+                    rows.push(motion_session_row(
+                        &motion,
                         theme,
                         summary,
                         active_id.as_deref() == Some(summary.id.as_str()),
@@ -3622,71 +4094,123 @@ impl AppView {
                 }
             }
         }
-        if !projects.is_empty() {
-            rows.push(sidebar_section_header(
-                theme,
-                "projects",
-                "全部项目",
-                projects.len(),
-                projects_collapsed,
-                cx,
-            ));
-            if !projects_collapsed {
-                for (project, group) in &projects {
-                    let collapsed = self.sidebar_section_collapsed(&project_group_key(project));
-                    let header_hover = preview_header_pending;
-                    preview_header_pending = false;
-                    rows.push(sidebar_project_header(
-                        theme,
-                        project,
-                        collapsed,
-                        header_hover,
-                        cx,
-                    ));
-                    if !collapsed {
-                        for summary in group {
-                            let row_hover = preview_row_pending && !header_hover;
-                            if row_hover {
-                                preview_row_pending = false;
-                            }
-                            rows.push(sidebar_session_row(
-                                theme,
-                                summary,
-                                active_id.as_deref() == Some(summary.id.as_str()),
-                                false,
-                                row_hover,
-                                cx,
-                            ));
+        rows.push(
+            motion_item(
+                &motion,
+                SharedString::from("sidebar-section-projects"),
+                sidebar_section_header(
+                    theme,
+                    "projects",
+                    "全部项目",
+                    projects.len(),
+                    projects_collapsed,
+                    Some(add_workspace),
+                    cx,
+                ),
+            )
+            .into_any_element(),
+        );
+        if !projects_collapsed {
+            if projects.is_empty() {
+                rows.push(
+                    motion_item(
+                        &motion,
+                        SharedString::from("sidebar-empty-projects"),
+                        div()
+                            .px(px(9.0))
+                            .py(px(5.0))
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child("暂无项目，点击右上角 + 添加工作区"),
+                    )
+                    .into_any_element(),
+                );
+            }
+            for (project, group) in &projects {
+                let project_key = project_group_key(project);
+                let collapsed = self.sidebar_section_collapsed(&project_key);
+                let header_hover = preview_header_pending;
+                preview_header_pending = false;
+                rows.push(
+                    motion_item(
+                        &motion,
+                        SharedString::from(format!("sidebar-project-{project_key}")),
+                        sidebar_project_header(theme, project, collapsed, header_hover, cx),
+                    )
+                    .into_any_element(),
+                );
+                if !collapsed {
+                    if group.is_empty() {
+                        rows.push(
+                            motion_item(
+                                &motion,
+                                SharedString::from(format!("sidebar-empty-{project_key}")),
+                                div()
+                                    .px(px(9.0))
+                                    .py(px(5.0))
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child("暂无任务，悬停项目可新建"),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                    for summary in group {
+                        let row_hover = preview_row_pending && !header_hover;
+                        if row_hover {
+                            preview_row_pending = false;
                         }
+                        rows.push(motion_session_row(
+                            &motion,
+                            theme,
+                            summary,
+                            active_id.as_deref() == Some(summary.id.as_str()),
+                            false,
+                            row_hover,
+                            cx,
+                        ));
                     }
                 }
             }
         }
-        rows.push(sidebar_section_header(
-            theme,
-            "tasks",
-            "任务",
-            tasks.len(),
-            tasks_collapsed,
-            cx,
-        ));
+        rows.push(
+            motion_item(
+                &motion,
+                SharedString::from("sidebar-section-tasks"),
+                sidebar_section_header(
+                    theme,
+                    "tasks",
+                    "任务",
+                    tasks.len(),
+                    tasks_collapsed,
+                    None,
+                    cx,
+                ),
+            )
+            .into_any_element(),
+        );
         if !tasks_collapsed {
             if tasks.is_empty() {
                 rows.push(
-                    div()
-                        .px(px(9.0))
-                        .py(px(5.0))
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child("暂无任务")
-                        .into_any_element(),
+                    motion_item(
+                        &motion,
+                        SharedString::from("sidebar-empty-tasks"),
+                        div()
+                            .px(px(9.0))
+                            .py(px(5.0))
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child("暂无任务"),
+                    )
+                    .into_any_element(),
                 );
             } else {
                 let mut preview_task_pending = self.preview_sidebar_hover && projects.is_empty();
                 for summary in &tasks {
                     let row_hover = preview_task_pending;
                     preview_task_pending = false;
-                    rows.push(sidebar_session_row(
+                    rows.push(motion_session_row(
+                        &motion,
                         theme,
                         summary,
                         active_id.as_deref() == Some(summary.id.as_str()),
@@ -4622,6 +5146,62 @@ impl AppView {
             .pb(px(20.0))
             .gap(px(10.0));
 
+        let computer_mode = self.config.computer_use_mode;
+        let computer_granted = self
+            .active_shared()
+            .map(|shared| {
+                let session = lock_session(&shared);
+                self.computer.is_granted(&session.id)
+            })
+            .unwrap_or(false);
+        let computer_vision = resolved.model.capabilities.vision;
+        let computer_hint = composer_hint(computer_mode, computer_granted, computer_vision);
+
+        let mut footer_left = div().flex().items_center().gap(px(8.0)).child(
+            if permission_mode == PermissionMode::Plan {
+                "计划模式：写操作将被拒绝，先出计划（Shift+Tab 切换）"
+            } else {
+                "Enter 发送 · Shift+Enter 换行"
+            },
+        );
+        if let Some((label, tooltip_text)) = computer_hint {
+            let (hint_color, hint_bg) = if !computer_vision {
+                (theme.warning, theme.warning_soft)
+            } else if computer_granted || computer_mode == ComputerUseMode::Always {
+                (theme.success, theme.success_soft)
+            } else {
+                (theme.text_muted, theme.surface_alt)
+            };
+            footer_left = footer_left
+                .child(div().w(px(1.0)).h(px(10.0)).bg(theme.border))
+                .child(
+                    div()
+                        .id("composer-computer")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(20.0))
+                        .px(px(6.0))
+                        .rounded(px(999.0))
+                        .bg(hint_bg)
+                        .text_size(px(10.0))
+                        .text_color(hint_color)
+                        .cursor_pointer()
+                        .tooltip(effibuddy_ui::tooltip(theme, tooltip_text))
+                        .hover(|style| style.bg(theme.active))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings_section(SettingsSection::General, window, cx)
+                        }))
+                        .child(
+                            svg()
+                                .path(icons::MOUSE)
+                                .size(px(10.0))
+                                .text_color(hint_color),
+                        )
+                        .child(label),
+                );
+        }
+
         if let Some(pending) = self.pending_approvals.first() {
             column = column.child(self.render_approval(
                 &pending.request,
@@ -4646,11 +5226,7 @@ impl AppView {
                     } else {
                         theme.text_faint
                     })
-                    .child(if permission_mode == PermissionMode::Plan {
-                        "计划模式：写操作将被拒绝，先出计划（Shift+Tab 切换）"
-                    } else {
-                        "Enter 发送 · Shift+Enter 换行"
-                    })
+                    .child(footer_left)
                     .child("Ctrl K 命令 · Esc 停止"),
             )
             .into_any_element()
@@ -5102,6 +5678,10 @@ impl Render for AppView {
             self.render_settings(window, cx)
         } else if self.view_mode == ViewMode::Graph {
             self.render_graph(window, cx)
+        } else if self.stress_dashboard_active() {
+            // Stress lab owns the main area while a run is active. The helper
+            // exists in both cfg states so the dispatch itself is ungated.
+            self.stress_content(&theme, cx)
         } else {
             self.render_chat(window, cx)
         };
@@ -5179,7 +5759,9 @@ impl Render for AppView {
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(self.side_resize_listener_layer(cx))
-                    .child(self.render_sidebar(window, cx))
+                    .when(!self.config.sidebar_collapsed, |element| {
+                        element.child(self.render_sidebar(window, cx))
+                    })
                     .child(div().flex_1().min_w(px(0.0)).h_full().child(content))
                     .when(
                         self.side.open && !self.settings_open && self.view_mode == ViewMode::Chat,
@@ -5542,13 +6124,15 @@ fn sidebar_icon_button(
         .child(svg().path(icon).size(px(11.0)).text_color(color))
 }
 
-/// Collapsible section header (`置顶` / `全部项目` / `任务`).
+/// Collapsible section header (`置顶` / `全部项目` / `任务`). `trailing` holds
+/// an optional action such as the projects section's "添加工作区" button.
 fn sidebar_section_header(
     theme: &Theme,
     group: &'static str,
     label: &'static str,
     count: usize,
     collapsed: bool,
+    trailing: Option<AnyElement>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     div()
@@ -5565,16 +6149,12 @@ fn sidebar_section_header(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.toggle_sidebar_section(group, cx);
         }))
-        .child(
-            svg()
-                .path(if collapsed {
-                    icons::CHEVRON_RIGHT
-                } else {
-                    icons::CHEVRON_DOWN
-                })
-                .size(px(10.0))
-                .text_color(theme.text_faint),
-        )
+        .child(disclosure_chevron(
+            SharedString::from(format!("sidebar-chevron-{group}")),
+            !collapsed,
+            theme.text_faint,
+            10.0,
+        ))
         .child(
             div()
                 .flex_1()
@@ -5589,6 +6169,7 @@ fn sidebar_section_header(
                 .text_color(theme.text_faint)
                 .child(count.to_string()),
         )
+        .when_some(trailing, |element, trailing| element.child(trailing))
         .into_any_element()
 }
 
@@ -5631,16 +6212,12 @@ fn sidebar_project_header(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.toggle_sidebar_section(&project_group_key(&project_for_click), cx);
         }))
-        .child(
-            svg()
-                .path(if collapsed {
-                    icons::CHEVRON_RIGHT
-                } else {
-                    icons::CHEVRON_DOWN
-                })
-                .size(px(10.0))
-                .text_color(theme.text_faint),
-        )
+        .child(disclosure_chevron(
+            SharedString::from(format!("project-chevron-{key}")),
+            !collapsed,
+            theme.text_faint,
+            10.0,
+        ))
         .child(
             div()
                 .flex_none()
@@ -5711,7 +6288,8 @@ fn sidebar_project_header(
 /// One conversation row: title + relative time, with pin and archive actions
 /// revealed on hover. Pinned rows live in the 置顶 section and show the pin
 /// affordance in its active color.
-fn sidebar_session_row(
+fn motion_session_row(
+    motion: &MotionController,
     theme: &Theme,
     summary: &SessionSummary,
     active: bool,
@@ -5719,6 +6297,24 @@ fn sidebar_session_row(
     force_hover: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
+    let motion_id = SharedString::from(summary.id.clone());
+    let mut row = sidebar_session_row(theme, summary, active, pinned_group, force_hover, cx);
+    if let Some(progress) = motion.enter_progress(&motion_id) {
+        row = row.opacity(progress);
+    }
+    motion_item(motion, motion_id, row)
+        .enter_offset(point(px(0.0), px(6.0)))
+        .into_any_element()
+}
+
+fn sidebar_session_row(
+    theme: &Theme,
+    summary: &SessionSummary,
+    active: bool,
+    pinned_group: bool,
+    force_hover: bool,
+    cx: &mut Context<AppView>,
+) -> Stateful<Div> {
     let id = summary.id.clone();
     let title = summary.title.clone();
     let time = relative_time(summary.updated_at);
@@ -5829,7 +6425,6 @@ fn sidebar_session_row(
                         ),
                 ),
         )
-        .into_any_element()
 }
 
 /// Open a project folder in the platform file manager.

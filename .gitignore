@@ -21,6 +21,11 @@ deepseekAPIKey.env
 /.v2c/
 /.zcode/
 
+# ---------- 应用数据兜底目录（系统数据目录不可写时落到 cwd） ----------
+/.effibuddy/
+/EffiBuddy/
+/EffiBuddy-Dev/
+
 # ---------- 日志与临时产物 ----------
 *.log
 *.tmp

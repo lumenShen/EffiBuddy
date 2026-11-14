@@ -1,8 +1,9 @@
 //! Session persistence: one JSON file per conversation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use effibuddy_agent_core::SessionState;
@@ -21,6 +22,17 @@ pub struct SessionSummary {
     pub pinned: bool,
 }
 
+/// One cached sidebar summary, keyed by file `(mtime, len)`.
+#[derive(Clone)]
+struct CachedSummary {
+    mtime: SystemTime,
+    len: u64,
+    /// `None` when the file failed to parse.
+    summary: Option<SessionSummary>,
+    parent_id: Option<String>,
+    archived: bool,
+}
+
 #[derive(Clone)]
 pub struct SessionStore {
     directory: PathBuf,
@@ -28,6 +40,11 @@ pub struct SessionStore {
     /// checks this set under the same lock the delete uses, so a transcript
     /// removed from the archive page cannot be resurrected by a stale save.
     deleted: Arc<Mutex<HashSet<String>>>,
+    /// Sidebar summaries keyed by file path. A full refresh used to parse
+    /// every JSON file on every scan — O(total bytes), which pins the UI
+    /// thread with hundreds of sessions. Metadata-guarded caching limits
+    /// parsing to files whose mtime or size changed.
+    summary_cache: Arc<Mutex<HashMap<PathBuf, CachedSummary>>>,
 }
 
 /// A serialized session produced by [`SessionStore::stage`], waiting to be
@@ -81,6 +98,7 @@ impl SessionStore {
         Self {
             directory,
             deleted: Arc::default(),
+            summary_cache: Arc::default(),
         }
     }
 
@@ -92,6 +110,7 @@ impl SessionStore {
         Self {
             directory,
             deleted: Arc::default(),
+            summary_cache: Arc::default(),
         }
     }
 
@@ -201,34 +220,70 @@ impl SessionStore {
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
             return summaries;
         };
+        let mut cache = self
+            .summary_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut seen: HashMap<PathBuf, ()> = HashMap::new();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(contents) = std::fs::read_to_string(&path) else {
-                continue;
+            let Ok(meta) = entry.metadata() else { continue };
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let len = meta.len();
+            seen.insert(path.clone(), ());
+
+            let cached = match cache.get(&path) {
+                Some(cached) if cached.mtime == mtime && cached.len == len => cached.clone(),
+                _ => {
+                    // Parse only files whose metadata changed since the last
+                    // scan.
+                    let parsed = std::fs::read_to_string(&path)
+                        .ok()
+                        .and_then(|contents| session_from_json(&contents))
+                        .map(|session| {
+                            let summary = SessionSummary {
+                                id: session.id.clone(),
+                                title: session.display_title(),
+                                updated_at: session.updated_at,
+                                message_count: session.messages.len(),
+                                project: session.project.clone(),
+                                pinned: session.pinned,
+                            };
+                            CachedSummary {
+                                mtime,
+                                len,
+                                summary: Some(summary),
+                                parent_id: session.parent_id,
+                                archived: session.archived,
+                            }
+                        })
+                        .unwrap_or_else(|| CachedSummary {
+                            mtime,
+                            len,
+                            summary: None,
+                            parent_id: None,
+                            archived: false,
+                        });
+                    cache.insert(path.clone(), parsed.clone());
+                    parsed
+                }
             };
-            let Some(session) = session_from_json(&contents) else {
-                continue;
-            };
+
             // Subagent transcripts live in the same directory but are opened
             // from the agent panel, never listed as top-level sessions.
-            if session.parent_id.is_some() || session.archived != archived {
+            if cached.parent_id.is_some() || cached.archived != archived {
                 continue;
             }
-            let id = session.id.clone();
-            let title = session.display_title();
-            let message_count = session.messages.len();
-            summaries.push(SessionSummary {
-                id,
-                title,
-                updated_at: session.updated_at,
-                message_count,
-                project: session.project,
-                pinned: session.pinned,
-            });
+            if let Some(summary) = cached.summary {
+                summaries.push(summary);
+            }
         }
+        // Drop cache entries for deleted files so the map cannot grow
+        // without bound across archives/restores.
+        cache.retain(|path, _| seen.contains_key(path));
         summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
         summaries
     }

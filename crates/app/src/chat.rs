@@ -31,9 +31,9 @@ use effibuddy_agent_core::{
     SubagentStatus, ToolCall, ToolResult,
 };
 use effibuddy_ui::{
-    BadgeTone, GlideTick, IconButton, ScrollGlide, Spinner, Theme, badge, chunk_ranges, icons,
-    markdown_source_key, render_markdown_chunk, render_markdown_keyed, shadow_float,
-    wheel_capture_overlay,
+    BadgeTone, GlideTick, IconButton, ScrollGlide, Spinner, Theme, badge, chunk_ranges,
+    disclosure_chevron, icons, markdown_source_key, render_markdown_chunk, render_markdown_keyed,
+    shadow_float, wheel_capture_overlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -1860,17 +1860,12 @@ fn render_turn_header(
                             .child(format_duration_ms(turn.total_ms)),
                     )
                 })
-                .child(
-                    svg()
-                        .path(if expanded {
-                            icons::CHEVRON_DOWN
-                        } else {
-                            icons::CHEVRON_RIGHT
-                        })
-                        .size(px(10.0))
-                        .text_color(theme.text_faint)
-                        .opacity(0.7),
-                ),
+                .child(disclosure_chevron(
+                    SharedString::from(format!("turn-chevron-{}", turn.id)),
+                    expanded,
+                    theme.text_faint.opacity(0.7),
+                    10.0,
+                )),
         )
         .into_any_element()
 }
@@ -2177,16 +2172,12 @@ fn render_reasoning(
                 cx.notify();
             });
         })
-        .child(
-            svg()
-                .path(if expanded {
-                    icons::CHEVRON_DOWN
-                } else {
-                    icons::CHEVRON_RIGHT
-                })
-                .size(px(11.0))
-                .text_color(theme.text_faint),
-        )
+        .child(disclosure_chevron(
+            SharedString::from(format!("reasoning-chevron-{message_id}")),
+            expanded,
+            theme.text_faint,
+            11.0,
+        ))
         .child(
             svg()
                 .path(icons::SPARKLES)
@@ -2600,17 +2591,12 @@ fn render_tool_row(
                         .text_color(status_color)
                         .child(status_label),
                 )
-                .child(
-                    svg()
-                        .path(if expanded {
-                            icons::CHEVRON_DOWN
-                        } else {
-                            icons::CHEVRON_RIGHT
-                        })
-                        .size(px(10.0))
-                        .text_color(theme.text_faint)
-                        .opacity(0.7),
-                ),
+                .child(disclosure_chevron(
+                    SharedString::from(format!("tool-chevron-{}", call.id)),
+                    expanded,
+                    theme.text_faint.opacity(0.7),
+                    10.0,
+                )),
         )
         .when(expanded, |element| {
             element.child(
@@ -2772,17 +2758,12 @@ fn render_tool_group(
                             .child(format_duration_ms(total_ms)),
                     )
                 })
-                .child(
-                    svg()
-                        .path(if expanded {
-                            icons::CHEVRON_DOWN
-                        } else {
-                            icons::CHEVRON_RIGHT
-                        })
-                        .size(px(10.0))
-                        .text_color(theme.text_faint)
-                        .opacity(0.7),
-                ),
+                .child(disclosure_chevron(
+                    SharedString::from(format!("tool-group-chevron-{group_id}")),
+                    expanded,
+                    theme.text_faint.opacity(0.7),
+                    10.0,
+                )),
         )
         .when(expanded, |element| {
             element.child(

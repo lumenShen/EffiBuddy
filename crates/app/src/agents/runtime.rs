@@ -8,6 +8,7 @@
 //! prompt in [`super::prompt`].
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -53,9 +54,23 @@ pub struct SubagentService {
     catalog: Arc<std::sync::RwLock<Vec<SubagentProfile>>>,
     /// Diagnostics from the last catalog refresh (invalid Markdown files).
     catalog_diagnostics: Arc<Mutex<Vec<effibuddy_agent_core::ProfileDiagnostic>>>,
+    /// Wall clock of the last profile-directory scan. Spawning fan-outs call
+    /// [`Self::refresh_catalog`] per launch; scanning the profile directories
+    /// on real disk each time collapses spawn throughput at 1000 children, so
+    /// refreshes are TTL-coalesced (edits still land within the window).
+    catalog_refreshed_at: Arc<Mutex<Option<Instant>>>,
     /// Durable provider/model registry used to resolve profile `model`.
     models: Arc<effibuddy_agent_core::ModelConfigFile>,
 }
+
+/// Minimum spacing between profile-directory scans per service.
+const CATALOG_REFRESH_TTL: Duration = Duration::from_secs(2);
+
+/// Minimum spacing between child-session saves in the event forwarder. The
+/// forwarder used to clone + serialize the whole child session on *every*
+/// structural event; a 1000-child fan-out turned that into unbounded JSON
+/// throughput. Mirrors the main session's persist throttle.
+const CHILD_SAVE_MIN_INTERVAL: Duration = Duration::from_millis(800);
 
 impl SubagentService {
     #[allow(clippy::too_many_arguments)]
@@ -82,6 +97,7 @@ impl SubagentService {
             effibuddy_agent_core::merged_subagent_profiles(&user_agents_dir, Some(&workspace));
         let catalog = Arc::new(std::sync::RwLock::new(catalog));
         let catalog_diagnostics = Arc::new(Mutex::new(diagnostics));
+        let catalog_refreshed_at = Arc::new(Mutex::new(None));
         let mut base_config = base_config;
         base_config.agent_catalog = catalog.clone();
         Self {
@@ -101,6 +117,7 @@ impl SubagentService {
             workspace,
             catalog,
             catalog_diagnostics,
+            catalog_refreshed_at,
             models,
         }
     }
@@ -109,6 +126,19 @@ impl SubagentService {
     /// catalog. Runs on construction, on every spawn and before the catalog
     /// query, so file edits are picked up without a restart.
     fn refresh_catalog(&self) -> Vec<SubagentProfile> {
+        // TTL coalescing: fan-out spawns call this per launch; without the
+        // floor each spawn re-scans the profile directories on disk.
+        if let Ok(fresh_at) = self.catalog_refreshed_at.lock() {
+            if let Some(at) = *fresh_at {
+                if at.elapsed() < CATALOG_REFRESH_TTL {
+                    if let Ok(slot) = self.catalog.read() {
+                        if !slot.is_empty() {
+                            return slot.clone();
+                        }
+                    }
+                }
+            }
+        }
         let user_agents_dir = crate::config::base_dir().join("agents");
         let (merged, diagnostics) =
             effibuddy_agent_core::merged_subagent_profiles(&user_agents_dir, Some(&self.workspace));
@@ -117,6 +147,9 @@ impl SubagentService {
         }
         if let Ok(mut slot) = self.catalog_diagnostics.lock() {
             *slot = diagnostics;
+        }
+        if let Ok(mut fresh_at) = self.catalog_refreshed_at.lock() {
+            *fresh_at = Some(Instant::now());
         }
         merged
     }
@@ -267,6 +300,12 @@ impl SubagentService {
                 }
             });
         registry = registry.filtered(|tool| {
+            // Computer Use is a main-agent-only capability. Even if a future
+            // change registers it globally, children never inherit screen and
+            // input control.
+            if tool == "computer" {
+                return false;
+            }
             if tool == "agent" || tool == "workflow_run" {
                 return allow_spawn;
             }
@@ -370,6 +409,9 @@ impl SubagentService {
         let forward_shared = prepared.shared.clone();
         let forward_store = self.store.clone();
         let forward_agent = agent_id.clone();
+        let last_save = Arc::new(Mutex::new(None::<Instant>));
+        let flush_scheduled = Arc::new(AtomicBool::new(false));
+        let save_runtime = self.runtime.clone();
         let forward = self.runtime.spawn(async move {
             while let Some(event) = child_rx.recv().await {
                 let structural = matches!(
@@ -380,8 +422,45 @@ impl SubagentService {
                         | HarnessEvent::ContextCompacted { .. }
                 );
                 if structural {
-                    let snapshot = lock_session(&forward_shared).clone();
-                    let _ = forward_store.save(&snapshot);
+                    // Throttle + trailing flush, mirroring the main session's
+                    // persist pattern: cloning and serializing a growing child
+                    // session on every structural event collapses under
+                    // fan-out (1000 children × ~30 structural events/s each).
+                    let now = Instant::now();
+                    let (due, remaining) = {
+                        let mut last = last_save
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let due = last
+                            .map(|at| now.duration_since(at) >= CHILD_SAVE_MIN_INTERVAL)
+                            .unwrap_or(true);
+                        let remaining = last
+                            .map(|at| {
+                                CHILD_SAVE_MIN_INTERVAL.saturating_sub(now.duration_since(at))
+                            })
+                            .unwrap_or(Duration::ZERO);
+                        if due {
+                            *last = Some(now);
+                        }
+                        (due, remaining)
+                    };
+                    if due {
+                        let snapshot = lock_session(&forward_shared).clone();
+                        let _ = forward_store.save(&snapshot);
+                    } else if !flush_scheduled.swap(true, Ordering::SeqCst) {
+                        let shared = forward_shared.clone();
+                        let store = forward_store.clone();
+                        let scheduled = flush_scheduled.clone();
+                        let last = last_save.clone();
+                        save_runtime.spawn(async move {
+                            tokio::time::sleep(remaining).await;
+                            let snapshot = lock_session(&shared).clone();
+                            let _ = store.save(&snapshot);
+                            *last.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                Some(Instant::now());
+                            scheduled.store(false, Ordering::SeqCst);
+                        });
+                    }
                 }
                 if events
                     .send(AppEvent::SubagentHarness {
@@ -392,6 +471,8 @@ impl SubagentService {
                 {
                     break;
                 }
+                #[cfg(feature = "stress")]
+                crate::stress::STRESS_PRODUCED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         });
 

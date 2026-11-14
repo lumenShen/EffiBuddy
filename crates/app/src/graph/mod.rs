@@ -13,6 +13,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use effibuddy_agent_core::SessionState;
 use gpui::{Pixels, Point};
@@ -39,6 +40,11 @@ pub enum GraphSelection {
     Frame(String),
 }
 
+/// Floor between projection rebuilds. Per-step harness events invalidate the
+/// graph continuously under load (1000 streaming children mark it dirty many
+/// times per second); without a floor every frame pays a full re-layout.
+const REBUILD_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
 pub struct GraphView {
     pub pan: [f32; 2],
     pub zoom: f32,
@@ -48,6 +54,8 @@ pub struct GraphView {
     /// Shared projection: `render_graph` clones the `Rc`, never the graph.
     pub projection: Option<Rc<GraphProjection>>,
     pub dirty: bool,
+    /// Wall clock of the last projection build; enforces [`REBUILD_MIN_INTERVAL`].
+    last_build: Option<Instant>,
     /// Last measured canvas size, written by the edge canvas during paint so
     /// "fit" can use the real viewport instead of a guessed one.
     pub canvas_size: Rc<Cell<[f32; 2]>>,
@@ -72,6 +80,7 @@ impl GraphView {
             drag: None,
             projection: None,
             dirty: true,
+            last_build: None,
             canvas_size: Rc::new(Cell::new([1100.0, 680.0])),
             json_cache: RefCell::new(HashMap::new()),
             session_id: None,
@@ -93,7 +102,12 @@ impl GraphView {
             }
             self.dirty = true;
         }
-        if self.dirty || self.projection.is_none() {
+        let needs_build = self.dirty || self.projection.is_none();
+        let build_allowed = self.projection.is_none()
+            || self
+                .last_build
+                .map_or(true, |built| built.elapsed() >= REBUILD_MIN_INTERVAL);
+        if needs_build && build_allowed {
             self.projection = Some(Rc::new(model::build_projection(
                 session,
                 tasks,
@@ -101,6 +115,7 @@ impl GraphView {
             )));
             self.json_cache.borrow_mut().clear();
             self.dirty = false;
+            self.last_build = Some(Instant::now());
         }
     }
 

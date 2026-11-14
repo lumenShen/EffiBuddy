@@ -1,10 +1,13 @@
 //! Composer model picker.
 
 use effibuddy_agent_core::lock_session;
-use effibuddy_ui::{Button, ButtonSize, ButtonVariant, IconButton, icons, shadow_float};
+use effibuddy_ui::{
+    Button, ButtonSize, ButtonVariant, IconButton, ease_out_cubic, icons, overlay_motion_duration,
+    shadow_float,
+};
 use gpui::{
-    AnyElement, Context, IntoElement, MouseButton, Pixels, Point, SharedString, Window, anchored,
-    div, point, prelude::*, px, svg,
+    Animation, AnimationExt, AnyElement, Context, IntoElement, MouseButton, Pixels, Point,
+    SharedString, Window, anchored, div, point, prelude::*, px, svg,
 };
 
 use crate::app::AppView;
@@ -413,6 +416,14 @@ impl AppView {
                                             this.model_menu.open = false;
                                             this.open_settings_models(window, cx);
                                         })),
+                                )
+                                .with_animation(
+                                    "model-menu-enter",
+                                    Animation::new(overlay_motion_duration())
+                                        .with_easing(ease_out_cubic),
+                                    |element, delta| {
+                                        element.opacity(delta).mt(px(4.0 * (1.0 - delta)))
+                                    },
                                 ),
                         ),
                 )
