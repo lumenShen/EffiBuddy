@@ -1,0 +1,73 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-core",
+    "crates/agent-tools",
+    "crates/agent-js",
+    "crates/ui",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/gozaoo/effibuddy"
+authors = ["EffiBuddy contributors"]
+
+[workspace.dependencies]
+effibuddy-agent-core = { path = "crates/agent-core" }
+effibuddy-agent-tools = { path = "crates/agent-tools" }
+effibuddy-agent-js = { path = "crates/agent-js" }
+effibuddy-ui = { path = "crates/ui" }
+
+gpui = "0.2.2"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+async-trait = "0.1"
+tokio = { version = "1.47", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "process",
+    "fs",
+    "io-util",
+] }
+tokio-util = "0.7"
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "http2",
+    "charset",
+    "gzip",
+] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+unicode-segmentation = "1.12"
+dirs = "6.0"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+regex = "1.11"
+tempfile = "3.20"
+
+[profile.release]
+lto = "thin"
+# Keep symbols in release builds so stack sampling (eu-stack/gdb) stays
+# readable during performance-lab runs.
+debug = true
+
+# GPUI and other heavy dependencies are painfully slow to step through at
+# opt-level 0; building deps with a little optimization keeps debug runs
+# responsive at a small first-build cost.
+[profile.dev.package."*"]
+opt-level = 1
+
+# Vendored gpui adds EFFIBUDDY_GPU_SLOW_MS (low-performance GPU emulation in
+# the present/fence wait) for the performance lab; see vendor/gpui.
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }

@@ -1,0 +1,18 @@
+[package]
+name = "effibuddy-agent-js"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sandboxed JavaScript runner for programmatic tool calling (PTC), built on Boa"
+
+[dependencies]
+async-trait.workspace = true
+boa_engine = { version = "0.22.0", default-features = false }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

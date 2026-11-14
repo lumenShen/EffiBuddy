@@ -1,0 +1,818 @@
+//! Agent runtime: run one child, wake it on messages, and expose the address
+//! book to tools.
+//!
+//! This module deliberately knows nothing about the graph UI. It produces
+//! plain events ([`AppEvent`]) and descriptors; the canvas is a separate
+//! consumer. The registry (names, records, visibility) lives in
+//! [`super::registry`], shared types in [`super::types`], and the system
+//! prompt in [`super::prompt`].
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use effibuddy_agent_core::{
+    AgentHarness, AgentMessage, AgentMessageKind, AgentSendOutcome, ApprovalDecision,
+    BrokerApprovalGate, ChildRunRecord, ContentBlock, HarnessConfig, HarnessEvent, MAX_AGENT_DEPTH,
+    ModelProvider, Role, RunOutcome, SessionState, SubagentLaunch, SubagentProfile, SubagentReport,
+    SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry, extract_json_value,
+    lock_session, new_shared_session, validate_json,
+};
+use effibuddy_agent_tools::builtin_tools;
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio_util::sync::CancellationToken;
+
+use crate::events::{AgentMessageDeliveredInfo, AppEvent, SubagentSpawnedInfo};
+use crate::store::SessionStore;
+
+use super::prompt::child_prompt;
+use super::registry::AgentRegistry;
+use super::types::{PreparedChild, can_address, descriptor_for, failed_report, is_mutating_tool};
+
+#[derive(Clone)]
+pub struct SubagentService {
+    provider: Arc<dyn ModelProvider>,
+    parent_session_id: String,
+    parent_provider_id: String,
+    parent_model: String,
+    parent_reasoning: Option<String>,
+    base_config: HarnessConfig,
+    project_instructions: String,
+    store: SessionStore,
+    events: UnboundedSender<AppEvent>,
+    runtime: tokio::runtime::Handle,
+    tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    gates: Arc<Mutex<HashMap<String, Arc<BrokerApprovalGate>>>>,
+    registry: AgentRegistry,
+    /// Parent workspace root; the project-scope profile directory lives under
+    /// `<workspace>/.effibuddy/agents`.
+    workspace: std::path::PathBuf,
+    /// Shared snapshot of the effective profile catalog. The same Arc is
+    /// installed in the harness configs, so refreshed Markdown profiles reach
+    /// the next system prompt without rebuilding anything.
+    catalog: Arc<std::sync::RwLock<Vec<SubagentProfile>>>,
+    /// Diagnostics from the last catalog refresh (invalid Markdown files).
+    catalog_diagnostics: Arc<Mutex<Vec<effibuddy_agent_core::ProfileDiagnostic>>>,
+    /// Durable provider/model registry used to resolve profile `model`.
+    models: Arc<effibuddy_agent_core::ModelConfigFile>,
+}
+
+impl SubagentService {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider: Arc<dyn ModelProvider>,
+        parent_session_id: String,
+        parent_provider_id: String,
+        parent_model: String,
+        parent_reasoning: Option<String>,
+        base_config: HarnessConfig,
+        project_instructions: String,
+        store: SessionStore,
+        events: UnboundedSender<AppEvent>,
+        runtime: tokio::runtime::Handle,
+        workspace: std::path::PathBuf,
+        models: Arc<effibuddy_agent_core::ModelConfigFile>,
+    ) -> Self {
+        let mut main =
+            effibuddy_agent_core::AgentDescriptor::main(parent_session_id.clone(), "main");
+        main.description = "主智能体：与用户对话并调度子代理与智能体组".to_string();
+        let registry = AgentRegistry::new(main);
+        let user_agents_dir = crate::config::base_dir().join("agents");
+        let (catalog, diagnostics) =
+            effibuddy_agent_core::merged_subagent_profiles(&user_agents_dir, Some(&workspace));
+        let catalog = Arc::new(std::sync::RwLock::new(catalog));
+        let catalog_diagnostics = Arc::new(Mutex::new(diagnostics));
+        let mut base_config = base_config;
+        base_config.agent_catalog = catalog.clone();
+        Self {
+            provider,
+            parent_session_id,
+            parent_provider_id,
+            parent_model,
+            parent_reasoning,
+            base_config,
+            project_instructions,
+            store,
+            events,
+            runtime,
+            tokens: Arc::new(Mutex::new(HashMap::new())),
+            gates: Arc::new(Mutex::new(HashMap::new())),
+            registry,
+            workspace,
+            catalog,
+            catalog_diagnostics,
+            models,
+        }
+    }
+
+    /// Reload Markdown profiles from both scopes and publish the merged
+    /// catalog. Runs on construction, on every spawn and before the catalog
+    /// query, so file edits are picked up without a restart.
+    fn refresh_catalog(&self) -> Vec<SubagentProfile> {
+        let user_agents_dir = crate::config::base_dir().join("agents");
+        let (merged, diagnostics) =
+            effibuddy_agent_core::merged_subagent_profiles(&user_agents_dir, Some(&self.workspace));
+        if let Ok(mut slot) = self.catalog.write() {
+            *slot = merged.clone();
+        }
+        if let Ok(mut slot) = self.catalog_diagnostics.lock() {
+            *slot = diagnostics;
+        }
+        merged
+    }
+
+    fn emit(&self, event: AppEvent) {
+        let _ = self.events.send(event);
+    }
+
+    fn prepare(
+        &self,
+        agent_id: &str,
+        request: &SubagentRequest,
+    ) -> Result<PreparedChild, ToolError> {
+        if request.depth > MAX_AGENT_DEPTH {
+            return Err(ToolError::new(format!(
+                "agent tree depth limit reached ({MAX_AGENT_DEPTH})"
+            )));
+        }
+        let parent_read_only = self.registry.parent_read_only(request);
+        let catalog = self.refresh_catalog();
+        let mut profile = catalog
+            .iter()
+            .find(|candidate| {
+                effibuddy_agent_core::normalize_profile_name(&candidate.name)
+                    == effibuddy_agent_core::normalize_profile_name(&request.profile)
+            })
+            .cloned()
+            .unwrap_or_else(|| SubagentProfile {
+                name: request.profile.clone(),
+                description: request.description.clone(),
+                prompt: format!(
+                    "You are the custom agent `{}`. Complete the task your launcher assigned to you.",
+                    request.profile
+                ),
+                tools: Vec::new(),
+                disallowed_tools: Vec::new(),
+                model: None,
+                read_only: parent_read_only || request.read_only.unwrap_or(false),
+                allow_spawn: request.allow_spawn,
+                color: effibuddy_agent_core::SubagentColor::Blue,
+                source: effibuddy_agent_core::ProfileSource::BuiltIn,
+            });
+        if let Some(prompt) = &request.system_prompt {
+            profile.prompt = prompt.clone();
+        }
+        // A read-only parent must never create a child that can mutate the
+        // workspace; an explicit `read_only: false` cannot escalate.
+        let read_only = parent_read_only || profile.read_only || request.read_only.unwrap_or(false);
+        profile.read_only = read_only;
+        let allow_spawn =
+            (request.allow_spawn || profile.allow_spawn) && request.depth < MAX_AGENT_DEPTH;
+        let name = self.registry.assign_name(agent_id, request, &profile);
+
+        // Model selection: the launcher's model unless the profile overrides
+        // it. An unresolvable override fails the spawn instead of silently
+        // falling back, so a profile never runs on the wrong model.
+        let mut provider = self.provider.clone();
+        let mut provider_id = self.parent_provider_id.clone();
+        let mut model = self.parent_model.clone();
+        let mut reasoning = self.parent_reasoning.clone();
+        if !profile.inherits_model() {
+            let requested = profile.model.as_deref().unwrap_or_default().trim();
+            let (provider_hint, model_id) = match requested.split_once('/') {
+                Some((prefix, rest)) if !prefix.is_empty() && !rest.is_empty() => {
+                    (Some(prefix), rest)
+                }
+                _ => (None, requested),
+            };
+            let resolved = self.models.resolve(provider_hint, Some(model_id), None);
+            if resolved.synthesized {
+                return Err(ToolError::new(format!(
+                    "profile `{}` requests unknown model `{requested}`; add it in 设置 → 模型",
+                    profile.name
+                )));
+            }
+            if !resolved.live {
+                return Err(ToolError::new(format!(
+                    "profile `{}` requests model `{requested}` but provider `{}` has no API key",
+                    profile.name,
+                    resolved.provider_label()
+                )));
+            }
+            provider = resolved.build_provider().map_err(|error| {
+                ToolError::new(format!("无法为 `{requested}` 创建模型客户端：{error}"))
+            })?;
+            provider_id = resolved.provider.id.clone();
+            model = resolved.model.id.clone();
+            reasoning = resolved.reasoning_level.clone();
+        }
+
+        let mut session = SessionState::new(request.workspace.clone(), model.clone());
+        session.set_model_selection(provider_id, model, reasoning);
+        session.title = format!("{} · {}", name, request.description);
+        session.parent_id = Some(request.parent_session_id.clone());
+        session.agent_name = Some(name.clone());
+        session.agent_description = Some(request.description.clone());
+        let shared = new_shared_session(session.clone());
+        // Persist before announcing so the child always exists on disk.
+        let _ = self.store.save(&session);
+
+        let tools = self.child_tools(request, &profile, allow_spawn, read_only)?;
+
+        let mut config = self.base_config.clone();
+        config.system_prompt_extra.clear();
+        config.system_prompt_override = Some(child_prompt(
+            &profile,
+            request,
+            &name,
+            allow_spawn,
+            &self.project_instructions,
+        ));
+        config.auto_approve_tools = false;
+        config.agent_id = agent_id.to_string();
+        config.agent_name = Some(name.clone());
+        config.agent_depth = request.depth;
+
+        Ok(PreparedChild {
+            request: request.clone(),
+            profile,
+            name,
+            shared,
+            tools: Arc::new(tools),
+            config,
+            provider,
+            allow_spawn,
+            read_only,
+        })
+    }
+
+    fn child_tools(
+        &self,
+        request: &SubagentRequest,
+        profile: &SubagentProfile,
+        allow_spawn: bool,
+        read_only: bool,
+    ) -> Result<ToolRegistry, ToolError> {
+        let mut registry = builtin_tools(&request.workspace)?;
+        let explicit: Option<HashSet<String>> = request
+            .tools
+            .clone()
+            .filter(|tools| !tools.is_empty())
+            .map(|tools| tools.into_iter().collect())
+            .or_else(|| {
+                if profile.tools.is_empty() {
+                    None
+                } else {
+                    Some(profile.tools.iter().cloned().collect())
+                }
+            });
+        registry = registry.filtered(|tool| {
+            if tool == "agent" || tool == "workflow_run" {
+                return allow_spawn;
+            }
+            // Messaging is safe: read-only agents may still talk.
+            if tool == "agent_send" || tool == "agent_list" {
+                return true;
+            }
+            // Profile blacklist wins over the allow-list, including when the
+            // profile inherits the parent's full tool set.
+            if profile
+                .disallowed_tools
+                .iter()
+                .any(|name| name == tool || name == "*")
+            {
+                return false;
+            }
+            if read_only && is_mutating_tool(tool) {
+                return false;
+            }
+            match &explicit {
+                Some(names) => names.contains(tool),
+                None => true,
+            }
+        });
+        Ok(registry)
+    }
+
+    fn spawned_info(
+        &self,
+        agent_id: &str,
+        prepared: &PreparedChild,
+        started_at: Instant,
+    ) -> SubagentSpawnedInfo {
+        // Lock once: two `lock_session` calls in one struct literal would hold
+        // the first temporary guard until the statement ends and self-deadlock.
+        let (child_session_id, model) = {
+            let session = lock_session(&prepared.shared);
+            (session.id.clone(), session.model.clone())
+        };
+        SubagentSpawnedInfo {
+            agent_id: agent_id.to_string(),
+            name: prepared.name.clone(),
+            profile: prepared.profile.name.clone(),
+            color: prepared.profile.color,
+            description: prepared.request.description.clone(),
+            child_session_id,
+            parent_call_id: prepared.request.parent_call_id.clone(),
+            parent_session_id: prepared.request.parent_session_id.clone(),
+            parent_agent_id: prepared.request.parent_agent_id.clone(),
+            parent_agent_name: prepared.request.parent_agent_name.clone(),
+            group_id: prepared.request.group_id.clone(),
+            group_name: prepared.request.group_name.clone(),
+            depth: prepared.request.depth,
+            visibility: prepared.request.visibility,
+            read_only: prepared.read_only,
+            background: prepared.request.background,
+            can_spawn: prepared.allow_spawn,
+            provider_id: Some(self.parent_provider_id.clone()),
+            model,
+            started_at,
+            shared: prepared.shared.clone(),
+            task_prompt: prepared.request.prompt.clone(),
+            output_schema: prepared.request.output_schema.clone(),
+        }
+    }
+
+    async fn execute_run(
+        &self,
+        prepared: PreparedChild,
+        agent_id: String,
+        cancel: CancellationToken,
+        input: Option<String>,
+        wake: bool,
+    ) -> SubagentReport {
+        let started = Instant::now();
+        let (child_tx, mut child_rx) = unbounded_channel::<HarnessEvent>();
+        let broker = Arc::new(BrokerApprovalGate::new(
+            child_tx.clone(),
+            Duration::from_secs(600),
+        ));
+        {
+            let mut gates = self
+                .gates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gates.insert(agent_id.clone(), broker.clone());
+        }
+
+        let harness = AgentHarness::new(
+            prepared.shared.clone(),
+            prepared.provider.clone(),
+            prepared.tools.clone(),
+            broker.clone(),
+            prepared.config.clone(),
+            child_tx.clone(),
+        )
+        .with_subagents(Arc::new(self.clone()) as Arc<dyn SubagentSpawner>);
+        let handle = harness.handle();
+
+        let events = self.events.clone();
+        let forward_shared = prepared.shared.clone();
+        let forward_store = self.store.clone();
+        let forward_agent = agent_id.clone();
+        let forward = self.runtime.spawn(async move {
+            while let Some(event) = child_rx.recv().await {
+                let structural = matches!(
+                    &event,
+                    HarnessEvent::AssistantFinished { .. }
+                        | HarnessEvent::ToolCallFinished { .. }
+                        | HarnessEvent::TodosUpdated { .. }
+                        | HarnessEvent::ContextCompacted { .. }
+                );
+                if structural {
+                    let snapshot = lock_session(&forward_shared).clone();
+                    let _ = forward_store.save(&snapshot);
+                }
+                if events
+                    .send(AppEvent::SubagentHarness {
+                        agent_id: forward_agent.clone(),
+                        event,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        let outcome = {
+            let run = async {
+                match input {
+                    Some(text) => harness.run_turn(text).await,
+                    None => harness.run_pending().await,
+                }
+            };
+            tokio::pin!(run);
+            tokio::select! {
+                result = &mut run => result,
+                _ = cancel.cancelled() => {
+                    handle.interrupt();
+                    (&mut run).await
+                }
+            }
+        };
+
+        drop(harness);
+        drop(broker);
+        drop(child_tx);
+        {
+            let mut gates = self
+                .gates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gates.remove(&agent_id);
+        }
+        {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens.remove(&agent_id);
+        }
+        let _ = forward.await;
+
+        let (mut status, mut error) = match &outcome {
+            Ok(RunOutcome::Completed) => (SubagentStatus::Completed, None),
+            Ok(RunOutcome::Interrupted) => (
+                SubagentStatus::Cancelled,
+                Some("subagent was interrupted".to_string()),
+            ),
+            Ok(RunOutcome::Failed(message)) => (SubagentStatus::Failed, Some(message.clone())),
+            Err(error) => (SubagentStatus::Failed, Some(error.to_string())),
+        };
+        if cancel.is_cancelled() {
+            status = SubagentStatus::Cancelled;
+            error = Some("subagent was stopped".to_string());
+        }
+
+        let (report_text, tool_uses, usage, child_session_id) = {
+            let session = lock_session(&prepared.shared);
+            let report_text = session
+                .messages
+                .iter()
+                .rev()
+                .filter(|message| message.role == Role::Assistant)
+                .map(|message| message.text())
+                .find(|text| !text.trim().is_empty())
+                .unwrap_or_default();
+            let tool_uses = session
+                .messages
+                .iter()
+                .flat_map(|message| &message.blocks)
+                .filter(|block| matches!(block, ContentBlock::ToolCall { .. }))
+                .count();
+            (
+                report_text,
+                tool_uses,
+                session.usage.clone(),
+                session.id.clone(),
+            )
+        };
+
+        // Enforce the output contract before the launcher or a downstream
+        // workflow node ever sees the value.
+        let mut data = None;
+        if status == SubagentStatus::Completed {
+            if let Some(schema) = &prepared.request.output_schema {
+                match extract_json_value(&report_text) {
+                    Some(value) => match validate_json(&value, schema) {
+                        Ok(()) => data = Some(value),
+                        Err(schema_error) => {
+                            status = SubagentStatus::Failed;
+                            error = Some(format!(
+                                "output did not satisfy output_schema: {schema_error}"
+                            ));
+                        }
+                    },
+                    None => {
+                        status = SubagentStatus::Failed;
+                        error = Some(
+                            "output was not valid JSON, but output_schema was required".to_string(),
+                        );
+                    }
+                }
+            } else {
+                data = extract_json_value(&report_text);
+            }
+        }
+
+        // The terminal record is the only cross-restart source of "how did
+        // this child end"; a restored session without it is Lost.
+        {
+            let mut session = lock_session(&prepared.shared);
+            session.child_run = Some(ChildRunRecord {
+                agent_id: agent_id.clone(),
+                profile: prepared.profile.name.clone(),
+                color: prepared.profile.color,
+                status,
+                depth: prepared.request.depth,
+                ended_at: chrono::Utc::now(),
+                usage: session.usage.clone(),
+            });
+        }
+        let snapshot = lock_session(&prepared.shared).clone();
+        let _ = self.store.save(&snapshot);
+
+        let report = SubagentReport {
+            agent_id: agent_id.clone(),
+            name: prepared.name.clone(),
+            profile: prepared.profile.name.clone(),
+            color: prepared.profile.color,
+            description: prepared.request.description.clone(),
+            child_session_id,
+            parent_call_id: prepared.request.parent_call_id.clone(),
+            parent_agent_id: prepared.request.parent_agent_id.clone(),
+            group_id: prepared.request.group_id.clone(),
+            group_name: prepared.request.group_name.clone(),
+            visibility: prepared.request.visibility,
+            background: prepared.request.background,
+            wake,
+            status,
+            report: report_text,
+            data,
+            error,
+            tool_uses,
+            duration_ms: started.elapsed().as_millis() as u64,
+            usage,
+        };
+        // Update the registry before publishing the terminal event. Listeners
+        // (and tests) may immediately message the agent as soon as they observe
+        // the finish; the registry must already report it as idle so the
+        // message wakes it instead of being queued behind a stale Running state.
+        let needs_wake = self.registry.finish(&agent_id, status);
+        self.emit(AppEvent::SubagentFinished(report.clone()));
+        if needs_wake {
+            self.spawn_wake(&agent_id);
+        }
+        report
+    }
+
+    fn spawn_wake(&self, agent_id: &str) -> bool {
+        let Some((prepared, token)) = self.registry.take_wake(agent_id) else {
+            return false;
+        };
+        {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens.insert(agent_id.to_string(), token.clone());
+        }
+        let this = self.clone();
+        let wake_agent = agent_id.to_string();
+        self.runtime.spawn(async move {
+            this.execute_run(prepared, wake_agent, token, None, true)
+                .await;
+        });
+        true
+    }
+
+    fn send_message(
+        &self,
+        from_session: &str,
+        to: &str,
+        kind: AgentMessageKind,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<AgentSendOutcome, ToolError> {
+        let from = self
+            .registry
+            .sender_descriptor(&self.parent_session_id, from_session);
+        let (target, target_id) = self.registry.lookup(to).ok_or_else(|| {
+            ToolError::new(format!(
+                "Unknown agent address `{to}`. Use agent_list to see what you may address."
+            ))
+        })?;
+        if !can_address(&from.id, &target) {
+            return Err(ToolError::new(format!(
+                "Agent `{}` is private to `{}`. Ask its owner, or create a public agent for shared work.",
+                target.name,
+                target.owner_name.as_deref().unwrap_or("its creator")
+            )));
+        }
+        if target.kind == effibuddy_agent_core::AgentNodeKind::Group {
+            return Err(ToolError::new(format!(
+                "`{}` is an agent group, not a messageable agent. Message one of its members.",
+                target.name
+            )));
+        }
+
+        let message = AgentMessage::new(&from, &target, kind, text, data);
+
+        // Main agent: the app owns its transcript and wake policy.
+        if target_id.is_none() {
+            self.emit(AppEvent::AgentMessageToMain(message));
+            return Ok(AgentSendOutcome {
+                to: target,
+                delivered: true,
+                queued: false,
+                woke: true,
+            });
+        }
+        let target_id = target_id.expect("checked");
+        let (target_session_id, snapshot, running) = self
+            .registry
+            .append_message(
+                &target_id,
+                effibuddy_agent_core::Message::from_agent_message(&message),
+            )
+            .ok_or_else(|| ToolError::new(format!("Unknown agent id `{target_id}`.")))?;
+        let _ = self.store.save(&snapshot);
+        let woke = if running {
+            false
+        } else {
+            self.spawn_wake(&target_id)
+        };
+        let outcome = AgentSendOutcome {
+            to: target,
+            delivered: true,
+            queued: !woke,
+            woke,
+        };
+        self.emit(AppEvent::AgentMessageDelivered(AgentMessageDeliveredInfo {
+            message,
+            target_session_id,
+            queued: outcome.queued,
+            woke: outcome.woke,
+        }));
+        Ok(outcome)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_read_only(&self, agent_id: &str) -> Option<bool> {
+        self.registry.record_read_only(agent_id)
+    }
+}
+
+#[async_trait::async_trait]
+impl SubagentSpawner for SubagentService {
+    fn profiles(&self) -> Vec<SubagentProfile> {
+        self.refresh_catalog()
+    }
+
+    async fn run(&self, request: SubagentRequest, cancel: CancellationToken) -> SubagentReport {
+        let agent_id = format!("agent_{}", effibuddy_agent_core::ids::short_id());
+        let prepared = match self.prepare(&agent_id, &request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return failed_report(&request, agent_id, String::new(), error.message);
+            }
+        };
+        let descriptor = descriptor_for(&agent_id, &prepared);
+        let token = CancellationToken::new();
+        {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens.insert(agent_id.clone(), token.clone());
+        }
+        self.registry
+            .register(&agent_id, descriptor, &prepared, token.clone());
+        self.emit(AppEvent::SubagentSpawned(self.spawned_info(
+            &agent_id,
+            &prepared,
+            Instant::now(),
+        )));
+
+        // The parent's cancellation must reach the child even when the parent
+        // tool future is dropped by the executor.
+        let watcher = {
+            let parent_cancel = cancel.clone();
+            let child_token = token.clone();
+            self.runtime.spawn(async move {
+                parent_cancel.cancelled().await;
+                child_token.cancel();
+            })
+        };
+
+        let fallback_request = request.clone();
+        let fallback_agent = agent_id.clone();
+        let child_session_id = lock_session(&prepared.shared).id.clone();
+        let this = self.clone();
+        let input = prepared.request.prompt.clone();
+        let task = self.runtime.spawn(async move {
+            this.execute_run(prepared, agent_id, token, Some(input), false)
+                .await
+        });
+        let result = match task.await {
+            Ok(report) => report,
+            Err(error) => {
+                let report = failed_report(
+                    &fallback_request,
+                    fallback_agent.clone(),
+                    child_session_id,
+                    format!("subagent task panicked: {error}"),
+                );
+                self.registry
+                    .finish(&fallback_agent, SubagentStatus::Failed);
+                self.emit(AppEvent::SubagentFinished(report.clone()));
+                report
+            }
+        };
+        watcher.abort();
+        result
+    }
+
+    fn launch(&self, request: SubagentRequest) -> Result<SubagentLaunch, ToolError> {
+        let agent_id = format!("agent_{}", effibuddy_agent_core::ids::short_id());
+        let prepared = self.prepare(&agent_id, &request)?;
+        let descriptor = descriptor_for(&agent_id, &prepared);
+        let agent_name = prepared.name.clone();
+        let child_session_id = lock_session(&prepared.shared).id.clone();
+        let token = CancellationToken::new();
+        {
+            let mut tokens = self
+                .tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tokens.insert(agent_id.clone(), token.clone());
+        }
+        self.registry
+            .register(&agent_id, descriptor, &prepared, token.clone());
+        self.emit(AppEvent::SubagentSpawned(self.spawned_info(
+            &agent_id,
+            &prepared,
+            Instant::now(),
+        )));
+
+        let this = self.clone();
+        let spawn_agent = agent_id.clone();
+        let input = prepared.request.prompt.clone();
+        self.runtime.spawn(async move {
+            let _ = this
+                .execute_run(prepared, spawn_agent, token, Some(input), false)
+                .await;
+        });
+
+        Ok(SubagentLaunch {
+            agent_id,
+            agent_name,
+            child_session_id,
+        })
+    }
+
+    fn stop(&self, agent_id: &str) {
+        let token = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .cloned();
+        if let Some(token) = token {
+            token.cancel();
+        }
+        self.registry.clear_pending(agent_id);
+    }
+
+    fn agents(&self) -> Vec<effibuddy_agent_core::AgentDescriptor> {
+        self.registry.all()
+    }
+
+    fn visible_agents(&self, viewer_agent_id: &str) -> Vec<effibuddy_agent_core::AgentDescriptor> {
+        self.registry.visible(viewer_agent_id)
+    }
+
+    fn send_agent_message(
+        &self,
+        from_session: &str,
+        to: &str,
+        kind: AgentMessageKind,
+        text: String,
+        data: Option<serde_json::Value>,
+    ) -> Result<AgentSendOutcome, ToolError> {
+        self.send_message(from_session, to, kind, text, data)
+    }
+
+    fn respond_approval(
+        &self,
+        agent_id: &str,
+        request_id: &str,
+        decision: ApprovalDecision,
+    ) -> bool {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .cloned();
+        match gate {
+            Some(gate) => gate.respond(request_id, decision),
+            None => false,
+        }
+    }
+
+    fn stop_all(&self) {
+        let tokens: Vec<CancellationToken> = self
+            .tokens
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for token in tokens {
+            token.cancel();
+        }
+        self.registry.clear_all_pending();
+    }
+}

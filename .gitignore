@@ -1,0 +1,51 @@
+# ---------- Rust / Cargo ----------
+/target/
+**/*.rs.bk
+*.pdb
+*.profraw
+*.profdata
+
+# Cargo 本地缓存（保留 .cargo/config.toml 之类的仓库配置）
+.cargo/registry/
+.cargo/git/
+
+# ---------- 密钥与环境变量（绝不提交） ----------
+deepseekAPIKey.env
+.env
+.env.*
+*.env
+!.env.example
+
+# ---------- 项目工具缓存 ----------
+/.mimosa/
+/.v2c/
+/.zcode/
+
+# ---------- 日志与临时产物 ----------
+*.log
+*.tmp
+*.temp
+/tmp/
+/dist/
+
+# ---------- 编辑器 / IDE ----------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ---------- 操作系统 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 构建 / 打包产物 ----------
+*.exe
+*.app
+*.dSYM/
+*.msi
+*.dmg
+*.deb
+*.rpm

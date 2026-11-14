@@ -1,0 +1,31 @@
+[package]
+name = "effibuddy-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "EffiBuddy — a GPUI desktop shell for a local-first coding agent"
+
+[[bin]]
+name = "effibuddy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+effibuddy-agent-core.workspace = true
+effibuddy-agent-tools.workspace = true
+effibuddy-ui.workspace = true
+gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar = { version = "2", features = ["inline"] }
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
+tempfile.workspace = true

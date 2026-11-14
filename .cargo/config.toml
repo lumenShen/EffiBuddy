@@ -1,0 +1,13 @@
+# 本仓库所在的 Windows 分区挂载为 fuseblk(NTFS)。链接器在 FUSE 文件系统上
+# 并行生成大体积测试二进制时会以 EOVERFLOW 失败（ld: final link failed:
+# Value too large for defined data type），因此把构建产物目录指到本机原生
+# btrfs 文件系统上。
+[build]
+target-dir = "/home/fedora/.cache/effibuddy-target"
+
+# 本机未安装 libxcb-devel / libxkbcommon-devel / libxkbcommon-x11-devel，
+# 只有运行时库 libxcb.so.1 / libxkbcommon.so.0 / libxkbcommon-x11.so.0。
+# gpui(x11) 经 xkbcommon crate 请求 -lxcb -lxkbcommon -lxkbcommon-x11，
+# 这里提供无版本 .so 符号链接的搜索目录（见该目录内说明）。
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-L", "native=/home/fedora/.local/lib/effibuddy-dev-links"]

@@ -1,0 +1,23 @@
+[package]
+name = "effibuddy-agent-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Built-in tools for the EffiBuddy agent runtime"
+
+[dependencies]
+async-trait.workspace = true
+effibuddy-agent-core.workspace = true
+effibuddy-agent-js.workspace = true
+futures.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

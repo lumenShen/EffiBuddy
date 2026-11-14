@@ -1,0 +1,15 @@
+[package]
+name = "effibuddy-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "EffiBuddy design system built on GPUI primitives"
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+pulldown-cmark.workspace = true
+unicode-segmentation.workspace = true
+# Direct dependency (not via workspace) so parallel work packages never touch the root manifest.
+unicode-width = "0.2"
