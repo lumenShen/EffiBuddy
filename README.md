@@ -152,6 +152,23 @@ cargo run -p effibuddy-app -- --computer-probe screenshot --out /tmp/effi.png
 
 Wayland 首次截图会触发 xdg-desktop-portal 的屏幕读取授权；输入则额外需要“远程控制”授权。详见 [docs/COMPUTER_USE.md](docs/COMPUTER_USE.md)。
 
+## 发布与更新
+
+发布由 GitHub Actions 全自动完成（[.github/workflows/release.yml](.github/workflows/release.yml)）：推送 `v*` tag（或在 Actions 页手动触发并填 tag）即启动 Windows + Linux 双平台构建，全部成功后自动把产物上传到 [Releases](https://github.com/lumenShen/EffiBuddy/releases)：
+
+| 平台 | 产物 |
+| --- | --- |
+| Linux x64 | `EffiBuddy-<版本>-linux-x86_64.tar.gz`（便携）+ `effibuddy_<版本>_amd64.deb` |
+| Windows x64 | `EffiBuddy-<版本>-windows-x86_64.zip`（便携）+ `EffiBuddy-<版本>-windows-x86_64-setup.exe`（NSIS 安装包，含开始菜单/桌面快捷方式与卸载器） |
+
+tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败（单一版本源）：
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0   # 触发发布
+```
+
+应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
+
 ## 工作区结构
 
 ```
