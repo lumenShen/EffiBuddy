@@ -577,10 +577,22 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - 配置：`<数据根目录>\config.json`（工作区、审批、默认权限模式、命令面板最近使用、主题、左侧栏折叠状态、右侧栏页签/宽度、上下文压缩百分比策略）；
 - 模型注册表：`<数据根目录>\providers.json`（供应商、模型、默认选择；损坏时保留原文件并回退内置配置）；
 - 用户级代理档案：`<数据根目录>\agents\*.md`（项目级 `<workspace>/.effibuddy/agents/*.md` 不受构建类型影响，随仓库分发）；
+- 崩溃报告：`<数据根目录>\crashes\crash-<时间>-<pid>.log`（只保留最近 20 份；数据目录不可写时退回系统临时目录的 `EffiBuddy-crashes`）；
 - 预览模式创建的会话不会写入磁盘；
 - 目录创建失败时回退到 `.effibuddy/sessions`，不会 panic。
 
 多文件夹项目的数据流：`SessionState.project_id` 是归属键；新会话 `cwd` 固定为项目主文件夹，其余文件夹通过 `HarnessConfig.additional_workspaces` → `ToolContext.additional_workspaces` → `SubagentRequest.additional_workspaces` 逐层传给工具与子代理，系统提示列出附加目录。文件树、git 状态与项目指令只认会话 cwd（ZCode 对齐），附加目录的文件以绝对路径访问与展示。旧 `SessionState.project` 路径保留为迁移种子与降级标签，分组时 `project_id` 优先、路径匹配兜底，未匹配的路径渲染为临时 legacy 分组，历史不会因注册表丢失而消失。
+
+### 崩溃上报（`app/crash.rs`）
+
+`main` 在创建窗口前安装 panic hook。hook 先把报告写入崩溃目录（版本、时间、系统、线程、位置、panic 消息、强制捕获的回溯），再链到原 hook，因此终端启动时仍然能看到默认的 panic 输出。随后只有**主线程** panic 才会拉起上报窗口：GPUI 事件循环在主线程，这类 panic 会让进程退出；tokio worker 与 harness 用 `catch_unwind` 隔离的工具 panic 只落盘、不弹窗，避免应用继续运行时出现假“崩溃”。
+
+窗口不是进程内再开一个窗口，而是用 `--crash-report <日志路径>` 重新执行自身：
+
+- panic 可能在 unwind 穿过平台 FFI 事件循环时直接 abort，此时进程内已经无法继续运行；子进程是唯一能活下来的展示方式；
+- 上报器启动时不安装 hook（否则它自己失败会递归拉起上报器），模式分发在 `Application::new()` 之前完成；
+- 窗口显示崩溃原因、位置与可滚动的日志（超过 128 KiB 只显示头部，完整内容在文件里），并提供「复制日志」（复制文件原文，不受显示上限影响）、「打开日志文件」、「在文件夹中显示」、「重新启动」、「关闭」；
+- 同一进程只拉起一次窗口（双 panic 时避免竞态）；日志写入失败（只读数据目录、磁盘满）时退回临时目录。
 
 ## 12. 测试策略
 

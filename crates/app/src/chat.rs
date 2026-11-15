@@ -438,6 +438,10 @@ pub(crate) struct ChatList {
     pub glide_frame_scheduled: bool,
     /// Turn 展开时刻；展开窗口内的新挂载内容做 stagger 渐显。
     turn_expand_at: HashMap<String, Instant>,
+    /// 已经播过自动展开渐显的 turn。`turn_expand_at` 会按窗口过期清理，
+    /// 而运行中的 turn 每帧都满足「自动展开」，若不记住「已播过」，清理
+    /// 后的下一帧就会重新打点，让整个活动栈在每个工具步骤之后重播渐显。
+    revealed_turns: HashSet<String>,
     /// Turn 展开内容的自然高度（渲染期由屏幕外观测副本回填）：高度渐显按
     /// 「进度 × 自然高度」逐帧长高，列表重测后下方内容平滑让位。
     turn_block_heights: Rc<RefCell<HashMap<String, f32>>>,
@@ -476,6 +480,7 @@ impl ChatList {
             glide: ScrollGlide::new(),
             glide_frame_scheduled: false,
             turn_expand_at: HashMap::new(),
+            revealed_turns: HashSet::new(),
             turn_block_heights: Rc::new(RefCell::new(HashMap::new())),
             turn_height_frame_scheduled: false,
         }
@@ -528,6 +533,7 @@ impl ChatList {
         self.first_slots.clear();
         self.glide = ScrollGlide::new();
         self.turn_expand_at.clear();
+        self.revealed_turns.clear();
         self.turn_block_heights.borrow_mut().clear();
         self.list_state.reset(0);
     }
@@ -536,6 +542,29 @@ impl ChatList {
     pub fn note_turn_expanded(&mut self, turn_id: &str) {
         self.turn_expand_at
             .insert(turn_id.to_string(), Instant::now());
+    }
+
+    /// 展开窗口过期后清理打点。自动展开的 live turn 不会因此重新打点——
+    /// 记录仍在 `revealed_turns` 里，见 [`Self::note_auto_expanded`]。
+    fn expire_turn_reveals(&mut self) {
+        self.turn_expand_at
+            .retain(|_, at| at.elapsed() < TURN_EXPAND_WINDOW * 2);
+    }
+
+    /// 自动展开（live turn）只打点一次：`turn_expand_at` 的条目会在窗口
+    /// 过期后清理，但 turn 仍然是 live，若重新打点就会周期性重播整套展开
+    /// 动画。手动展开走 [`Self::note_turn_expanded`]，仍然可以重播。
+    ///
+    /// 以关联函数形式接收两个字段，`prepare_frame` 遍历 `items` 时才能做
+    /// 不相交的字段借用。
+    fn note_auto_expanded(
+        revealed: &mut HashSet<String>,
+        expand_at: &mut HashMap<String, Instant>,
+        turn_id: &str,
+    ) {
+        if revealed.insert(turn_id.to_string()) {
+            expand_at.insert(turn_id.to_string(), Instant::now());
+        }
     }
 
     /// Rebuild the item snapshot from the session. Only invoked when a
@@ -727,6 +756,15 @@ impl ChatList {
         for item in &items {
             next_entered.insert(item.id.clone(), item.entered_at);
         }
+        // 已播过渐显的记录只跟着现存 turn 走：编辑/撤销把 turn 从尾部截掉后
+        // 不必再为它保留记录，长期会话也不会无限增长。
+        let turn_ids: HashSet<&str> = items
+            .iter()
+            .filter(|item| matches!(&item.kind, ChatItemKind::Turn(_)))
+            .map(|item| item.id.as_str())
+            .collect();
+        self.revealed_turns
+            .retain(|id| turn_ids.contains(id.as_str()));
 
         self.prompt_marks = Rc::new(build_prompt_marks(&items, run.running));
         self.items = Rc::new(items);
@@ -781,8 +819,7 @@ impl ChatList {
         };
 
         // 展开动画只在窗口内生效；过期的时刻顺手清掉，避免无限增长。
-        self.turn_expand_at
-            .retain(|_, at| at.elapsed() < TURN_EXPAND_WINDOW * 2);
+        self.expire_turn_reveals();
         // 高度缓存与展开时刻同寿命：key 形如 `turn:… #activity|#tools`。
         {
             let heights = self.turn_block_heights.clone();
@@ -825,9 +862,11 @@ impl ChatList {
                         streaming_id.as_deref(),
                     );
                 if auto_expanded {
-                    self.turn_expand_at
-                        .entry(turn.id.clone())
-                        .or_insert_with(Instant::now);
+                    Self::note_auto_expanded(
+                        &mut self.revealed_turns,
+                        &mut self.turn_expand_at,
+                        &turn.id,
+                    );
                 }
             }
             // The streaming message is always the newest assistant message:
@@ -4904,6 +4943,89 @@ mod tests {
             panic!("expected a merged turn block");
         };
         assert!(Rc::ptr_eq(&old_member, &turn.members[0]));
+    }
+
+    #[test]
+    fn auto_expand_reveal_is_armed_once_per_turn() {
+        let mut session = SessionState::new(std::env::temp_dir(), "test");
+        session.push_message(Message::user("hello"));
+        let mut first = Message::assistant();
+        first.set_text("working");
+        session.push_message(first);
+        let mut second = Message::assistant();
+        second.set_text("done");
+        session.push_message(second.clone());
+
+        let mut chat = ChatList::new();
+        let run = RunSnapshot {
+            running: true,
+            ..RunSnapshot::default()
+        };
+        chat.rebuild(&session, &run);
+        // The turn's last message is the live streaming one.
+        chat.begin_message(&second.id);
+        let entity = WeakEntity::<AppView>::new_invalid();
+        let none = HashSet::new();
+        let mut prepare = |chat: &mut ChatList| {
+            chat.prepare_frame(
+                true,
+                true,
+                &none,
+                &none,
+                &none,
+                &none,
+                &HashMap::new(),
+                &entity,
+            )
+        };
+        let turn_id = chat.items[1].id.clone();
+
+        prepare(&mut chat);
+        assert!(chat.turn_expand_at.contains_key(&turn_id));
+        let armed_at = chat.turn_expand_at[&turn_id];
+
+        // Still live on the next frame: the timestamp must not move.
+        prepare(&mut chat);
+        assert_eq!(chat.turn_expand_at[&turn_id], armed_at);
+
+        // `prepare_frame` prunes the expired window; the live turn is still
+        // auto-expanded, but the reveal must not be re-armed — otherwise the
+        // whole activity stack fades in again after every tool step.
+        chat.turn_expand_at.insert(
+            turn_id.clone(),
+            Instant::now() - TURN_EXPAND_WINDOW * 2,
+        );
+        let view = prepare(&mut chat);
+        assert!(!view.turn_expand_at.contains_key(&turn_id));
+        assert!(!chat.turn_expand_at.contains_key(&turn_id));
+
+        // Manual expand stays a deliberate replay.
+        chat.note_turn_expanded(&turn_id);
+        let view = prepare(&mut chat);
+        assert!(view.turn_expand_at.contains_key(&turn_id));
+    }
+
+    #[test]
+    fn rebuild_forgets_reveals_of_removed_turns() {
+        let mut session = SessionState::new(std::env::temp_dir(), "test");
+        session.push_message(Message::user("hello"));
+        let mut first = Message::assistant();
+        first.set_text("working");
+        session.push_message(first);
+        let mut second = Message::assistant();
+        second.set_text("done");
+        session.push_message(second);
+
+        let mut chat = ChatList::new();
+        chat.rebuild(&session, &RunSnapshot::default());
+        let turn_id = chat.items[1].id.clone();
+        ChatList::note_auto_expanded(&mut chat.revealed_turns, &mut chat.turn_expand_at, &turn_id);
+        assert!(chat.revealed_turns.contains(&turn_id));
+
+        // Undo drops the turn from the transcript; the bookkeeping goes too.
+        session.messages.truncate(2);
+        chat.rebuild(&session, &RunSnapshot::default());
+        assert!(!chat.revealed_turns.contains(&turn_id));
     }
 
     #[test]

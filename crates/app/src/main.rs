@@ -10,6 +10,7 @@ mod composer_menu;
 mod computer;
 mod config;
 mod context_meter;
+mod crash;
 mod draft_store;
 mod events;
 mod file_menu;
@@ -42,6 +43,20 @@ use crate::config::AppConfig;
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
 
 fn main() {
+    // Crash reporter mode: a separate process that survives whatever killed
+    // the main one and shows the saved report. It must not install the panic
+    // hook again, or a reporter failure would spawn reporters forever.
+    if std::env::args().any(|argument| argument == crash::CRASH_REPORT_ARG) {
+        match crash::crash_report_path() {
+            Some(path) => crash::run_crash_report_window(path),
+            None => {
+                eprintln!("`{}` requires a crash log path", crash::CRASH_REPORT_ARG);
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+
     // CI smoke test and packaging scripts read the version headlessly; this
     // must exit before any window/GPU initialization.
     if std::env::args().any(|argument| argument == "--version") {
@@ -52,6 +67,10 @@ fn main() {
         run_computer_probe();
         return;
     }
+
+    // A UI-thread panic otherwise takes the window down without a trace when
+    // the app was started from a launcher. Keep the log and leave a window.
+    crash::install_panic_reporter();
 
     Application::new()
         .with_assets(EffiBuddyAssets)
