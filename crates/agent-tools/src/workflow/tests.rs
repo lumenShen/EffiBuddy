@@ -86,6 +86,7 @@ fn context(spawner: Arc<RecordingSpawner>) -> ToolContext {
         cancel: CancellationToken::new(),
         nested: None,
         subagents: Some(spawner),
+        checkpoint_sink: None,
     }
 }
 

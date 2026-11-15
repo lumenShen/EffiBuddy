@@ -21,7 +21,7 @@ use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, MotionController, MotionSpec,
     Spinner, TextInputOptions, TextInputState, TextInputView, Theme, disclosure_chevron, divider,
     ease_out_cubic, empty_state, icons, kbd, motion_item, overlay_motion_duration, radius,
-    shadow_float, small_badge,
+    reduce_motion, shadow_float, small_badge,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Div,
@@ -37,6 +37,7 @@ use crate::chat::{
     AgentCard, ChatList, RunSnapshot, agent_color, render_chat_item, render_scroll_to_bottom,
     render_scrollbar,
 };
+use crate::checkpoint::{RestoreAction, RestorePlan};
 use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
 use crate::config::AppConfig;
 use crate::events::{AppEvent, SubagentSpawnedInfo};
@@ -54,9 +55,55 @@ use crate::store::{PendingSave, SessionStore, SessionSummary};
 use crate::subagent::SubagentService;
 
 /// Expanded left sidebar width. The titlebar brand block mirrors it so the
-/// two form one continuous column; when collapsed the sidebar is removed
-/// entirely and only the main column remains.
+/// two form one continuous column; when collapsed the sidebar slides out over
+/// [`PANE_SLIDE_SECS`] and is then removed from the tree.
 const SIDEBAR_WIDTH: f32 = 272.0;
+
+/// One in-flight slide of the left sidebar or the right side pane. Progress
+/// follows `MotionSpec::LAYOUT`'s 220ms ease-out so a collapse reads like the
+/// app's other layout motion.
+#[derive(Clone, Copy)]
+struct PaneSlide {
+    start: Instant,
+    from: f32,
+    to: f32,
+}
+
+/// Slide duration in seconds, mirroring `MotionSpec::LAYOUT`.
+const PANE_SLIDE_SECS: f32 = 0.22;
+
+/// Advance a panel slide toward `target` (0 = hidden, 1 = shown); returns
+/// whether the slide still needs frames. The first frame that sees an unmet
+/// target starts a slide from the current progress, and a mid-flight retarget
+/// restarts from wherever the panel currently is, so rapid toggles never jump.
+fn advance_pane_slide(slide: &mut Option<PaneSlide>, progress: &mut f32, target: f32) -> bool {
+    if reduce_motion() {
+        *slide = None;
+        *progress = target;
+        return false;
+    }
+    if *progress == target && slide.is_none() {
+        return false;
+    }
+    let now = Instant::now();
+    let state = match slide {
+        Some(state) if state.to == target => *state,
+        _ => PaneSlide {
+            start: now,
+            from: *progress,
+            to: target,
+        },
+    };
+    let t = (now.saturating_duration_since(state.start).as_secs_f32() / PANE_SLIDE_SECS).min(1.0);
+    if t >= 1.0 {
+        *progress = state.to;
+        *slide = None;
+        return false;
+    }
+    *progress = state.from + (state.to - state.from) * ease_out_cubic(t);
+    *slide = Some(state);
+    true
+}
 
 actions!(
     effibuddy_app,
@@ -162,12 +209,56 @@ pub(crate) struct ActiveRun {
     handle: AgentHandle,
     approval: Arc<BrokerApprovalGate>,
     started_at: Instant,
+    /// Bound to the user message that owns this run once `RunStarted` lands.
+    checkpoint: Option<Arc<crate::checkpoint::CheckpointRecorder>>,
+}
+
+/// Delivery lane for a message typed while a run is active. `Queue` waits for
+/// the turn to finish and then starts a new one; `Steer` is handed to the
+/// harness and injected at the next step boundary inside the current turn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingInputKind {
+    Queue,
+    Steer,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingInput {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    pub(crate) kind: PendingInputKind,
 }
 
 #[derive(Clone)]
 pub(crate) struct PendingApproval {
     pub(crate) agent_id: Option<String>,
     pub(crate) request: ApprovalRequest,
+}
+
+/// Composer-side editing state for a user message. Sending truncates the
+/// transcript at `message_id` and (optionally) restores this turn's files.
+#[derive(Clone)]
+pub(crate) struct EditMessageState {
+    pub message_id: String,
+    pub plan: RestorePlan,
+    pub include_files: bool,
+}
+
+/// Second-step confirmation before a user message and its files are removed.
+#[derive(Clone)]
+pub(crate) struct UndoDialogState {
+    pub message_id: String,
+    pub excerpt: String,
+    pub plan: RestorePlan,
+}
+
+/// Shown when the edited turn has files that cannot be restored safely. The
+/// conversation is not trimmed until the user chooses an explicit action.
+#[derive(Clone)]
+pub(crate) struct EditConflictState {
+    pub message_id: String,
+    pub text: String,
+    pub plan: RestorePlan,
 }
 
 /// Popover anchored to a project's "more" button in the sidebar.
@@ -231,6 +322,13 @@ pub struct AppView {
     pub(crate) active: Option<ActiveSession>,
     pub(crate) active_run: Option<ActiveRun>,
     pub(crate) pending_approvals: Vec<PendingApproval>,
+    /// User message currently being edited in the composer. The next submit
+    /// trims the transcript at this message and optionally restores files.
+    pub(crate) edit_message: Option<EditMessageState>,
+    /// Secondary confirmation for the hover “撤销” action.
+    pub(crate) undo_dialog: Option<UndoDialogState>,
+    /// Edit conflict dialog: the conversation is not trimmed until resolved.
+    pub(crate) edit_conflict: Option<EditConflictState>,
     /// Update check state (see `update.rs`); results arrive via `AppEvent`.
     pub(crate) update: crate::update::UpdateState,
 
@@ -262,6 +360,16 @@ pub struct AppView {
     /// still matches, so continuous wheel-zoom writes disk once per gesture.
     pub(crate) graph_save_generation: u64,
     pending_subagent_notifications: Vec<String>,
+    /// Messages typed while a run was active, in admission order. Queue items
+    /// auto-drain one per finished turn; steer items vanish when the harness
+    /// reports them drained. In-memory only (like ZCode's queue): a crash
+    /// loses them and the user re-sends.
+    pending_inputs: Vec<PendingInput>,
+    /// Set when a run ends in Interrupted/Failed with the queue still full;
+    /// ZCode calls this error-paused. A held queue does not auto-drain — not
+    /// even after an unrelated background-notification run — until the user
+    /// sends from the bar or clears it.
+    queue_held: bool,
     agent_ticker_active: bool,
     /// Staged session saves, drained one at a time off the UI thread.
     persist_tx: UnboundedSender<PendingSave>,
@@ -340,6 +448,14 @@ pub struct AppView {
     sidebar_grouping_dirty: bool,
     /// Guards against scheduling more than one smooth-scroll frame at a time.
     scroll_frame_scheduled: bool,
+    /// Guards against scheduling more than one panel-slide frame at a time.
+    pane_frame_scheduled: bool,
+    /// Slide progress (0 = hidden, 1 = shown) of the left sidebar and the
+    /// right side pane, advanced per frame like the scroll glides.
+    sidebar_slide: Option<PaneSlide>,
+    sidebar_p: f32,
+    side_pane_slide: Option<PaneSlide>,
+    side_p: f32,
     run_ticker_active: bool,
     pub(crate) last_error: Option<String>,
     pub(crate) notice: Option<String>,
@@ -469,10 +585,15 @@ impl AppView {
         });
         let weak = cx.entity().downgrade();
         let composer = cx.new(|cx| {
+            let weak_alt = weak.clone();
             TextInputView::new(composer_state.clone(), cx)
                 .frameless(true)
                 .on_submit(move |text, window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.send_message(text, window, cx));
+                    let _ = weak.update(cx, |this, cx| this.send_message(text, false, window, cx));
+                })
+                .on_submit_alternate(move |text, window, cx| {
+                    let _ =
+                        weak_alt.update(cx, |this, cx| this.send_message(text, true, window, cx));
                 })
         });
         let composer_subscription = cx.observe(&composer_state, |_, _, cx| cx.notify());
@@ -532,6 +653,9 @@ impl AppView {
         let side = SidePaneState::new(cx, &config, config.workspace());
         let settings = SettingsState::new(cx, &config, &models);
 
+        // Read the collapse flags before `config` moves into the struct.
+        let sidebar_collapsed = config.sidebar_collapsed;
+        let side_bar_open = config.side_bar_open;
         let mut view = Self {
             config,
             models,
@@ -543,6 +667,9 @@ impl AppView {
             active,
             active_run: None,
             pending_approvals: Vec::new(),
+            edit_message: None,
+            undo_dialog: None,
+            edit_conflict: None,
             update: Default::default(),
             computer,
             computer_overlay: None,
@@ -557,6 +684,8 @@ impl AppView {
             graph: GraphView::new(),
             graph_save_generation: 0,
             pending_subagent_notifications: Vec::new(),
+            pending_inputs: Vec::new(),
+            queue_held: false,
             agent_ticker_active: false,
             persist_tx,
             last_persist: None,
@@ -593,6 +722,11 @@ impl AppView {
             motion: MotionController::new(),
             sidebar_grouping_dirty: false,
             scroll_frame_scheduled: false,
+            pane_frame_scheduled: false,
+            sidebar_slide: None,
+            sidebar_p: if sidebar_collapsed { 0.0 } else { 1.0 },
+            side_pane_slide: None,
+            side_p: if side_bar_open { 1.0 } else { 0.0 },
             run_ticker_active: false,
             last_error: None,
             notice: None,
@@ -1208,6 +1342,35 @@ impl AppView {
             .map(|active| lock_session(&active.shared).id.clone())
     }
 
+    /// Drop edit/undo UI when the transcript under it changes identity.
+    fn clear_message_editing(&mut self) {
+        self.edit_message = None;
+        self.undo_dialog = None;
+        self.edit_conflict = None;
+    }
+
+    /// A rewind mutates the transcript and the workspace, so it must wait for
+    /// the main run *and* every background child to stop.
+    fn message_rewind_blocked(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.active_run.is_some() {
+            self.notice = Some("任务运行中，结束后才能编辑或撤销消息。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return true;
+        }
+        if self
+            .subagent_tasks
+            .iter()
+            .any(|task| task.status == SubagentStatus::Running)
+        {
+            self.notice = Some("子代理仍在运行，请先停止后再编辑或撤销消息。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn active_shared(&self) -> Option<SharedSession> {
         self.active.as_ref().map(|active| active.shared.clone())
     }
@@ -1333,17 +1496,554 @@ impl AppView {
         .detach();
     }
 
-    fn send_message(&mut self, text: String, _window: &mut Window, cx: &mut Context<Self>) {
+    fn send_message(
+        &mut self,
+        text: String,
+        steer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.trim().to_string();
         if text.is_empty() {
             return;
         }
         if self.active_run.is_some() {
-            self.notice = Some("当前任务仍在运行，请先停止。".to_string());
+            if self.edit_message.is_some() {
+                self.restore_composer_text(text, window, cx);
+                return;
+            }
+            // Running: never reject. Enter queues for a fresh turn; Ctrl+Enter
+            // hands the message to the harness for the next step boundary.
+            if steer {
+                let steer_id = self
+                    .active_run
+                    .as_ref()
+                    .expect("checked active_run above")
+                    .handle
+                    .steer(text.clone());
+                self.pending_inputs.push(PendingInput {
+                    id: steer_id,
+                    text,
+                    kind: PendingInputKind::Steer,
+                });
+                self.notice = Some("将在下一个步骤边界插入当前回合。".to_string());
+            } else {
+                self.pending_inputs.push(PendingInput {
+                    id: effibuddy_agent_core::ids::new_id(),
+                    text,
+                    kind: PendingInputKind::Queue,
+                });
+                self.notice = Some("已加入队列，当前回合结束后自动发送。".to_string());
+            }
             cx.notify();
             return;
         }
+        if self.edit_message.is_some() {
+            self.commit_edit_message(text, window, cx);
+            return;
+        }
         self.start_run(Some(text), cx);
+    }
+
+    /// Drop one pending input from the queue bar.
+    pub(crate) fn remove_pending_input(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.pending_inputs.retain(|input| input.id != id);
+        if self.pending_inputs.is_empty() {
+            self.queue_held = false;
+        }
+        cx.notify();
+    }
+
+    /// "Send now" on a queued item. While a run is active this converts it
+    /// into a steer (jumps ahead of the remaining queue); when idle it starts
+    /// the run immediately — the manual disposition for a held queue.
+    pub(crate) fn send_pending_input_now(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(position) = self.pending_inputs.iter().position(|input| input.id == id) else {
+            return;
+        };
+        let Some(input) = self.pending_inputs.get(position) else {
+            return;
+        };
+        if input.kind == PendingInputKind::Steer {
+            return; // already handed to the harness; injection is pending
+        }
+        let text = input.text.clone();
+        let running = self.active_run.is_some();
+        self.pending_inputs.remove(position);
+        self.queue_held = false;
+        if running {
+            let steer_id = self
+                .active_run
+                .as_ref()
+                .expect("running checked above")
+                .handle
+                .steer(text.clone());
+            self.pending_inputs.push(PendingInput {
+                id: steer_id,
+                text,
+                kind: PendingInputKind::Steer,
+            });
+            self.notice = Some("将在下一个步骤边界插入当前回合。".to_string());
+        } else {
+            self.notice = None;
+            self.start_run(Some(text), cx);
+            return;
+        }
+        cx.notify();
+    }
+
+    /// Enter edit mode for a user message. The composer receives the original
+    /// text; submitting trims the transcript at this message and, by default,
+    /// restores every file the turn changed.
+    pub(crate) fn begin_edit_message(
+        &mut self,
+        message_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.message_rewind_blocked(cx) {
+            return;
+        }
+        let Some(shared) = self.active_shared() else {
+            return;
+        };
+        let root = crate::checkpoint::checkpoint_root();
+        let (text, plan) = {
+            let session = lock_session(&shared);
+            let Some(message) = session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+            else {
+                self.notice = Some("这条消息已不在当前会话中。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            };
+            if message.role != effibuddy_agent_core::Role::User
+                || message.synthetic
+                || message.agent_message.is_some()
+            {
+                self.notice = Some("只能编辑用户输入的消息。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            }
+            let Ok(plan) = crate::checkpoint::plan_restore(&session, message_id, &root) else {
+                self.notice = Some("无法读取这轮消息的文件检查点。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            };
+            (message.text(), plan)
+        };
+        let include_files = plan.has_file_changes();
+        self.edit_message = Some(EditMessageState {
+            message_id: message_id.to_string(),
+            plan,
+            include_files,
+        });
+        self.undo_dialog = None;
+        self.edit_conflict = None;
+        self.composer_state
+            .update(cx, |state, cx| state.set_content(text, window, cx));
+        self.composer_focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    pub(crate) fn cancel_edit_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.edit_message = None;
+        self.edit_conflict = None;
+        self.composer_state
+            .update(cx, |state, cx| state.clear(window, cx));
+        self.composer_focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_edit_files(&mut self, cx: &mut Context<Self>) {
+        if let Some(edit) = &mut self.edit_message {
+            edit.include_files = !edit.include_files;
+            cx.notify();
+        }
+    }
+
+    /// Submit from edit mode. The plan is recomputed here so a file changed
+    /// while the composer was open cannot be clobbered silently.
+    fn commit_edit_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut edit) = self.edit_message.take() else {
+            return;
+        };
+        if self.message_rewind_blocked(cx) {
+            self.edit_message = Some(edit);
+            self.restore_composer_text(text, window, cx);
+            return;
+        }
+        if !self.run_ready(cx) {
+            self.edit_message = Some(edit);
+            self.restore_composer_text(text, window, cx);
+            return;
+        }
+        let Some(shared) = self.active_shared() else {
+            self.edit_message = Some(edit);
+            return;
+        };
+        let root = crate::checkpoint::checkpoint_root();
+        let plan = {
+            let session = lock_session(&shared);
+            match crate::checkpoint::plan_restore(&session, &edit.message_id, &root) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.edit_message = Some(edit);
+                    self.last_error = Some(error);
+                    self.restore_composer_text(text, window, cx);
+                    return;
+                }
+            }
+        };
+        edit.plan = plan;
+
+        if edit.include_files && !edit.plan.can_restore() {
+            // Conflict dialogs are rare; clone the plan so the edit state can
+            // be restored if the user cancels.
+            let plan = edit.plan.clone();
+            let message_id = edit.message_id.clone();
+            self.edit_message = Some(edit);
+            self.edit_conflict = Some(EditConflictState {
+                message_id,
+                text,
+                plan,
+            });
+            window.blur();
+            cx.notify();
+            return;
+        }
+
+        let restore = edit.include_files && edit.plan.has_file_changes() && edit.plan.can_restore();
+        match self.trim_conversation(&edit.message_id, restore.then_some(&edit.plan), cx) {
+            Ok(restored) => {
+                self.edit_message = None;
+                self.edit_conflict = None;
+                self.composer_state
+                    .update(cx, |state, cx| state.clear(window, cx));
+                self.last_error = None;
+                self.start_run(Some(text), cx);
+                self.composer_focus_handle(cx).focus(window);
+                if self.active_run.is_some() && restored > 0 {
+                    self.notice = Some(format!("已还原 {restored} 个文件，正在发送…"));
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.edit_message = Some(edit);
+                self.last_error = Some(error);
+                self.restore_composer_text(text, window, cx);
+            }
+        }
+    }
+
+    fn restore_composer_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_state
+            .update(cx, |state, cx| state.set_content(text, window, cx));
+        self.composer_focus_handle(cx).focus(window);
+        self.edit_conflict = None;
+        self.chat_dirty = true;
+        cx.notify();
+    }
+
+    /// Open the secondary confirmation for undoing a user message.
+    pub(crate) fn request_undo_message(
+        &mut self,
+        message_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.message_rewind_blocked(cx) {
+            return;
+        }
+        if self.edit_message.is_some() {
+            self.notice = Some("请先取消当前的消息编辑。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return;
+        }
+        let Some(shared) = self.active_shared() else {
+            return;
+        };
+        let root = crate::checkpoint::checkpoint_root();
+        let (excerpt, plan) = {
+            let session = lock_session(&shared);
+            let Some(message) = session
+                .messages
+                .iter()
+                .find(|message| message.id == message_id)
+            else {
+                self.notice = Some("这条消息已不在当前会话中。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            };
+            if message.role != effibuddy_agent_core::Role::User
+                || message.synthetic
+                || message.agent_message.is_some()
+            {
+                self.notice = Some("只能撤销用户输入的消息。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            }
+            let excerpt = preview_text(&message.text(), 120);
+            let Ok(plan) = crate::checkpoint::plan_restore(&session, message_id, &root) else {
+                self.notice = Some("无法读取这轮消息的文件检查点。".to_string());
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            };
+            (excerpt, plan)
+        };
+        self.undo_dialog = Some(UndoDialogState {
+            message_id: message_id.to_string(),
+            excerpt,
+            plan,
+        });
+        self.edit_conflict = None;
+        // The dialog has no text input; drop composer focus so typing cannot
+        // edit the transcript draft behind the modal.
+        window.blur();
+        cx.notify();
+    }
+
+    pub(crate) fn close_undo_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.undo_dialog = None;
+        self.composer_focus_handle(cx).focus(window);
+        cx.notify();
+    }
+
+    /// Cancel the edit-conflict dialog and hand the drafted text back to the
+    /// composer, still in edit mode.
+    pub(crate) fn dismiss_edit_conflict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(conflict) = self.edit_conflict.take() {
+            self.composer_state.update(cx, |state, cx| {
+                state.set_content(conflict.text, window, cx);
+            });
+            self.composer_focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Resolve an edit conflict by trimming only the conversation and sending
+    /// the edited text; the conflicting files are left untouched.
+    pub(crate) fn send_edit_without_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(conflict) = self.edit_conflict.take() else {
+            return;
+        };
+        if self.message_rewind_blocked(cx) {
+            self.edit_conflict = Some(conflict);
+            return;
+        }
+        if !self.run_ready(cx) {
+            self.edit_conflict = Some(conflict);
+            return;
+        }
+        match self.trim_conversation(&conflict.message_id, None, cx) {
+            Ok(_) => {
+                self.edit_message = None;
+                self.composer_state
+                    .update(cx, |state, cx| state.clear(window, cx));
+                self.last_error = None;
+                self.start_run(Some(conflict.text), cx);
+                self.composer_focus_handle(cx).focus(window);
+                if self.active_run.is_some() {
+                    self.notice = Some("已重置对话；冲突文件未改动。".to_string());
+                    cx.notify();
+                }
+            }
+            Err(error) => {
+                self.edit_conflict = Some(conflict);
+                self.last_error = Some(error);
+                self.chat_dirty = true;
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn confirm_undo(
+        &mut self,
+        restore_files: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.undo_dialog.take() else {
+            return;
+        };
+        if self.message_rewind_blocked(cx) {
+            self.undo_dialog = Some(dialog);
+            return;
+        }
+        let mut succeeded = false;
+        let restore = restore_files && dialog.plan.can_restore() && dialog.plan.has_file_changes();
+        match self.trim_conversation(&dialog.message_id, restore.then_some(&dialog.plan), cx) {
+            Ok(restored) => {
+                succeeded = true;
+                self.last_error = None;
+                let shell_note = if dialog.plan.shell_commands.is_empty() {
+                    ""
+                } else {
+                    "；shell 改动无法追踪"
+                };
+                self.notice = Some(if restored > 0 {
+                    format!("已撤销这条消息，并还原 {restored} 个文件{shell_note}。")
+                } else if dialog.plan.has_file_changes() {
+                    format!("已撤销这条消息；文件改动未还原{shell_note}。")
+                } else if !dialog.plan.shell_commands.is_empty() {
+                    "已撤销这条消息；shell 命令造成的改动无法追踪。".to_string()
+                } else {
+                    "已撤销这条消息。".to_string()
+                });
+                self.chat.pin_to_bottom();
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                // Re-run the preflight so the dialog shows the new on-disk
+                // state (for example a file that changed during confirmation)
+                // instead of repeating a doomed restore with a stale plan.
+                let message_id = dialog.message_id.clone();
+                let excerpt = dialog.excerpt.clone();
+                let root = crate::checkpoint::checkpoint_root();
+                let refreshed = self.active_shared().and_then(|shared| {
+                    let session = lock_session(&shared);
+                    crate::checkpoint::plan_restore(&session, &message_id, &root).ok()
+                });
+                self.undo_dialog = Some(UndoDialogState {
+                    message_id,
+                    excerpt,
+                    plan: refreshed.unwrap_or(dialog.plan),
+                });
+                self.chat_dirty = true;
+            }
+        }
+        if succeeded {
+            // The dialog had blurred the composer; restore focus so keyboard
+            // shortcuts and the next draft behave normally.
+            self.composer_focus_handle(cx).focus(window);
+        }
+        cx.notify();
+    }
+
+    /// Validate that starting a run will not immediately fail. Used before a
+    /// destructive trim so a missing API key cannot cost the user their
+    /// transcript.
+    fn run_ready(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(shared) = self.active_shared() else {
+            self.last_error = Some("没有活动会话。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return false;
+        };
+        let workspace = lock_session(&shared).cwd.clone();
+        if !workspace.is_dir() {
+            self.last_error = Some(format!("工作区不可访问：{}", workspace.display()));
+            self.chat_dirty = true;
+            cx.notify();
+            return false;
+        }
+        if self.runtime.is_none() {
+            self.last_error = Some("后台运行时不可用。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return false;
+        }
+        let resolved = self.active_resolved_model();
+        if self.models.demo_mode(self.config.use_demo, &resolved) {
+            return true;
+        }
+        if !resolved.live {
+            self.last_error = Some(format!(
+                "供应商「{}」尚未配置 API Key。请在设置 → 模型中填写，或切换到其他供应商。",
+                resolved.provider_label()
+            ));
+            self.chat_dirty = true;
+            cx.notify();
+            return false;
+        }
+        if let Err(error) = resolved.build_provider() {
+            self.last_error = Some(format!("无法创建模型客户端：{error}"));
+            self.chat_dirty = true;
+            cx.notify();
+            return false;
+        }
+        true
+    }
+
+    /// Trim the transcript at `message_id`, optionally restoring files first.
+    /// File restoration is verified and atomic per file; the transcript is
+    /// only trimmed after the restore succeeded.
+    fn trim_conversation(
+        &mut self,
+        message_id: &str,
+        restore: Option<&RestorePlan>,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        let Some(shared) = self.active_shared() else {
+            return Err("没有活动会话。".to_string());
+        };
+        let cwd = {
+            let session = lock_session(&shared);
+            if session.message_position(message_id).is_none() {
+                return Err("这条消息已不在当前会话中。".to_string());
+            }
+            session.cwd.clone()
+        };
+        let restored = match restore {
+            Some(plan) => crate::checkpoint::apply_restore_at(plan, &cwd)?,
+            None => 0,
+        };
+
+        let root = crate::checkpoint::checkpoint_root();
+        {
+            let mut session = lock_session(&shared);
+            let Some(cut_index) = session.message_position(message_id) else {
+                return Err("这条消息已不在当前会话中。".to_string());
+            };
+            session.truncate_from(cut_index);
+            let live: HashSet<String> = session
+                .messages
+                .iter()
+                .map(|message| message.id.clone())
+                .collect();
+            let stale: Vec<String> = session
+                .checkpoints
+                .iter()
+                .filter(|checkpoint| !live.contains(&checkpoint.message_id))
+                .map(|checkpoint| checkpoint.message_id.clone())
+                .collect();
+            crate::checkpoint::drop_turn_checkpoints(&mut session, &stale, &root);
+            // No run or child is alive at this point; clear a stale busy flag
+            // left by an interrupted harness so the edited turn can restart.
+            session.set_status(RunStatus::Idle);
+            session.touch();
+        }
+        // Undo/edit is a deliberate structural change; save synchronously so
+        // the sidebar and a reopened session see the trimmed transcript even
+        // when the throttled background writer would still hold the old JSON.
+        // Preview sessions are never written to disk.
+        if !self.preview_mode {
+            let _ = self.save_active_metadata(&shared);
+        }
+        // A completed background child may still be waiting for its
+        // `<task-notification>` to be flushed. That turn no longer exists, so
+        // drop the notification instead of waking the model for removed work.
+        self.pending_subagent_notifications.clear();
+        // Queued user messages referenced the pre-trim conversation; drop
+        // them too so they cannot run against a rewound transcript.
+        self.pending_inputs.clear();
+        self.chat_dirty = true;
+        self.graph.invalidate();
+        self.chat.pin_to_bottom();
+        // Created files may have been deleted and restored files rewritten;
+        // keep the file pane honest without touching Git.
+        self.refresh_file_tree();
+        self.refresh_sessions(cx);
+        Ok(restored)
     }
 
     /// Start one parent turn. `input = None` resumes an existing transcript
@@ -1431,6 +2131,8 @@ impl AppView {
         } else {
             self.config.project_instructions()
         };
+        let checkpoint_recorder =
+            Arc::new(crate::checkpoint::CheckpointRecorder::new(shared.clone()));
         let harness_config = HarnessConfig {
             max_tokens: Some(resolved.max_output_tokens()),
             temperature: self.config.temperature,
@@ -1443,6 +2145,10 @@ impl AppView {
             auto_approve_tools: false,
             system_prompt_extra,
             tool_timeout: Duration::from_secs(180),
+            // `RunStarted` binds this to the user message that owns the turn;
+            // child harnesses inherit the same sink through the cloned config,
+            // so subagent edits land in the parent turn.
+            checkpoint_sink: Some(checkpoint_recorder.clone()),
             ..HarnessConfig::default()
         };
 
@@ -1533,6 +2239,7 @@ impl AppView {
             handle,
             approval,
             started_at: Instant::now(),
+            checkpoint: Some(checkpoint_recorder),
         });
         self.pending_approvals
             .retain(|pending| pending.agent_id.is_some());
@@ -1659,8 +2366,15 @@ impl AppView {
         let mut structural = false;
         match &event {
             HarnessEvent::RunStarted { run_id, .. } => {
+                let turn_id = self.active_shared().and_then(|shared| {
+                    let session = lock_session(&shared);
+                    session.latest_user_turn_id().map(str::to_string)
+                });
                 if let Some(run) = &mut self.active_run {
                     run.run_id = Some(run_id.clone());
+                    if let (Some(recorder), Some(turn_id)) = (&run.checkpoint, turn_id) {
+                        recorder.bind_turn(turn_id);
+                    }
                 }
                 self.persist_active(cx);
                 self.refresh_sessions(cx);
@@ -1714,8 +2428,34 @@ impl AppView {
                 self.persist_active(cx);
                 structural = true;
             }
+            HarnessEvent::SteerDrained { steer_id, .. } => {
+                // The steer is now a real transcript user message; drop the
+                // queue-bar entry that was waiting for injection.
+                self.pending_inputs
+                    .retain(|input| input.id != steer_id.as_str());
+                // Steered messages intentionally have no edit/undo actions:
+                // they ride inside the turn checkpoint owned by the prompt
+                // that started the run.
+                self.persist_active(cx);
+                structural = true;
+            }
             HarnessEvent::RunFinished { outcome, .. } => {
+                // Steers that never reached a step boundary (interrupt, hard
+                // failure) come back to the host. Bar entries still marked
+                // Steer are exactly those messages, so normalize them instead
+                // of re-pushing the reclaimed text.
+                if let Some(run) = &self.active_run {
+                    run.handle.take_pending_steers();
+                }
+                for input in &mut self.pending_inputs {
+                    input.kind = PendingInputKind::Queue;
+                }
                 self.active_run = None;
+                // A failed or interrupted turn pauses the queue (ZCode's
+                // error-paused state): the messages stay visible and the user
+                // decides whether to send or drop them.
+                self.queue_held =
+                    !matches!(outcome, RunOutcome::Completed) && !self.pending_inputs.is_empty();
                 self.pending_approvals
                     .retain(|pending| pending.agent_id.is_some());
                 // Hide the control bar and restore parked windows/workspace.
@@ -1763,7 +2503,7 @@ impl AppView {
         }
         if let HarnessEvent::RunFinished { outcome, .. } = &event {
             if outcome.is_success() {
-                self.maybe_flush_subagent_notifications(cx);
+                self.resume_after_run(cx);
             }
         }
         // Token deltas are picked up by the typewriter reveal loop, which
@@ -2226,6 +2966,7 @@ impl AppView {
             HarnessEvent::TodosUpdated { .. }
             | HarnessEvent::ContextCompacted { .. }
             | HarnessEvent::SessionChanged
+            | HarnessEvent::SteerDrained { .. }
             | HarnessEvent::UsageUpdated { .. } => {
                 structural = true;
             }
@@ -2331,6 +3072,48 @@ impl AppView {
         self.chat_dirty = true;
         self.notice = Some("正在汇总后台子代理的结果…".to_string());
         self.start_run(None, cx);
+    }
+
+    /// Continuation after a successful turn: auto-drain the queue head (one
+    /// message per turn, like DeepSeek Harness claiming a single `next-turn`
+    /// item) and fold pending background notifications into the same new turn,
+    /// ahead of the queued user message. A held queue (interrupt/failure) is
+    /// never resumed from here — not even by an unrelated notification run —
+    /// only by the user acting on the queue bar.
+    fn resume_after_run(&mut self, cx: &mut Context<Self>) {
+        if self.active_run.is_some() {
+            return;
+        }
+        let notifications = std::mem::take(&mut self.pending_subagent_notifications);
+        let head = if self.queue_held {
+            None
+        } else {
+            self.pending_inputs
+                .iter()
+                .position(|input| input.kind == PendingInputKind::Queue)
+        };
+        if notifications.is_empty() && head.is_none() {
+            return;
+        }
+        let head = head
+            .map(|index| self.pending_inputs.remove(index))
+            .map(|input| input.text);
+        if head.is_some() {
+            self.queue_held = false;
+        }
+        if !notifications.is_empty() {
+            let Some(active) = &self.active else {
+                return;
+            };
+            {
+                let mut session = lock_session(&active.shared);
+                session.push_message(Message::synthetic_user(notifications.join("\n\n")));
+                session.touch();
+            }
+            self.persist_active(cx);
+            self.chat_dirty = true;
+        }
+        self.start_run(head, cx);
     }
 
     fn ensure_agent_ticker(&mut self, cx: &mut Context<Self>) {
@@ -2688,6 +3471,7 @@ impl AppView {
             self.side.close_tab(&id);
         }
         self.pending_subagent_notifications.clear();
+        self.pending_inputs.clear();
         self.pending_approvals
             .retain(|pending| pending.agent_id.is_none());
     }
@@ -2807,7 +3591,11 @@ impl AppView {
     /// main content and owns wheel input; smooth-scroll overlays underneath
     /// must not claim the event.
     pub(crate) fn modal_blocks_scroll(&self) -> bool {
-        self.palette_open || self.model_menu.open || self.project_menu.project.is_some()
+        self.palette_open
+            || self.model_menu.open
+            || self.project_menu.project.is_some()
+            || self.undo_dialog.is_some()
+            || self.edit_conflict.is_some()
     }
 
     pub(crate) fn scroll_chat_to_bottom(&mut self) {
@@ -2857,6 +3645,7 @@ impl AppView {
         self.expanded_tools.clear();
         self.expanded_turns.clear();
         self.collapsed_turns.clear();
+        self.clear_message_editing();
         self.chat.reset_session();
         self.chat_dirty = true;
         self.chat.pin_to_bottom();
@@ -2955,6 +3744,7 @@ impl AppView {
         self.expanded_tools.clear();
         self.expanded_turns.clear();
         self.collapsed_turns.clear();
+        self.clear_message_editing();
         self.chat.reset_session();
         self.chat_dirty = true;
         self.chat.pin_to_bottom();
@@ -3011,13 +3801,15 @@ impl AppView {
     /// already-staged writes so an older transcript cannot win afterwards.
     fn save_active_metadata(&mut self, shared: &SharedSession) -> Result<(), String> {
         let snapshot = lock_session(shared).clone();
-        let result = self.store.save(&snapshot);
-        if result.is_ok()
-            && let Ok(save) = self.store.stage(&snapshot)
-        {
-            let _ = self.persist_tx.send(save);
-        }
-        result
+        // Serialize once. Write the JSON synchronously so the immediately
+        // following session scan sees the metadata, then queue the same
+        // payload behind older staged writes so an older transcript cannot
+        // win afterwards. The previous `save` + `stage` pair serialized the
+        // whole session twice on the UI thread.
+        let save = self.store.stage(&snapshot)?;
+        save.write()?;
+        let _ = self.persist_tx.send(save);
+        Ok(())
     }
 
     /// Archive a conversation: it leaves the sidebar and is kept in
@@ -3085,6 +3877,7 @@ impl AppView {
             self.expanded_tools.clear();
             self.expanded_turns.clear();
             self.collapsed_turns.clear();
+            self.clear_message_editing();
             self.chat.reset_session();
             self.chat_dirty = true;
             self.chat.pin_to_bottom();
@@ -3132,7 +3925,10 @@ impl AppView {
         }
         self.settings.archived_delete_confirm = None;
         match self.store.delete(id) {
-            Ok(()) => self.settings.status = Some((true, "已删除归档会话。".to_string())),
+            Ok(()) => {
+                crate::checkpoint::remove_session_checkpoints(id);
+                self.settings.status = Some((true, "已删除归档会话。".to_string()));
+            }
             Err(error) => self.settings.status = Some((false, error)),
         }
         self.refresh_archived_sessions(cx);
@@ -3581,7 +4377,6 @@ impl AppView {
             .iter()
             .filter(|task| task.status == SubagentStatus::Running)
             .count();
-        let sidebar_collapsed = self.config.sidebar_collapsed;
         div()
             .h(px(52.0))
             .flex()
@@ -3590,44 +4385,52 @@ impl AppView {
             .bg(theme.bg)
             .border_b_1()
             .border_color(theme.border)
-            .when(!sidebar_collapsed, |element| {
+            .when(self.sidebar_p > 0.001, |element| {
                 element.child(
                     div()
-                        .w(px(SIDEBAR_WIDTH))
+                        .w(px(SIDEBAR_WIDTH * self.sidebar_p))
                         .h_full()
-                        .flex()
                         .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .px_4()
+                        .when(self.sidebar_p < 1.0, |clip| clip.overflow_hidden())
                         .bg(theme.sidebar)
                         .border_r_1()
                         .border_color(theme.border)
                         .child(
-                            svg()
-                                .path(icons::SPARKLES)
-                                .size(px(16.0))
-                                .text_color(theme.text),
-                        )
-                        .child(
                             div()
-                                .text_size(px(13.5))
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.text)
-                                .child("EffiBuddy"),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            IconButton::new("sidebar-toggle", icons::PANEL_LEFT, theme)
-                                .size(26.0, 13.0)
-                                .tooltip("隐藏左侧栏 (Ctrl B)")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                                .w(px(SIDEBAR_WIDTH))
+                                .h_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_4()
+                                .child(
+                                    svg()
+                                        .path(icons::SPARKLES)
+                                        .size(px(16.0))
+                                        .text_color(theme.text),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(13.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(theme.text)
+                                        .child("EffiBuddy"),
+                                )
+                                .child(div().flex_1())
+                                .child(
+                                    IconButton::new("sidebar-toggle", icons::PANEL_LEFT, theme)
+                                        .size(26.0, 13.0)
+                                        .tooltip("隐藏左侧栏 (Ctrl B)")
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
+                                        ),
+                                ),
                         ),
                 )
             })
-            .when(sidebar_collapsed, |element| {
+            .when(self.sidebar_p < 0.999, |element| {
                 element.child(
-                    div().ml(px(8.0)).child(
+                    div().ml(px(8.0)).opacity(1.0 - self.sidebar_p).child(
                         IconButton::new("sidebar-expand", icons::PANEL_LEFT, theme)
                             .size(28.0, 14.0)
                             .tooltip("显示左侧栏 (Ctrl B)")
@@ -3759,13 +4562,14 @@ impl AppView {
                     }
                 },
             ))
-            .when(sidebar_collapsed, |element| {
+            .when(self.sidebar_p < 0.999, |element| {
                 element.child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(1.0))
                         .mr(px(6.0))
+                        .opacity(1.0 - self.sidebar_p)
                         .child(
                             IconButton::new(
                                 "titlebar-theme-toggle",
@@ -4085,14 +4889,6 @@ impl AppView {
         let scroll_entity = cx.entity().downgrade();
         let active_id = self.active_id();
         let running = self.active_run.is_some();
-        let workspace = self.config.workspace();
-        let workspace_label = workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| workspace.display().to_string());
-        let workspace_path = workspace.display().to_string();
         // Partition once; each group keeps the store's updated-at order, and
         // projects appear in order of their most recent conversation.
         let mut pinned: Vec<&SessionSummary> = Vec::new();
@@ -4409,74 +5205,44 @@ impl AppView {
             )
             .child(divider(theme))
             .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("sidebar-workspace")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .h(px(26.0))
-                            .text_size(px(11.5))
-                            .text_color(theme.text_muted)
-                            .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
-                            .child(
-                                svg()
-                                    .path(icons::FOLDER)
-                                    .size(px(13.0))
-                                    .text_color(theme.text_faint),
+                div().px_4().py_3().flex().flex_col().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            IconButton::new(
+                                "theme-toggle",
+                                if theme.is_dark() {
+                                    icons::SUN
+                                } else {
+                                    icons::MOON
+                                },
+                                theme,
                             )
-                            .child(
+                            .size(28.0, 14.0)
+                            .tooltip("切换主题 (Ctrl+Shift+T)")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                        )
+                        .child(
+                            Button::new("settings", "设置", theme)
+                                .icon(icons::SETTINGS)
+                                .size(ButtonSize::Sm)
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(window, cx)
+                                })),
+                        )
+                        .when(running, |element| {
+                            element.child(
                                 div()
                                     .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .child(workspace_label),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    "theme-toggle",
-                                    if theme.is_dark() {
-                                        icons::SUN
-                                    } else {
-                                        icons::MOON
-                                    },
-                                    theme,
-                                )
-                                .size(28.0, 14.0)
-                                .tooltip("切换主题 (Ctrl+Shift+T)")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                                    .flex()
+                                    .justify_end()
+                                    .child(Spinner::new(theme.accent, 12.0)),
                             )
-                            .child(
-                                Button::new("settings", "设置", theme)
-                                    .icon(icons::SETTINGS)
-                                    .size(ButtonSize::Sm)
-                                    .variant(ButtonVariant::Ghost)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_settings(window, cx)
-                                    })),
-                            )
-                            .when(running, |element| {
-                                element.child(
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .justify_end()
-                                        .child(Spinner::new(theme.accent, 12.0)),
-                                )
-                            }),
-                    ),
+                        }),
+                ),
             )
             .into_any_element()
     }
@@ -4537,6 +5303,13 @@ impl AppView {
                         cx.notify();
                     },
                 )),
+            )
+            // Rare banner: fade the contents in so the bar does not pop; the
+            // height push itself is not interpolated (size never tweens here).
+            .with_animation(
+                "update-banner-enter",
+                Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                |element, delta| element.opacity(delta),
             )
             .into_any_element();
         Some(banner)
@@ -4793,6 +5566,7 @@ impl AppView {
             let agent_cards = self.agent_cards();
             let view = Rc::new(self.chat.prepare_frame(
                 self.active_run.is_some(),
+                true,
                 &self.expanded_reasoning,
                 &self.expanded_tools,
                 &self.expanded_turns,
@@ -5095,7 +5869,7 @@ impl AppView {
                     let text = this.composer_state.read(cx).content().to_string();
                     this.composer_state
                         .update(cx, |state, cx| state.clear(window, cx));
-                    this.send_message(text, window, cx);
+                    this.send_message(text, false, window, cx);
                 }))
                 .child(
                     svg()
@@ -5307,6 +6081,8 @@ impl AppView {
         let mut footer_left = div().flex().items_center().gap(px(8.0)).child(
             if permission_mode == PermissionMode::Plan {
                 "计划模式：写操作将被拒绝，先出计划（Shift+Tab 切换）"
+            } else if self.active_run.is_some() {
+                "任务运行中：Enter 排队 · Ctrl+Enter 插入当前回合 · Shift+Enter 换行"
             } else {
                 "Enter 发送 · Shift+Enter 换行"
             },
@@ -5357,6 +6133,14 @@ impl AppView {
             ));
         }
 
+        if let Some(edit) = &self.edit_message {
+            column = column.child(self.render_edit_banner(edit, cx));
+        }
+
+        if !self.pending_inputs.is_empty() {
+            column = column.child(self.render_queue_bar(cx));
+        }
+
         column
             .child(composer_card)
             .child(
@@ -5377,6 +6161,281 @@ impl AppView {
                     .child("Ctrl K 命令 · Esc 停止"),
             )
             .into_any_element()
+    }
+
+    /// Composer banner shown while a user message is being edited. It states
+    /// how much conversation will be removed and whether files are restored.
+    /// Pending-message bar above the composer: queue items (wait for the
+    /// current turn, then start a new one) and steers (waiting for the next
+    /// step boundary). Queue rows can be sent immediately — while running
+    /// that promotes them ahead of the rest of the queue, when idle it starts
+    /// the run, which is the manual disposition for a held queue.
+    fn render_queue_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let running = self.active_run.is_some();
+        let mut rows = div().w_full().flex().flex_col().gap(px(4.0));
+        for input in &self.pending_inputs {
+            let (chip_label, chip_color, chip_bg) = match input.kind {
+                PendingInputKind::Queue => ("排队", theme.text_muted, theme.surface_alt),
+                PendingInputKind::Steer => ("待注入", theme.accent, theme.accent_soft),
+            };
+            let mut row = div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(20.0))
+                        .px(px(7.0))
+                        .rounded(px(999.0))
+                        .bg(chip_bg)
+                        .text_size(px(10.0))
+                        .text_color(chip_color)
+                        .child(
+                            svg()
+                                .path(icons::CLOCK)
+                                .size(px(10.0))
+                                .text_color(chip_color),
+                        )
+                        .child(chip_label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .truncate()
+                        .child(input.text.replace('\n', " ")),
+                );
+            if input.kind == PendingInputKind::Queue {
+                let send_id = SharedString::from(format!("queue-send-{}", input.id));
+                let send_entity = cx.entity().downgrade();
+                let send_target = input.id.clone();
+                row = row.child(
+                    IconButton::new(send_id, icons::SEND, theme)
+                        .size(24.0, 14.0)
+                        .tooltip(if running {
+                            "跳过队列，插入当前回合"
+                        } else {
+                            "立即发送"
+                        })
+                        .on_click(move |_, _, cx| {
+                            let _ = send_entity.update(cx, |this, cx| {
+                                this.send_pending_input_now(&send_target, cx);
+                            });
+                        }),
+                );
+            }
+            let remove_id = SharedString::from(format!("queue-remove-{}", input.id));
+            let remove_entity = cx.entity().downgrade();
+            let remove_target = input.id.clone();
+            row = row.child(
+                IconButton::new(remove_id, icons::TRASH, theme)
+                    .size(24.0, 14.0)
+                    .tooltip("移除")
+                    .on_click(move |_, _, cx| {
+                        let _ = remove_entity.update(cx, |this, cx| {
+                            this.remove_pending_input(&remove_target, cx);
+                        });
+                    }),
+            );
+            rows = rows.child(row);
+        }
+
+        div()
+            .w_full()
+            .max_w(px(760.0))
+            .rounded(px(radius::LG))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_alt)
+            .px(px(12.0))
+            .py(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint)
+                    .child(if running {
+                        "消息队列 · 当前回合结束后按顺序发送"
+                    } else if self.queue_held {
+                        "消息队列 · 已暂停，点击发送图标立即执行"
+                    } else {
+                        "消息队列 · 空闲中，点击发送图标立即执行"
+                    }),
+            )
+            .child(rows)
+            .into_any_element()
+    }
+
+    fn render_edit_banner(&self, edit: &EditMessageState, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let plan = &edit.plan;
+        let file_count = plan.files.len();
+        let conflict_count = plan.conflicts.len();
+        let has_changes = plan.has_file_changes();
+        let toggle_label = if !has_changes {
+            "本轮没有可还原的文件改动".to_string()
+        } else if !edit.include_files {
+            "不还原文件".to_string()
+        } else if conflict_count > 0 {
+            if file_count == 0 {
+                format!("{conflict_count} 个文件无法安全还原")
+            } else {
+                format!("还原 {file_count} 个文件（{conflict_count} 个无法还原）")
+            }
+        } else {
+            format!("发送时还原 {file_count} 个文件")
+        };
+        let toggle_color = if conflict_count > 0 {
+            theme.warning
+        } else if edit.include_files {
+            theme.accent
+        } else {
+            theme.text_faint
+        };
+
+        let mut banner = div()
+            .w_full()
+            .max_w(px(760.0))
+            .rounded(px(radius::LG))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_alt)
+            .px(px(12.0))
+            .py(px(9.0))
+            .flex()
+            .flex_col()
+            .gap(px(5.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        svg()
+                            .path(icons::EDIT)
+                            .size(px(13.0))
+                            .text_color(theme.accent),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child("正在编辑用户消息"),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(format!(
+                                        "发送后将重置到这条消息之前，共移除 {} 条消息（{} 轮对话）",
+                                        plan.removed_messages, plan.removed_user_turns
+                                    )),
+                            ),
+                    )
+                    .when(has_changes, |element| {
+                        element.child(
+                            div()
+                                .id("edit-file-toggle")
+                                .flex()
+                                .flex_none()
+                                .items_center()
+                                .gap(px(4.0))
+                                .h(px(22.0))
+                                .px(px(8.0))
+                                .rounded(px(999.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.surface)
+                                .text_size(px(10.5))
+                                .text_color(toggle_color)
+                                .cursor_pointer()
+                                .tooltip(effibuddy_ui::tooltip(
+                                    theme,
+                                    "发送时是否把本轮文件改动还原到编辑前",
+                                ))
+                                .hover(|style| style.bg(theme.hover))
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_edit_files(cx)))
+                                .child(
+                                    svg()
+                                        .path(if conflict_count > 0 {
+                                            icons::ALERT
+                                        } else if edit.include_files {
+                                            icons::CHECK
+                                        } else {
+                                            icons::FILE
+                                        })
+                                        .size(px(11.0))
+                                        .text_color(toggle_color),
+                                )
+                                .child(toggle_label.clone()),
+                        )
+                    })
+                    .child(
+                        Button::new("edit-message-cancel", "取消", theme)
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.cancel_edit_message(window, cx)
+                            })),
+                    ),
+            );
+        if conflict_count > 0 {
+            banner = banner.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .pl(px(21.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.warning)
+                    .child(
+                        svg()
+                            .path(icons::ALERT)
+                            .size(px(11.0))
+                            .text_color(theme.warning),
+                    )
+                    .child(format!(
+                        "{conflict_count} 个文件无法安全还原，发送前会再次确认；也可以关闭“还原文件”。"
+                    )),
+            );
+        }
+        if !plan.shell_commands.is_empty() {
+            banner = banner.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(5.0))
+                    .pl(px(21.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.warning)
+                    .child(
+                        svg()
+                            .path(icons::TERMINAL)
+                            .size(px(11.0))
+                            .text_color(theme.warning),
+                    )
+                    .child("本轮运行过 shell 命令，其文件改动无法追踪，也不会被还原。"),
+            );
+        }
+        banner.into_any_element()
     }
 
     pub(crate) fn render_approval(
@@ -5544,6 +6603,264 @@ impl AppView {
                 SharedString::from(format!("approval-enter-{}", request.id)),
                 Animation::new(overlay_motion_duration())
                     .with_easing(|delta| 1.0 - (1.0 - delta).powi(3)),
+                |element, delta| element.opacity(delta),
+            )
+            .into_any_element()
+    }
+
+    /// Secondary confirmation for message undo, and the conflict dialog for
+    /// edited turns whose files cannot be restored safely. Both list every
+    /// affected path and state explicitly that EffiBuddy cannot recover the
+    /// change afterwards (no Git snapshots are involved).
+    fn render_restore_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let (title, subtitle, excerpt, plan, undo) = if let Some(dialog) = &self.undo_dialog {
+            (
+                "撤销这条用户消息？",
+                format!(
+                    "将移除从这条消息开始的 {} 条消息（{} 轮对话）。",
+                    dialog.plan.removed_messages, dialog.plan.removed_user_turns
+                ),
+                Some(dialog.excerpt.clone()),
+                &dialog.plan,
+                true,
+            )
+        } else if let Some(conflict) = &self.edit_conflict {
+            (
+                "文件无法安全重置",
+                "对话尚未裁剪。请检查下列冲突文件，然后仅重置对话并发送，或取消。".to_string(),
+                None,
+                &conflict.plan,
+                false,
+            )
+        } else {
+            return div().into_any_element();
+        };
+
+        let file_count = plan.files.len();
+        let can_restore = plan.can_restore();
+        let has_files = plan.has_file_changes();
+        let backdrop_entity = cx.entity().downgrade();
+        let card = div()
+            .id("restore-dialog")
+            .w(px(620.0))
+            .max_h(px(600.0))
+            .rounded(px(radius::XL))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.elevated)
+            .shadow(shadow_float(theme))
+            .p(px(20.0))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(30.0))
+                            .rounded(px(radius::MD))
+                            .bg(if undo {
+                                theme.danger_soft
+                            } else {
+                                theme.warning_soft
+                            })
+                            .child(
+                                svg()
+                                    .path(if undo { icons::UNDO } else { icons::ALERT })
+                                    .size(px(15.0))
+                                    .text_color(if undo { theme.danger } else { theme.warning }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(3.0))
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .line_height(px(17.0))
+                                    .text_color(theme.text_muted)
+                                    .child(subtitle),
+                            ),
+                    ),
+            )
+            .when_some(excerpt, |element, excerpt| {
+                element.child(
+                    div()
+                        .rounded(px(radius::MD))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.surface_alt)
+                        .px(px(11.0))
+                        .py(px(8.0))
+                        .text_size(px(11.5))
+                        .line_height(px(17.0))
+                        .text_color(theme.text_muted)
+                        .child(excerpt),
+                )
+            })
+            .child(
+                div()
+                    .id("restore-dialog-scroll")
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .child(render_restore_report(theme, plan)),
+            )
+            .when(has_files && !can_restore, |element| {
+                element.child(
+                    div()
+                        .px(px(2.0))
+                        .text_size(px(11.0))
+                        .line_height(px(16.0))
+                        .text_color(theme.warning)
+                        .child(
+                            "存在无法安全还原的文件，因此本次不会写入任何文件；\
+                             冲突文件会原样保留。",
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .rounded(px(radius::MD))
+                    .border_1()
+                    .border_color(theme.danger)
+                    .bg(theme.danger_soft)
+                    .px(px(11.0))
+                    .py(px(9.0))
+                    .flex()
+                    .items_start()
+                    .gap(px(7.0))
+                    .child(
+                        svg()
+                            .path(icons::ALERT)
+                            .size(px(13.0))
+                            .flex_none()
+                            .text_color(theme.danger),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(theme.danger)
+                            .child(
+                                "此操作不可撤销：这条消息及其后的对话会被删除，工作区文件会被写回旧内容或删除。\
+                                 EffiBuddy 不会使用 Git，也无法从版本库找回这些内容。",
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("restore-dialog-cancel", "取消", theme)
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Ghost)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if this.edit_conflict.is_some() {
+                                    this.dismiss_edit_conflict(window, cx);
+                                } else {
+                                    this.close_undo_dialog(window, cx);
+                                }
+                            })),
+                    )
+                    .when(undo && has_files, |element| {
+                        element.child(
+                            Button::new("restore-dialog-conversation", "仅撤销对话", theme)
+                                .size(ButtonSize::Sm)
+                                .variant(ButtonVariant::Secondary)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.confirm_undo(false, window, cx)),
+                                ),
+                        )
+                    })
+                    .when(!undo, |element| {
+                        element.child(
+                            Button::new("restore-dialog-send-only", "仅重置对话并发送", theme)
+                                .size(ButtonSize::Sm)
+                                .variant(ButtonVariant::Primary)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.send_edit_without_files(window, cx)
+                                })),
+                        )
+                    })
+                    .when(undo, |element| {
+                        let label = if has_files {
+                            if can_restore {
+                                format!("撤销并还原 {file_count} 个文件")
+                            } else {
+                                "无法安全还原文件".to_string()
+                            }
+                        } else {
+                            "撤销消息".to_string()
+                        };
+                        element.child(
+                            Button::new("restore-dialog-confirm", label, theme)
+                                .size(ButtonSize::Sm)
+                                .variant(ButtonVariant::Danger)
+                                .disabled(has_files && !can_restore)
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.confirm_undo(true, window, cx)),
+                                ),
+                        )
+                    }),
+            );
+
+        // Entrance: the backdrop fades while the card settles down 4px, on
+        // the same 180ms beat as the menus and approval cards. Exit stays
+        // instant — cancelling must feel immediate.
+        let card = card.with_animation(
+            "restore-dialog-enter",
+            Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+            |element, delta| element.mt(px(4.0 * (1.0 - delta))),
+        );
+
+        div()
+            .id("restore-dialog-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(theme.overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                let _ = backdrop_entity.update(cx, |this, cx| {
+                    if this.edit_conflict.is_some() {
+                        this.dismiss_edit_conflict(window, cx);
+                    } else {
+                        this.close_undo_dialog(window, cx);
+                    }
+                });
+            })
+            .child(card)
+            .with_animation(
+                "restore-dialog-backdrop-enter",
+                Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
                 |element, delta| element.opacity(delta),
             )
             .into_any_element()
@@ -5821,6 +7138,35 @@ impl Render for AppView {
             });
         }
 
+        // Panel slides: advance the sidebar / side-pane collapse glides before
+        // the tree builds, then keep one frame scheduled while either is still
+        // moving (same pattern as the scroll glides above).
+        let sidebar_target = if self.config.sidebar_collapsed {
+            0.0
+        } else {
+            1.0
+        };
+        let side_pane_target =
+            if self.side.open && !self.settings_open && self.view_mode == ViewMode::Chat {
+                1.0
+            } else {
+                0.0
+            };
+        let slides_animating =
+            advance_pane_slide(&mut self.sidebar_slide, &mut self.sidebar_p, sidebar_target)
+                | advance_pane_slide(
+                    &mut self.side_pane_slide,
+                    &mut self.side_p,
+                    side_pane_target,
+                );
+        if slides_animating && !self.pane_frame_scheduled {
+            self.pane_frame_scheduled = true;
+            cx.on_next_frame(window, |this, _, cx| {
+                this.pane_frame_scheduled = false;
+                cx.notify();
+            });
+        }
+
         let content = if self.settings_open {
             self.render_settings(window, cx)
         } else if self.view_mode == ViewMode::Graph {
@@ -5857,7 +7203,13 @@ impl Render for AppView {
                 this.composer_focus_handle(cx).focus(window);
             }))
             .on_action(cx.listener(|this, _: &StopRun, window, cx| {
-                if this.palette_open {
+                if this.edit_conflict.is_some() {
+                    this.dismiss_edit_conflict(window, cx);
+                } else if this.undo_dialog.is_some() {
+                    this.close_undo_dialog(window, cx);
+                } else if this.edit_message.is_some() {
+                    this.cancel_edit_message(window, cx);
+                } else if this.palette_open {
                     this.close_palette(window, cx);
                 } else if this.model_menu.open {
                     this.close_model_menu(cx);
@@ -5906,14 +7258,40 @@ impl Render for AppView {
                     .min_h(px(0.0))
                     .overflow_hidden()
                     .child(self.side_resize_listener_layer(cx))
-                    .when(!self.config.sidebar_collapsed, |element| {
-                        element.child(self.render_sidebar(window, cx))
+                    // While a slide is in flight the panel renders inside a
+                    // clipping wrapper at the interpolated width; once settled
+                    // it goes in bare so nothing can clip its edges.
+                    .when(self.sidebar_p > 0.001, |element| {
+                        if self.sidebar_p >= 1.0 {
+                            element.child(self.render_sidebar(window, cx))
+                        } else {
+                            element.child(
+                                div()
+                                    .w(px(SIDEBAR_WIDTH * self.sidebar_p))
+                                    .h_full()
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .border_r_1()
+                                    .border_color(theme.border)
+                                    .child(self.render_sidebar(window, cx)),
+                            )
+                        }
                     })
                     .child(div().flex_1().min_w(px(0.0)).h_full().child(content))
-                    .when(
-                        self.side.open && !self.settings_open && self.view_mode == ViewMode::Chat,
-                        |element| element.child(self.render_side_pane(window, cx)),
-                    )
+                    .when(self.side_p > 0.001, |element| {
+                        if self.side_p >= 1.0 {
+                            element.child(self.render_side_pane(window, cx))
+                        } else {
+                            element.child(
+                                div()
+                                    .w(px(self.side.width * self.side_p))
+                                    .h_full()
+                                    .flex_none()
+                                    .overflow_hidden()
+                                    .child(self.render_side_pane(window, cx)),
+                            )
+                        }
+                    })
             })
             .when_some(self.render_side_overlay(window, cx), |element, overlay| {
                 element.child(overlay)
@@ -5929,7 +7307,11 @@ impl Render for AppView {
             })
             .when(self.palette_open, |element| {
                 element.child(self.render_palette(window, cx))
-            });
+            })
+            .when(
+                self.undo_dialog.is_some() || self.edit_conflict.is_some(),
+                |element| element.child(self.render_restore_dialog(cx)),
+            );
         if perf::hud_snapshot().is_some() {
             tree = tree.child(render_perf_hud(&theme));
         }
@@ -6022,6 +7404,231 @@ fn permission_mode_hint(mode: PermissionMode) -> Option<&'static str> {
             Some("完全访问模式只对主会话生效；来自子代理的请求仍会请求批准。")
         }
     }
+}
+
+/// File/conflict report shared by the undo confirmation and the edit-conflict
+/// dialog. Every row the user is about to change is listed here; shell commands
+/// are called out separately because their file effects cannot be tracked.
+fn render_restore_report(theme: &Theme, plan: &RestorePlan) -> Div {
+    let mut report = div().flex().flex_col().gap(px(8.0));
+    if !plan.has_file_changes() && plan.shell_commands.is_empty() {
+        return report.child(
+            div()
+                .py(px(8.0))
+                .text_size(px(11.5))
+                .text_color(theme.text_faint)
+                .child("本轮没有可还原的文件改动。"),
+        );
+    }
+
+    if !plan.files.is_empty() {
+        report = report.child(restore_section_label(
+            if plan.can_restore() {
+                format!("将还原 {} 个文件", plan.files.len())
+            } else {
+                format!("可安全还原 {} 个文件", plan.files.len())
+            },
+            theme.success,
+        ));
+        let mut rows = div().flex().flex_col().gap(px(1.0));
+        for file in plan.files.iter().take(crate::checkpoint::MAX_LISTED_FILES) {
+            let tools = if file.tool_names.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", file.tool_names.join(" / "))
+            };
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .min_h(px(24.0))
+                    .px(px(4.0))
+                    .rounded(px(radius::XS))
+                    .hover(|style| style.bg(theme.hover))
+                    .child(
+                        svg()
+                            .path(icons::FILE)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(theme.mono_font())
+                            .text_size(px(11.0))
+                            .text_color(theme.text)
+                            .child(file.path.clone()),
+                    )
+                    .child(small_badge(
+                        theme,
+                        file.action.label(),
+                        match file.action {
+                            RestoreAction::Restore => BadgeTone::Neutral,
+                            RestoreAction::Delete => BadgeTone::Warning,
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .child(format!("{} 次修改{tools}", file.operations)),
+                    ),
+            );
+        }
+        if plan.files.len() > crate::checkpoint::MAX_LISTED_FILES {
+            rows = rows.child(
+                div()
+                    .py(px(3.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .child(format!(
+                        "还有 {} 个文件未列出…",
+                        plan.files.len() - crate::checkpoint::MAX_LISTED_FILES
+                    )),
+            );
+        }
+        report = report.child(rows);
+    }
+
+    if !plan.conflicts.is_empty() {
+        report = report.child(restore_section_label(
+            format!("无法安全还原 {} 个文件", plan.conflicts.len()),
+            theme.warning,
+        ));
+        let mut rows = div().flex().flex_col().gap(px(1.0));
+        for conflict in plan
+            .conflicts
+            .iter()
+            .take(crate::checkpoint::MAX_LISTED_FILES)
+        {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(7.0))
+                    .min_h(px(24.0))
+                    .px(px(4.0))
+                    .rounded(px(radius::XS))
+                    .hover(|style| style.bg(theme.hover))
+                    .child(
+                        svg()
+                            .path(icons::ALERT)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.warning),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .font_family(theme.mono_font())
+                            .text_size(px(11.0))
+                            .text_color(theme.text)
+                            .child(conflict.path.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.warning)
+                            .child(conflict.reason.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .child(format!(
+                                "{} 次修改{}",
+                                conflict.operations,
+                                if conflict.tool_names.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", conflict.tool_names.join(" / "))
+                                }
+                            )),
+                    ),
+            );
+        }
+        if plan.conflicts.len() > crate::checkpoint::MAX_LISTED_FILES {
+            rows = rows.child(
+                div()
+                    .py(px(3.0))
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .child(format!(
+                        "还有 {} 个文件未列出…",
+                        plan.conflicts.len() - crate::checkpoint::MAX_LISTED_FILES
+                    )),
+            );
+        }
+        report = report.child(rows);
+    }
+
+    if !plan.shell_commands.is_empty() {
+        report = report.child(restore_section_label(
+            "无法追踪的改动".to_string(),
+            theme.warning,
+        ));
+        let mut commands = div().flex().flex_col().gap(px(2.0));
+        for command in plan.shell_commands.iter().take(4) {
+            let command = command.replace(['\r', '\n'], " ");
+            let command = preview_text(&command, 160);
+            commands = commands.child(
+                div()
+                    .truncate()
+                    .px(px(4.0))
+                    .font_family(theme.mono_font())
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
+                    .child(format!("$ {command}")),
+            );
+        }
+        if plan.shell_commands.len() > 4 {
+            commands = commands.child(
+                div()
+                    .px(px(4.0))
+                    .text_size(px(10.0))
+                    .text_color(theme.text_faint)
+                    .child(format!("还有 {} 条命令…", plan.shell_commands.len() - 4)),
+            );
+        }
+        report = report.child(commands).child(
+            div()
+                .px(px(4.0))
+                .text_size(px(10.5))
+                .line_height(px(15.0))
+                .text_color(theme.warning)
+                .child("这些命令造成的文件改动无法追踪，不会被还原。"),
+        );
+    }
+
+    report
+}
+
+fn restore_section_label(label: String, color: gpui::Hsla) -> Div {
+    div()
+        .px(px(4.0))
+        .text_size(px(10.5))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(color)
+        .child(label)
+}
+
+/// Short excerpt for dialogs. Counts characters, not bytes, so a cut never
+/// lands inside a multi-byte glyph.
+fn preview_text(text: &str, max_chars: usize) -> String {
+    let mut out: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 /// Row cap of the command palette, recents included.

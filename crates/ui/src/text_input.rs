@@ -45,6 +45,7 @@ actions!(
         Cut,
         Copy,
         Submit,
+        SubmitAlternate,
         InsertNewline,
     ]
 );
@@ -269,6 +270,9 @@ pub struct TextInputState {
     /// scroll the caret back into view.
     pending_scroll_to_caret: bool,
     on_submit: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    /// Secondary submit (Ctrl/Cmd+Enter). Lets a host distinguish "send" from
+    /// "send with a different delivery", e.g. steering a running agent.
+    on_submit_alternate: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
 }
 
 impl TextInputState {
@@ -291,6 +295,7 @@ impl TextInputState {
             glide_frame_scheduled: false,
             pending_scroll_to_caret: false,
             on_submit: None,
+            on_submit_alternate: None,
         }
     }
 
@@ -687,8 +692,26 @@ impl TextInputState {
         self.finish_submit(window, cx);
     }
 
+    fn submit_alternate(
+        &mut self,
+        _: &SubmitAlternate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.finish_submit_with(self.on_submit_alternate.clone(), window, cx);
+    }
+
     fn finish_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(handler) = self.on_submit.clone() else {
+        self.finish_submit_with(self.on_submit.clone(), window, cx);
+    }
+
+    fn finish_submit_with(
+        &mut self,
+        handler: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handler) = handler else {
             return;
         };
         let text = std::mem::take(&mut self.content);
@@ -1213,6 +1236,7 @@ fn line_starts(lines: &[gpui::WrappedLine]) -> Vec<usize> {
 pub struct TextInputView {
     state: Entity<TextInputState>,
     on_submit: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    on_submit_alternate: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
     frameless: bool,
     _subscription: Option<Subscription>,
     _theme_subscription: Subscription,
@@ -1225,6 +1249,7 @@ impl TextInputView {
         Self {
             state,
             on_submit: None,
+            on_submit_alternate: None,
             frameless: false,
             _subscription: Some(subscription),
             _theme_subscription: theme_subscription,
@@ -1243,6 +1268,16 @@ impl TextInputView {
         self
     }
 
+    /// Handler for Ctrl/Cmd+Enter. Only fires when registered; otherwise the
+    /// keystroke is unbound and falls through.
+    pub fn on_submit_alternate(
+        mut self,
+        handler: impl Fn(String, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_submit_alternate = Some(Rc::new(handler));
+        self
+    }
+
     pub fn state(&self) -> Entity<TextInputState> {
         self.state.clone()
     }
@@ -1253,8 +1288,10 @@ impl Render for TextInputView {
         let theme = Theme::get(cx).clone();
         let state = self.state.clone();
         let on_submit = self.on_submit.clone();
+        let on_submit_alternate = self.on_submit_alternate.clone();
         state.update(cx, |state, _cx| {
             state.on_submit = on_submit;
+            state.on_submit_alternate = on_submit_alternate;
         });
 
         let focus_handle = state.read(cx).focus_handle.clone();
@@ -1380,6 +1417,7 @@ fn bind_actions(
     element = bind!(element, Cut, cut);
     element = bind!(element, Copy, copy);
     element = bind!(element, Submit, submit);
+    element = bind!(element, SubmitAlternate, submit_alternate);
     element = bind!(element, InsertNewline, insert_newline);
     element
 }
@@ -1408,6 +1446,8 @@ pub fn install_keybindings(cx: &mut App) {
         KeyBinding::new("home", Home, Some("EffiTextInput")),
         KeyBinding::new("end", End, Some("EffiTextInput")),
         KeyBinding::new("enter", Submit, Some("EffiTextInput")),
+        KeyBinding::new("ctrl-enter", SubmitAlternate, Some("EffiTextInput")),
+        KeyBinding::new("cmd-enter", SubmitAlternate, Some("EffiTextInput")),
         KeyBinding::new("shift-enter", InsertNewline, Some("EffiTextInput")),
     ]);
 }

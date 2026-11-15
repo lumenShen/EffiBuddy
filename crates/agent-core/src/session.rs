@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::TurnCheckpoint;
 use crate::ids::new_id;
 use crate::message::{Message, Role, TodoItem, ToolResult, Usage, truncate_chars};
 use crate::network::AgentGraphRecord;
@@ -168,6 +169,11 @@ pub struct SessionState {
     /// projected over this record by the UI.
     #[serde(default)]
     pub graph: AgentGraphRecord,
+    /// Original file state captured before each tool edit, grouped by the user
+    /// message whose turn produced the edits. Used by the message edit/undo
+    /// flow to restore the workspace without touching Git.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoints: Vec<TurnCheckpoint>,
     /// Runtime `message_id → index into messages` map. `messages` is
     /// append-only (compaction moves `compacted_upto`, never removes), so the
     /// map stays valid without rebuilds; streamed deltas use it for O(1)
@@ -210,6 +216,7 @@ impl SessionState {
             agent_description: None,
             child_run: None,
             graph: AgentGraphRecord::default(),
+            checkpoints: Vec::new(),
             message_index: HashMap::new(),
         }
     }
@@ -256,6 +263,111 @@ impl SessionState {
         let index = *self.message_index.get(message_id)?;
         let message = self.messages.get_mut(index)?;
         (message.id == message_id).then_some(message)
+    }
+
+    /// Index of a message, without mutating the session.
+    pub fn message_position(&self, message_id: &str) -> Option<usize> {
+        self.messages
+            .iter()
+            .position(|message| message.id == message_id)
+    }
+
+    /// Id of the visible user message that owns the current turn. Synthetic
+    /// notifications, inter-agent messages and mid-turn steers are skipped so
+    /// a background wake keeps appending to the turn the user actually typed.
+    pub fn latest_user_turn_id(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == Role::User
+                    && !message.synthetic
+                    && !message.mid_turn
+                    && message.agent_message.is_none()
+            })
+            .map(|message| message.id.as_str())
+    }
+
+    pub fn checkpoint(&self, message_id: &str) -> Option<&TurnCheckpoint> {
+        self.checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.message_id == message_id)
+    }
+
+    pub fn checkpoint_mut(&mut self, message_id: &str) -> Option<&mut TurnCheckpoint> {
+        self.checkpoints
+            .iter_mut()
+            .find(|checkpoint| checkpoint.message_id == message_id)
+    }
+
+    /// Borrow the checkpoint for `message_id`, creating it on first use.
+    pub fn checkpoint_or_insert(&mut self, message_id: &str) -> &mut TurnCheckpoint {
+        if let Some(index) = self
+            .checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.message_id == message_id)
+        {
+            return &mut self.checkpoints[index];
+        }
+        self.checkpoints
+            .push(TurnCheckpoint::new(message_id.to_string()));
+        self.checkpoints
+            .last_mut()
+            .expect("checkpoint was just pushed")
+    }
+
+    pub fn remove_checkpoint(&mut self, message_id: &str) -> Option<TurnCheckpoint> {
+        let index = self
+            .checkpoints
+            .iter()
+            .position(|checkpoint| checkpoint.message_id == message_id)?;
+        Some(self.checkpoints.remove(index))
+    }
+
+    /// Visible user turn ids at or after `index`. Used by the rewind flow to
+    /// decide which checkpoints become unreachable when the transcript is
+    /// trimmed.
+    pub fn user_turn_ids_from(&self, index: usize) -> Vec<String> {
+        self.messages
+            .iter()
+            .skip(index)
+            .filter(|message| {
+                message.role == Role::User && !message.synthetic && message.agent_message.is_none()
+            })
+            .map(|message| message.id.clone())
+            .collect()
+    }
+
+    /// Remove every message from `index` onward. This is the transcript half
+    /// of edit/undo; the caller restores files and drops checkpoint metadata
+    /// around it. Compaction that covered a removed prefix is discarded so the
+    /// next request cannot carry a summary of messages that no longer exist.
+    pub fn truncate_from(&mut self, index: usize) -> Vec<Message> {
+        if index >= self.messages.len() {
+            return Vec::new();
+        }
+        // The sidebar title is derived from the first visible user message.
+        // Dropping that message must clear the title so an edited first prompt
+        // can become the new title instead of leaving the deleted one behind.
+        let title_source_removed = !self.messages[..index].iter().any(|message| {
+            message.role == Role::User && !message.synthetic && message.agent_message.is_none()
+        });
+        let removed = self.messages.split_off(index);
+        if title_source_removed {
+            self.title.clear();
+        }
+        if self.compacted_upto > index {
+            self.compacted_upto = 0;
+            self.compaction = None;
+        }
+        self.steps = 0;
+        // The current context footprint no longer describes this transcript.
+        // Cumulative billing counters stay untouched; only the context-ring
+        // value resets until the next model request reports a fresh one.
+        self.usage.last_prompt_tokens = 0;
+        self.rebuild_message_index();
+        self.touch();
+        removed
     }
 
     fn maybe_set_title(&mut self, text: &str) {
@@ -420,5 +532,15 @@ mod tests {
             .expect("session serializes to an object")
             .insert("permission_mode".to_string(), serde_json::json!("yolo"));
         assert!(serde_json::from_value::<SessionState>(value).is_err());
+    }
+
+    #[test]
+    fn truncating_the_first_user_message_clears_the_title() {
+        let mut session = sample_session();
+        assert_eq!(session.title, "hello");
+        session.push_message(Message::assistant());
+        session.truncate_from(0);
+        assert!(session.messages.is_empty());
+        assert!(session.title.is_empty());
     }
 }

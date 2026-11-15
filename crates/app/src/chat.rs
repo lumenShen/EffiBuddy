@@ -46,8 +46,16 @@ use crate::app::AppView;
 
 type ToolResults = HashMap<String, Rc<ToolResult>>;
 
-const CONTENT_MAX_WIDTH: f32 = 760.0;
-const CONTENT_PADDING: f32 = 32.0;
+// ZCode conversation column: 896px at the desktop breakpoint with 24px gutters
+// (its `@min-[864px]` step), instead of the old 760px/32px.
+const CONTENT_MAX_WIDTH: f32 = 896.0;
+const CONTENT_PADDING: f32 = 24.0;
+/// Vertical gap between chat items (turn boundaries). ZCode stacks turns with
+/// `gap-5` + `pb-5`, which lands at ~40px of air between exchanges.
+const ITEM_GAP: f32 = 40.0;
+/// Vertical gap between the virtual rows of one split message (its markdown
+/// chunks), matching the inter-block spacing inside a single document.
+const CHUNK_GAP: f32 = 9.0;
 const LIST_OVERDRAW: f32 = 560.0;
 const ENTER_ANIMATION: Duration = Duration::from_millis(260);
 const ENTER_WINDOW: Duration = Duration::from_millis(320);
@@ -93,6 +101,10 @@ pub(crate) struct ChatViewState {
     /// Turn blocks the user explicitly collapsed (overrides the auto fold).
     pub collapsed_turns: HashSet<String>,
     pub running: bool,
+    /// Whether user-message hover actions (copy/edit/undo) are available.
+    /// Read-only child transcripts disable them; editing a child message would
+    /// target the parent session.
+    pub actions_enabled: bool,
     pub stream: Option<StreamSnapshot>,
     /// Fence-safe chunk table of the revealed streaming text, recomputed per
     /// frame in `prepare_frame`. Rows of the streaming message slice the
@@ -156,8 +168,6 @@ pub(crate) struct StreamSnapshot {
     pub shown_reasoning: usize,
     /// Still generating (shows the caret and live reasoning timer).
     pub active: bool,
-    /// Time since the assistant message started, for the live "思考中" clock.
-    pub elapsed: Duration,
 }
 
 impl StreamSnapshot {
@@ -176,7 +186,14 @@ pub(crate) struct ChatItem {
 
 pub(crate) enum ChatItemKind {
     User {
-        text: String,
+        /// Shared so the bubble and the hover copy action can both clone a
+        /// ref-counted handle instead of copying the message text every frame.
+        text: SharedString,
+        /// True for a message the user typed while the model was working and
+        /// that was injected at a step boundary. Renders with a「回合中」chip
+        /// and without edit/undo actions (the turn checkpoint belongs to the
+        /// message that started the run).
+        steered: bool,
     },
     /// A solo assistant message (single-step turn). Shared as an `Rc` so a
     /// rebuild can reuse unchanged messages without cloning them.
@@ -216,7 +233,6 @@ pub(crate) struct AssistantItem {
     pub text: SharedString,
     pub text_key: u64,
     pub reasoning: SharedString,
-    pub char_count: usize,
     /// Fence-safe chunk table for long bodies (`None` when the body renders
     /// as one virtual item). Present whenever the body exceeds
     /// [`SPLIT_TEXT_THRESHOLD`], so scrolling a long transcript lays out one
@@ -462,7 +478,8 @@ impl ChatList {
                     summary: notification_summary(&message.text()),
                 },
                 Role::User => ChatItemKind::User {
-                    text: message.text(),
+                    text: message.text().into(),
+                    steered: message.mid_turn,
                 },
                 Role::System => ChatItemKind::System {
                     text: message.text(),
@@ -588,6 +605,7 @@ impl ChatList {
     pub fn prepare_frame(
         &mut self,
         running: bool,
+        actions_enabled: bool,
         expanded_reasoning: &HashSet<String>,
         expanded_tools: &HashSet<String>,
         expanded_turns: &HashSet<String>,
@@ -700,6 +718,7 @@ impl ChatList {
             expanded_turns: expanded_turns.clone(),
             collapsed_turns: collapsed_turns.clone(),
             running,
+            actions_enabled,
             stream_chunks: streaming_chunks,
             stream,
             reasoning_scrolls: Rc::clone(&self.reasoning_scrolls),
@@ -988,7 +1007,6 @@ fn build_assistant_item(message: &Message, reasoning_duration: Option<Duration>)
         message: message.clone(),
         reasoning_duration,
         text_key: markdown_source_key(&text),
-        char_count: text.chars().count(),
         text: text.into(),
         reasoning: reasoning.into(),
         chunks,
@@ -1108,6 +1126,7 @@ fn message_signature(
     let mut hasher = DefaultHasher::new();
     message.id.hash(&mut hasher);
     message.interrupted.hash(&mut hasher);
+    message.mid_turn.hash(&mut hasher);
     reasoning_duration
         .map(|duration| duration.as_millis())
         .hash(&mut hasher);
@@ -1163,7 +1182,6 @@ struct StreamReveal {
     reasoning: Rc<RefCell<String>>,
     shown_reasoning: usize,
     active: bool,
-    started_at: Option<Instant>,
     reasoning_started: Option<Instant>,
     reasoning_elapsed: Option<Duration>,
 }
@@ -1173,11 +1191,9 @@ impl StreamReveal {
         if self.message_id.as_deref() == Some(message_id) {
             return;
         }
-        let started_at = Some(Instant::now());
         *self = Self {
             message_id: Some(message_id.to_string()),
             active: true,
-            started_at,
             ..Self::default()
         };
     }
@@ -1211,9 +1227,6 @@ impl StreamReveal {
             self.reasoning_elapsed = self.reasoning_started.map(|start| start.elapsed());
         }
         self.active = false;
-        if self.started_at.is_none() {
-            self.started_at = Some(Instant::now());
-        }
     }
 
     fn reasoning_duration(&self) -> Option<Duration> {
@@ -1256,10 +1269,6 @@ impl StreamReveal {
             reasoning: Rc::clone(&self.reasoning),
             shown_reasoning: self.shown_reasoning,
             active: self.active,
-            elapsed: self
-                .started_at
-                .map(|start| start.elapsed())
-                .unwrap_or_default(),
         })
     }
 }
@@ -1312,7 +1321,15 @@ pub(crate) fn render_chat_item(
     };
     let content = match (&item.kind, slot.part) {
         (_, SlotPart::Whole) => match &item.kind {
-            ChatItemKind::User { text } => render_user(theme, text),
+            ChatItemKind::User { text, steered } => render_user(
+                theme,
+                text,
+                &item.id,
+                *steered,
+                view.running,
+                view.actions_enabled,
+                entity,
+            ),
             ChatItemKind::Assistant(assistant) => render_assistant(assistant, view, theme, entity),
             ChatItemKind::Turn(turn) => render_turn(turn, view, theme, entity),
             ChatItemKind::System { text } => div()
@@ -1389,15 +1406,15 @@ pub(crate) fn render_chat_item(
         .slots
         .get(index + 1)
         .is_none_or(|next| next.item_ix != slot.item_ix);
-
     let wrapper = div()
         .w_full()
         .flex()
         .justify_center()
         .when(index == 0, |element| element.pt(px(28.0)))
-        // Within one message the inner column used a 9px gap between
-        // reasoning/markdown/tool rows; across messages the gap was 22px.
-        .pb(px(if last_part { 22.0 } else { 9.0 }))
+        // ZCode rhythm: ~40px between turns, 9px between the chunk rows of
+        // one message. The user hover-action strip rides inside its own row,
+        // so it no longer needs a special case in the inter-item padding.
+        .pb(px(if last_part { ITEM_GAP } else { CHUNK_GAP }))
         .child(
             div()
                 .w_full()
@@ -1420,27 +1437,128 @@ pub(crate) fn render_chat_item(
     }
 }
 
-fn render_user(theme: &Theme, text: &str) -> AnyElement {
-    div()
+/// Right-aligned user bubble plus the hover-revealed actions. The action row
+/// always reserves its height, so hovering cannot shift the transcript.
+fn render_user(
+    theme: &Theme,
+    text: &SharedString,
+    message_id: &str,
+    steered: bool,
+    running: bool,
+    actions: bool,
+    entity: &WeakEntity<AppView>,
+) -> AnyElement {
+    let group = SharedString::from(format!("user-{message_id}"));
+    let copy_id = SharedString::from(format!("user-copy-{message_id}"));
+    let copy_text = text.clone();
+    let edit_id = message_id.to_string();
+    let edit_entity = entity.clone();
+    let undo_id = message_id.to_string();
+    let undo_entity = entity.clone();
+    let edit_tip = if running {
+        "任务运行结束后可编辑"
+    } else {
+        "编辑这条消息"
+    };
+
+    let mut container = div()
         .w_full()
         .flex()
-        .justify_end()
-        .child(
+        .flex_col()
+        .items_end()
+        .group(group.clone());
+    if steered {
+        container = container.child(
             div()
-                .max_w(px(600.0))
-                .min_w(px(0.0))
-                .rounded(px(18.0))
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.user_bubble)
-                .px(px(15.0))
-                .py(px(10.0))
-                .text_size(px(14.0))
-                .line_height(px(22.0))
-                .text_color(theme.text)
-                .child(text.to_string()),
-        )
-        .into_any_element()
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .mb(px(4.0))
+                .text_size(px(10.0))
+                .text_color(theme.text_faint)
+                .child(
+                    svg()
+                        .path(icons::CLOCK)
+                        .size(px(10.0))
+                        .text_color(theme.text_faint),
+                )
+                .child("运行中插入"),
+        );
+    }
+    // ZCode user bubble: 12px radius with a 2px top-right corner (the "tail"
+    // pointing at the sender), 16/12 padding, capped at 576px.
+    container = container.child(
+        div()
+            .max_w(px(576.0))
+            .min_w(px(0.0))
+            .rounded(px(12.0))
+            .rounded_tr(px(2.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.user_bubble)
+            .px(px(16.0))
+            .py(px(12.0))
+            .text_size(px(14.0))
+            .line_height(px(21.0))
+            .text_color(theme.text)
+            .child(text.to_string()),
+    );
+    // Steered messages ride inside a turn owned by another user message, so
+    // editing/undoing them would rewind checkpoints they never had.
+    let actions = actions && !steered;
+    if actions {
+        container = container.child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .h(px(22.0))
+                .mt(px(4.0))
+                .opacity(0.0)
+                .group_hover(group, |style| style.opacity(1.0))
+                .child(
+                    IconButton::new(copy_id, icons::COPY, theme)
+                        .size(22.0, 12.0)
+                        .tooltip("复制")
+                        .on_click(move |_, _, cx| {
+                            if !copy_text.is_empty() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    copy_text.to_string(),
+                                ));
+                            }
+                        }),
+                )
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("user-edit-{message_id}")),
+                        icons::EDIT,
+                        theme,
+                    )
+                    .size(22.0, 12.0)
+                    .tooltip(edit_tip)
+                    .on_click(move |_, window, cx| {
+                        let _ = edit_entity.update(cx, |this, cx| {
+                            this.begin_edit_message(&edit_id, window, cx);
+                        });
+                    }),
+                )
+                .child(
+                    IconButton::new(
+                        SharedString::from(format!("user-undo-{message_id}")),
+                        icons::UNDO,
+                        theme,
+                    )
+                    .size(22.0, 12.0)
+                    .tooltip("撤销这条消息并还原文件")
+                    .on_click(move |_, window, cx| {
+                        let _ = undo_entity.update(cx, |this, cx| {
+                            this.request_undo_message(&undo_id, window, cx);
+                        });
+                    }),
+                ),
+        );
+    }
+    container.into_any_element()
 }
 
 /// Borrowed text/reasoning for one assistant row: the live reveal slice when
@@ -1460,7 +1578,6 @@ struct StreamBorrow<'a> {
     shown: usize,
     shown_reasoning: usize,
     active: bool,
-    elapsed: Duration,
 }
 
 impl<'a> AssistantTexts<'a> {
@@ -1489,10 +1606,6 @@ impl<'a> AssistantTexts<'a> {
     fn active(&self) -> bool {
         self.stream.as_ref().is_some_and(|stream| stream.active)
     }
-
-    fn elapsed(&self) -> Option<Duration> {
-        self.stream.as_ref().map(|stream| stream.elapsed)
-    }
 }
 
 fn assistant_texts<'a>(
@@ -1511,7 +1624,6 @@ fn assistant_texts<'a>(
                 shown: stream.shown,
                 shown_reasoning: stream.shown_reasoning,
                 active: stream.active,
-                elapsed: stream.elapsed,
             }),
             text: &assistant.text,
             reasoning: &assistant.reasoning,
@@ -1557,11 +1669,14 @@ fn slot_chunk<'a>(
 }
 
 fn assistant_column(message_group: &SharedString) -> Div {
+    // ZCode keeps reasoning / body / tool groups as flow items with a clear
+    // step between them; 12px holds that rhythm without disconnecting the
+    // pieces the way its 20px would after the chunk split.
     div()
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(9.0))
+        .gap(px(12.0))
         .group(message_group.clone())
 }
 
@@ -1594,7 +1709,6 @@ fn render_assistant(
             &assistant.message.id,
             texts.reasoning(),
             assistant.reasoning_duration,
-            texts.elapsed(),
             texts.active(),
             view.expanded_reasoning.contains(&assistant.message.id),
             view,
@@ -1637,7 +1751,6 @@ fn render_assistant_lead(
             &assistant.message.id,
             texts.reasoning(),
             assistant.reasoning_duration,
-            texts.elapsed(),
             texts.active(),
             view.expanded_reasoning.contains(&assistant.message.id),
             view,
@@ -1732,25 +1845,10 @@ fn turn_expanded(turn: &TurnItem, view: &ChatViewState) -> bool {
     view.expanded_turns.contains(&turn.id) || (view.running && turn_is_live(turn, view))
 }
 
-/// Distinct tool-kind labels across the turn, for the summary line.
-fn turn_kind_summary(turn: &TurnItem) -> String {
-    let mut kinds: Vec<&'static str> = Vec::new();
-    for member in &turn.members {
-        for block in &member.message.blocks {
-            if let ContentBlock::ToolCall { call } = block {
-                let kind = tool_kind_label(&call.name);
-                if !kinds.contains(&kind) {
-                    kinds.push(kind);
-                }
-            }
-        }
-    }
-    kinds.join(" · ")
-}
-
-/// Aggregate summary header of a turn block: status icon over every tool
-/// result, counts of thinking phases / tool calls / subagents, and the
-/// chevron. Clicking it records the explicit fold choice.
+/// Aggregate status bar of a turn block, ZCode-style: a full-width
+/// 「已工作 {duration}」 strip above a bottom hairline, with the activity
+/// counts trailing and the chevron revealed on hover. Clicking it records the
+/// explicit fold choice.
 fn render_turn_header(
     turn: &TurnItem,
     expanded: bool,
@@ -1765,24 +1863,22 @@ fn render_turn_header(
             _ => false,
         })
     });
-    let status_icon: AnyElement = if turn.any_error {
-        svg()
-            .path(icons::ALERT)
-            .size(px(12.0))
-            .text_color(theme.danger)
-            .into_any_element()
-    } else if live || unresolved {
-        Spinner::new(theme.text_faint, 11.0).into_any_element()
-    } else {
-        svg()
-            .path(icons::CHECK)
-            .size(px(12.0))
-            .text_color(theme.text_faint)
-            .into_any_element()
-    };
 
-    let mut label = String::new();
+    let mut label = if live {
+        if turn.total_ms > 0 {
+            format!("工作中 · {}", format_duration_ms(turn.total_ms))
+        } else {
+            "工作中".to_string()
+        }
+    } else if turn.total_ms > 0 {
+        format!("已工作 {}", format_duration_ms(turn.total_ms))
+    } else {
+        String::new()
+    };
     if turn.thinking_count > 0 {
+        if !label.is_empty() {
+            label.push_str(" · ");
+        }
         label.push_str(&format!("思考 {} 次", turn.thinking_count));
     }
     if turn.tool_calls > 0 {
@@ -1798,25 +1894,51 @@ fn render_turn_header(
         label.push_str(&format!("{} 个子代理", turn.agent_calls));
     }
     if label.is_empty() {
-        label.push_str("执行中");
+        label.push_str(if live { "工作中" } else { "已完成" });
     }
 
     let turn_id = turn.id.clone();
     let toggle_entity = entity.clone();
-    let summary = turn_kind_summary(turn);
+    let row_group = SharedString::from(format!("turn-row-{}", turn.id));
+    let label_element = if live && !unresolved {
+        div()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(13.0))
+            .text_color(theme.text_muted)
+            .child(label)
+            .with_animation(
+                SharedString::from(format!("turn-pulse-{}", turn.id)),
+                Animation::new(Duration::from_millis(1600)).repeat(),
+                |element, delta| element.opacity(pulsating_between(0.45, 1.0)(delta)),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(13.0))
+            .text_color(if turn.any_error {
+                theme.danger
+            } else {
+                theme.text_muted
+            })
+            .child(label)
+            .into_any_element()
+    };
 
     div()
         .w_full()
         .child(
             div()
                 .id(SharedString::from(format!("turn-head-{}", turn.id)))
+                .group(row_group.clone())
                 .flex()
                 .items_center()
-                .gap(px(7.0))
-                .h(px(26.0))
-                .px(px(6.0))
-                .mx(px(-6.0))
-                .rounded(px(6.0))
+                .gap(px(8.0))
+                .pb(px(6.0))
+                .border_b_1()
+                .border_color(theme.border)
                 .cursor_pointer()
                 .hover(|style| style.bg(theme.hover))
                 .on_click(move |_, _, cx| {
@@ -1826,47 +1948,36 @@ fn render_turn_header(
                         cx.notify();
                     });
                 })
-                .child(status_icon)
-                .child(
-                    svg()
-                        .path(icons::WRENCH)
-                        .size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .flex_none(),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(summary),
-                )
-                .when(turn.total_ms > 0, |element| {
+                .when(turn.any_error, |element| {
+                    element.child(
+                        svg()
+                            .path(icons::ALERT)
+                            .size(px(13.0))
+                            .text_color(theme.danger)
+                            .flex_none(),
+                    )
+                })
+                .when(!turn.any_error && (live || unresolved), |element| {
                     element.child(
                         div()
                             .flex_none()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_faint)
-                            .opacity(0.8)
-                            .child(format_duration_ms(turn.total_ms)),
+                            .child(Spinner::new(theme.text_faint, 12.0)),
                     )
                 })
-                .child(disclosure_chevron(
-                    SharedString::from(format!("turn-chevron-{}", turn.id)),
-                    expanded,
-                    theme.text_faint.opacity(0.7),
-                    10.0,
-                )),
+                .child(label_element)
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .flex_none()
+                        .opacity(0.0)
+                        .group_hover(row_group, |style| style.opacity(1.0))
+                        .child(disclosure_chevron(
+                            SharedString::from(format!("turn-chevron-{}", turn.id)),
+                            expanded,
+                            theme.text_faint,
+                            12.0,
+                        )),
+                ),
         )
         .into_any_element()
 }
@@ -1886,7 +1997,6 @@ fn render_turn_member(
             &member.message.id,
             &member.reasoning,
             member.reasoning_duration,
-            None,
             false,
             view.expanded_reasoning.contains(&member.message.id),
             view,
@@ -1921,7 +2031,6 @@ fn render_turn_body_reasoning(
         &body.message.id,
         texts.reasoning(),
         body.reasoning_duration,
-        texts.elapsed(),
         texts.active(),
         view.expanded_reasoning.contains(&body.message.id),
         view,
@@ -2039,7 +2148,8 @@ fn render_turn_tail(
 }
 
 /// Tool-call rows (agent cards, groups, singles) shared by every assistant
-/// row variant.
+/// row variant. They stack into one tight group container (ZCode's `gap-1`
+/// work-items rhythm) instead of inheriting the looser column spacing.
 fn append_tool_rows(
     column: Div,
     assistant: &AssistantItem,
@@ -2056,14 +2166,14 @@ fn append_tool_rows(
             _ => None,
         })
         .collect();
-    let mut column = column;
+    let mut rows: Vec<AnyElement> = Vec::new();
     let mut cursor = 0;
     while cursor < calls.len() {
         let call = calls[cursor];
         if call.name == "agent" {
             let result = view.results.get(&call.id).map(Rc::as_ref);
             let card = view.agents.get(&call.id);
-            column = column.child(render_agent_row(call, result, card, theme, entity));
+            rows.push(render_agent_row(call, result, card, theme, entity));
             cursor += 1;
             continue;
         }
@@ -2076,21 +2186,25 @@ fn append_tool_rows(
         if run.len() >= 3 {
             let group_id = format!("group:{}:{}", message.id, start);
             let expanded = view.expanded_tools.contains(&group_id);
-            column = column.child(render_tool_group(
+            rows.push(render_tool_group(
                 &group_id, run, view, expanded, theme, entity,
             ));
         } else {
             for call in run {
                 let result = view.results.get(&call.id).map(Rc::as_ref);
                 let expanded = view.expanded_tools.contains(&call.id);
-                column = column.child(render_tool_row(call, result, view, expanded, theme, entity));
+                rows.push(render_tool_row(call, result, view, expanded, theme, entity));
             }
         }
     }
-    column
+    if rows.is_empty() {
+        return column;
+    }
+    column.child(div().w_full().flex().flex_col().gap(px(4.0)).children(rows))
 }
 
-/// Hover-revealed copy button + character count, shared by assistant rows.
+/// Hover-revealed copy button plus the ZCode-style timestamp, shared by
+/// assistant rows.
 fn render_copy_footer(
     assistant: &AssistantItem,
     message_group: &SharedString,
@@ -2099,7 +2213,7 @@ fn render_copy_footer(
     let message = &assistant.message;
     let copy_id = SharedString::from(format!("copy-{}", message.id));
     let copy_text = assistant.text.clone();
-    let chars = assistant.char_count;
+    let time_label = message_time_label(message.created_at);
     div()
         .flex()
         .items_center()
@@ -2118,9 +2232,9 @@ fn render_copy_footer(
         )
         .child(
             div()
-                .text_size(px(10.5))
+                .text_size(px(11.5))
                 .text_color(theme.text_faint)
-                .child(format!("{chars} 字")),
+                .child(time_label),
         )
         .when(message.interrupted, |element| {
             element.child(badge(theme, "已中断", BadgeTone::Warning))
@@ -2128,12 +2242,29 @@ fn render_copy_footer(
         .into_any_element()
 }
 
+/// ZCode message timestamp: local clock, `HH:mm` today, `M/D HH:mm` within
+/// the year, and a full date once the year differs.
+fn message_time_label(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    use chrono::{Datelike, Duration, Local, TimeZone};
+    let local = Local.from_utc_datetime(&created_at.naive_utc());
+    let now = Local::now();
+    let today = now.date_naive();
+    if local.date_naive() == today {
+        local.format("%H:%M").to_string()
+    } else if local.date_naive() == today - Duration::try_days(1).unwrap_or_default() {
+        local.format("昨天 %H:%M").to_string()
+    } else if local.year() == now.year() {
+        local.format("%-m/%-d %H:%M").to_string()
+    } else {
+        local.format("%Y/%-m/%-d %H:%M").to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_reasoning(
     message_id: &str,
     reasoning: &str,
     duration: Option<Duration>,
-    stream_elapsed: Option<Duration>,
     active: bool,
     expanded: bool,
     view: &ChatViewState,
@@ -2141,17 +2272,15 @@ fn render_reasoning(
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let live = active;
+    // ZCode wording: 「正在思考」 while streaming (no clock in the row), the
+    // measured duration once done, second-granularity like ZCode's ceil().
     let label = if live {
-        let elapsed = stream_elapsed.unwrap_or_default();
-        format!("正在思考 · {}", format_elapsed(elapsed))
+        "正在思考".to_string()
     } else if let Some(duration) = duration {
-        if duration < Duration::from_secs(1) {
-            "思考了不到 1 秒".to_string()
-        } else {
-            format!("思考了 {}", format_elapsed(duration))
-        }
+        let seconds = duration.as_secs().max(1);
+        format!("思考 · 持续了 {seconds} 秒")
     } else {
-        "思考过程".to_string()
+        "思考".to_string()
     };
 
     let toggle_id = message_id.to_string();
@@ -2160,8 +2289,8 @@ fn render_reasoning(
         .id(SharedString::from(format!("reasoning-{}", message_id)))
         .flex()
         .items_center()
-        .gap(px(7.0))
-        .h(px(26.0))
+        .gap(px(8.0))
+        .py(px(2.0))
         .px(px(6.0))
         .mx(px(-6.0))
         .rounded(px(6.0))
@@ -2173,31 +2302,32 @@ fn render_reasoning(
                 cx.notify();
             });
         })
-        .child(disclosure_chevron(
-            SharedString::from(format!("reasoning-chevron-{message_id}")),
-            expanded,
-            theme.text_faint,
-            11.0,
-        ))
         .child(
             svg()
                 .path(icons::SPARKLES)
-                .size(px(12.0))
-                .text_color(if live { theme.accent } else { theme.text_faint }),
+                .size(px(13.0))
+                .text_color(theme.text_faint)
+                .flex_none(),
         )
-        .child(
+        .child(if live {
             div()
                 .flex_none()
-                .text_size(px(11.5))
-                .text_color(if live {
-                    theme.text_muted
-                } else {
-                    theme.text_faint
-                })
-                .child(label),
-        )
-        .when(live, |element| {
-            element.child(Spinner::new(theme.text_faint, 11.0))
+                .text_size(px(13.0))
+                .text_color(theme.text_muted)
+                .child(label)
+                .with_animation(
+                    SharedString::from(format!("reasoning-pulse-{message_id}")),
+                    Animation::new(Duration::from_millis(1600)).repeat(),
+                    |element, delta| element.opacity(pulsating_between(0.45, 1.0)(delta)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_none()
+                .text_size(px(13.0))
+                .text_color(theme.text_muted)
+                .child(label)
+                .into_any_element()
         })
         .when(live && !expanded, |element| {
             element.child(
@@ -2205,12 +2335,21 @@ fn render_reasoning(
                     .flex_1()
                     .min_w(px(0.0))
                     .truncate()
-                    .text_size(px(10.5))
+                    .text_size(px(11.5))
                     .text_color(theme.text_faint)
                     .opacity(0.8)
                     .child(latest_reasoning_line(reasoning)),
             )
-        });
+        })
+        .when(!(live && !expanded), |element| {
+            element.child(div().flex_1())
+        })
+        .child(disclosure_chevron(
+            SharedString::from(format!("reasoning-chevron-{message_id}")),
+            expanded,
+            theme.text_faint,
+            12.0,
+        ));
 
     // The body is only built when expanded: a collapsed reasoning block used
     // to clone the full reasoning text on every frame.
@@ -2228,11 +2367,11 @@ fn render_reasoning(
             .clone();
         div()
             .id(SharedString::from(format!("reasoning-body-{}", message_id)))
-            .ml(px(17.0))
-            .pl(px(11.0))
-            .border_l_2()
-            .border_color(theme.border_strong)
-            .max_h(px(280.0))
+            .ml(px(8.0))
+            .pl(px(12.0))
+            .border_l_1()
+            .border_color(theme.border)
+            .max_h(px(240.0))
             .overflow_y_scroll()
             .track_scroll(&scroll_handle)
             .child(
@@ -2475,6 +2614,9 @@ fn render_agent_row(
     row.into_any_element()
 }
 
+/// Tool call summary row, ZCode-style: one subtle line whose verb carries the
+/// state (「正在读取」→「已读取」, pulsing while running), with the chevron
+/// revealed on hover and the expandable detail carded below the row.
 fn render_tool_row(
     call: &ToolCall,
     result: Option<&ToolResult>,
@@ -2484,12 +2626,9 @@ fn render_tool_row(
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let running = view.running;
-    let (status_label, status_color) = match result {
-        Some(result) if result.is_error => ("失败", theme.danger),
-        Some(_) => ("完成", theme.text_faint),
-        None if running => ("运行中", theme.text_faint),
-        None => ("未执行", theme.text_faint),
-    };
+    let failed = result.is_some_and(|result| result.is_error);
+    let pending = result.is_none() && running;
+    let label = tool_action_label(&call.name, result, running);
     let detail = tool_detail(call);
     let call_id = call.id.clone();
     let toggle_entity = entity.clone();
@@ -2501,37 +2640,45 @@ fn render_tool_row(
     } else {
         None
     };
-    let meta = result.map(|result| (result.is_error, result.duration_ms));
 
-    let status_icon: AnyElement = match result {
-        Some(result) if result.is_error => svg()
-            .path(icons::ALERT)
-            .size(px(12.0))
-            .text_color(theme.danger)
-            .into_any_element(),
-        Some(_) => svg()
-            .path(icons::CHECK)
-            .size(px(12.0))
-            .text_color(theme.text_faint)
-            .into_any_element(),
-        None if running => Spinner::new(theme.text_faint, 11.0).into_any_element(),
-        None => svg()
-            .path(icons::CLOCK)
-            .size(px(12.0))
-            .text_color(theme.text_faint)
-            .into_any_element(),
+    // ZCode keeps the tool icon static and expresses "running" through the
+    // shimmering label; the pulse animation stands in for the shimmer here.
+    let row_group = SharedString::from(format!("tool-row-{}", call.id));
+    let label_element = if pending {
+        div()
+            .flex_none()
+            .text_size(px(13.0))
+            .text_color(theme.text_muted)
+            .child(label)
+            .with_animation(
+                SharedString::from(format!("tool-pulse-{}", call.id)),
+                Animation::new(Duration::from_millis(1600)).repeat(),
+                |element, delta| element.opacity(pulsating_between(0.45, 1.0)(delta)),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .flex_none()
+            .text_size(px(13.0))
+            .text_color(if failed {
+                theme.danger
+            } else {
+                theme.text_muted
+            })
+            .child(label)
+            .into_any_element()
     };
 
     div()
         .w_full()
-        .rounded(px(8.0))
         .child(
             div()
                 .id(SharedString::from(format!("tool-{}", call.id)))
+                .group(row_group.clone())
                 .flex()
                 .items_center()
-                .gap(px(7.0))
-                .h(px(26.0))
+                .gap(px(8.0))
+                .py(px(2.0))
                 .px(px(6.0))
                 .mx(px(-6.0))
                 .rounded(px(6.0))
@@ -2543,74 +2690,44 @@ fn render_tool_row(
                         cx.notify();
                     });
                 })
-                .child(status_icon)
                 .child(
                     svg()
                         .path(tool_icon(&call.name))
-                        .size(px(12.0))
+                        .size(px(13.0))
                         .text_color(theme.text_faint)
                         .flex_none(),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .text_size(px(11.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if running && result.is_none() {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(tool_kind_label(&call.name)),
-                )
+                .child(label_element)
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
                         .truncate()
-                        .text_size(px(11.0))
+                        .text_size(px(12.0))
                         .text_color(theme.text_faint)
                         .child(detail),
-                )
-                .when_some(
-                    meta.and_then(|(_, duration)| duration),
-                    |element, duration| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.0))
-                                .text_color(theme.text_faint)
-                                .opacity(0.8)
-                                .child(format_duration_ms(duration)),
-                        )
-                    },
                 )
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(10.0))
-                        .text_color(status_color)
-                        .child(status_label),
-                )
-                .child(disclosure_chevron(
-                    SharedString::from(format!("tool-chevron-{}", call.id)),
-                    expanded,
-                    theme.text_faint.opacity(0.7),
-                    10.0,
-                )),
+                        .opacity(0.0)
+                        .group_hover(row_group, |style| style.opacity(1.0))
+                        .child(disclosure_chevron(
+                            SharedString::from(format!("tool-chevron-{}", call.id)),
+                            expanded,
+                            theme.text_faint,
+                            12.0,
+                        )),
+                ),
         )
         .when(expanded, |element| {
             element.child(
                 div()
-                    .ml(px(8.0))
-                    .pl(px(9.0))
-                    .border_l_1()
-                    .border_color(theme.border)
-                    .pt(px(4.0))
-                    .pb(px(8.0))
+                    .mt(px(2.0))
+                    .mb(px(4.0))
                     .flex()
                     .flex_col()
-                    .gap_2()
+                    .gap(px(8.0))
                     .when_some(args, |element, args| {
                         element.child(code_panel(
                             theme,
@@ -2636,9 +2753,10 @@ fn render_tool_row(
         .into_any_element()
 }
 
-/// Consecutive tool calls collapse into one summary row. Expanding it reveals
-/// the individual rows on a vertical rail, which keeps a long agent turn
-/// readable without hiding evidence.
+/// Consecutive tool calls collapse into one ZCode-style summary line
+/// (「已读取 3 项，已执行 2 命令」). Expanding it reveals the individual rows
+/// on a vertical rail, which keeps a long agent turn readable without hiding
+/// evidence.
 fn render_tool_group(
     group_id: &str,
     calls: &[&ToolCall],
@@ -2655,36 +2773,7 @@ fn render_tool_group(
             .get(&call.id)
             .is_some_and(|result| result.is_error)
     });
-    let total_ms: u64 = calls
-        .iter()
-        .filter_map(|call| view.results.get(&call.id))
-        .filter_map(|result| result.duration_ms)
-        .sum();
-
-    let mut kinds: Vec<&'static str> = Vec::new();
-    for call in calls {
-        let kind = tool_kind_label(&call.name);
-        if !kinds.contains(&kind) {
-            kinds.push(kind);
-        }
-    }
-    let summary = kinds.join(" · ");
-
-    let status_icon: AnyElement = if any_error {
-        svg()
-            .path(icons::ALERT)
-            .size(px(12.0))
-            .text_color(theme.danger)
-            .into_any_element()
-    } else if any_running {
-        Spinner::new(theme.text_faint, 11.0).into_any_element()
-    } else {
-        svg()
-            .path(icons::CHECK)
-            .size(px(12.0))
-            .text_color(theme.text_faint)
-            .into_any_element()
-    };
+    let summary = tool_group_stats(calls, any_running);
 
     let group_key = group_id.to_string();
     let toggle_entity = entity.clone();
@@ -2703,15 +2792,44 @@ fn render_tool_group(
         Vec::new()
     };
 
+    // Like single rows: a static icon, a stat line that pulses while any call
+    // is still running, and a hover-revealed chevron.
+    let row_group = SharedString::from(format!("tool-group-row-{group_id}"));
+    let stat_element = if any_running && !any_error {
+        div()
+            .flex_none()
+            .text_size(px(13.0))
+            .text_color(theme.text_muted)
+            .child(summary)
+            .with_animation(
+                SharedString::from(format!("tool-group-pulse-{group_id}")),
+                Animation::new(Duration::from_millis(1600)).repeat(),
+                |element, delta| element.opacity(pulsating_between(0.45, 1.0)(delta)),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .flex_none()
+            .text_size(px(13.0))
+            .text_color(if any_error {
+                theme.danger
+            } else {
+                theme.text_muted
+            })
+            .child(summary)
+            .into_any_element()
+    };
+
     div()
         .w_full()
         .child(
             div()
                 .id(SharedString::from(format!("tool-group-{group_id}")))
+                .group(row_group.clone())
                 .flex()
                 .items_center()
-                .gap(px(7.0))
-                .h(px(26.0))
+                .gap(px(8.0))
+                .py(px(2.0))
                 .px(px(6.0))
                 .mx(px(-6.0))
                 .rounded(px(6.0))
@@ -2724,64 +2842,73 @@ fn render_tool_group(
                         cx.notify();
                     });
                 })
-                .child(status_icon)
                 .child(
                     svg()
-                        .path(icons::WRENCH)
-                        .size(px(12.0))
-                        .text_color(theme.text_faint)
+                        .path(if any_error {
+                            icons::ALERT
+                        } else {
+                            icons::WRENCH
+                        })
+                        .size(px(13.0))
+                        .text_color(if any_error {
+                            theme.danger
+                        } else {
+                            theme.text_faint
+                        })
                         .flex_none(),
                 )
+                .child(stat_element)
+                .child(div().flex_1())
                 .child(
                     div()
                         .flex_none()
-                        .text_size(px(11.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text)
-                        .child(format!("{} 个工具调用", calls.len())),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(summary),
-                )
-                .when(total_ms > 0, |element| {
-                    element.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.0))
-                            .text_color(theme.text_faint)
-                            .opacity(0.8)
-                            .child(format_duration_ms(total_ms)),
-                    )
-                })
-                .child(disclosure_chevron(
-                    SharedString::from(format!("tool-group-chevron-{group_id}")),
-                    expanded,
-                    theme.text_faint.opacity(0.7),
-                    10.0,
-                )),
+                        .opacity(0.0)
+                        .group_hover(row_group, |style| style.opacity(1.0))
+                        .child(disclosure_chevron(
+                            SharedString::from(format!("tool-group-chevron-{group_id}")),
+                            expanded,
+                            theme.text_faint,
+                            12.0,
+                        )),
+                ),
         )
         .when(expanded, |element| {
             element.child(
                 div()
+                    .mt(px(2.0))
+                    .mb(px(4.0))
                     .ml(px(8.0))
-                    .pl(px(9.0))
+                    .pl(px(12.0))
                     .border_l_1()
                     .border_color(theme.border)
-                    .pt(px(2.0))
-                    .pb(px(4.0))
                     .flex()
                     .flex_col()
-                    .gap(px(1.0))
+                    .gap(px(4.0))
                     .children(rail),
             )
         })
         .into_any_element()
+}
+
+/// ZCode summary-group stats: per-verb counts joined with 「，」, past-tense
+/// once nothing is pending (「查阅 3 项」→「已查阅 3 项」).
+fn tool_group_stats(calls: &[&ToolCall], any_running: bool) -> String {
+    let mut stats: Vec<(&'static str, &'static str, usize)> = Vec::new();
+    for call in calls {
+        let verb = tool_verb(&call.name);
+        let unit = tool_unit(&call.name);
+        if let Some(entry) = stats.iter_mut().find(|(v, u, _)| *v == verb && *u == unit) {
+            entry.2 += 1;
+        } else {
+            stats.push((verb, unit, 1));
+        }
+    }
+    let prefix = if any_running { "" } else { "已" };
+    stats
+        .into_iter()
+        .map(|(verb, unit, count)| format!("{prefix}{verb} {count} {unit}"))
+        .collect::<Vec<_>>()
+        .join("，")
 }
 
 fn render_run_status(
@@ -3147,19 +3274,47 @@ fn with_alpha(mut color: Hsla, alpha: f32) -> Hsla {
     color
 }
 
-fn tool_kind_label(name: &str) -> &'static str {
+fn tool_verb(name: &str) -> &'static str {
     match name {
         "read_file" => "读取",
         "write_file" => "写入",
         "edit_file" => "编辑",
-        "list_dir" => "目录",
+        "list_dir" => "浏览",
         "grep" => "搜索",
-        "shell" => "命令",
+        "shell" => "执行",
         "todo_write" => "计划",
-        "run_js" => "JS",
-        "agent" => "子代理",
-        _ => "工具",
+        "run_js" => "运行",
+        _ => "调用",
     }
+}
+
+/// Counting unit used by the ZCode-style group stats line ("已读取 3 项").
+fn tool_unit(name: &str) -> &'static str {
+    match name {
+        "read_file" | "list_dir" => "项",
+        "shell" => "命令",
+        "write_file" | "edit_file" => "个文件",
+        _ => "次",
+    }
+}
+
+/// Status folded into the tool verb, ZCode-style: 「正在读取」→「已读取」,
+/// failures degrade to the plain status word.
+fn tool_action_label(name: &str, result: Option<&ToolResult>, running: bool) -> String {
+    if result.is_some_and(|result| result.is_error) {
+        return "执行失败".to_string();
+    }
+    let verb = tool_verb(name);
+    if result.is_some() {
+        return format!("已{verb}");
+    }
+    if running {
+        return match verb {
+            "执行" => "执行中".to_string(),
+            other => format!("正在{other}"),
+        };
+    }
+    "等待中".to_string()
 }
 
 fn notification_summary(text: &str) -> String {
@@ -3269,15 +3424,20 @@ fn code_panel(
         .entry(panel_key.clone())
         .or_insert_with(ScrollHandle::new)
         .clone();
+    // ZCode detail card: hairline border on the panel surface instead of a
+    // bare dark slab.
     div()
         .w_full()
-        .rounded(px(10.0))
-        .bg(theme.code_bg)
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
         .overflow_hidden()
         .child(
             div()
                 .px(px(12.0))
-                .py(px(6.0))
+                .pt(px(8.0))
+                .pb(px(4.0))
                 .text_size(px(10.5))
                 .text_color(theme.text_faint)
                 .child(title.to_string()),

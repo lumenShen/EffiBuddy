@@ -68,6 +68,12 @@ impl Tool for ShellTool {
             .unwrap_or(60)
             .clamp(1, 300);
         let timeout = Duration::from_secs(timeout_secs);
+        if let Some(sink) = &ctx.checkpoint_sink {
+            // Shell commands can rewrite arbitrary paths, so the turn is
+            // marked as having untracked changes; rewind warns about them
+            // instead of pretending the restore is complete.
+            sink.note_shell(&command_line);
+        }
 
         #[cfg(windows)]
         let mut command = {

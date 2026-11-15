@@ -174,7 +174,7 @@ impl Tool for WriteFileTool {
         format!("Write {bytes} bytes to `{path}`")
     }
 
-    async fn execute(&self, _ctx: ToolContext, arguments: Value) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, ctx: ToolContext, arguments: Value) -> Result<ToolOutput, ToolError> {
         let raw_path = required_string(&arguments, "path")?;
         let content = required_string(&arguments, "content")?;
         if content.len() > MAX_WRITE_CHARS {
@@ -192,9 +192,22 @@ impl Tool for WriteFileTool {
                 ))
             })?;
         }
-        tokio::fs::write(&path, content.as_bytes())
-            .await
-            .map_err(|error| ToolError::new(format!("cannot write `{raw_path}`: {error}")))?;
+        let relative = self.workspace.display_path(&path);
+        let checkpoint = ctx.checkpoint_sink.clone();
+        if let Some(sink) = &checkpoint {
+            sink.before_write(&relative, &path, self.name());
+        }
+        if let Err(error) = tokio::fs::write(&path, content.as_bytes()).await {
+            if let Some(sink) = &checkpoint {
+                sink.write_failed(&relative, &path, self.name());
+            }
+            return Err(ToolError::new(format!(
+                "cannot write `{raw_path}`: {error}"
+            )));
+        }
+        if let Some(sink) = &checkpoint {
+            sink.after_write(&relative, &path, self.name(), content.as_bytes());
+        }
         Ok(ToolOutput::text(format!(
             "Wrote {} bytes to `{}`.",
             content.len(),
@@ -250,7 +263,7 @@ impl Tool for EditFileTool {
         format!("Edit `{path}` in place")
     }
 
-    async fn execute(&self, _ctx: ToolContext, arguments: Value) -> Result<ToolOutput, ToolError> {
+    async fn execute(&self, ctx: ToolContext, arguments: Value) -> Result<ToolOutput, ToolError> {
         let raw_path = required_string(&arguments, "path")?;
         let old_string = required_string(&arguments, "old_string")?;
         let new_string = required_string(&arguments, "new_string")?;
@@ -281,9 +294,22 @@ impl Tool for EditFileTool {
         } else {
             content.replacen(&old_string, &new_string, 1)
         };
-        tokio::fs::write(&path, updated.as_bytes())
-            .await
-            .map_err(|error| ToolError::new(format!("cannot write `{raw_path}`: {error}")))?;
+        let relative = self.workspace.display_path(&path);
+        let checkpoint = ctx.checkpoint_sink.clone();
+        if let Some(sink) = &checkpoint {
+            sink.before_write(&relative, &path, self.name());
+        }
+        if let Err(error) = tokio::fs::write(&path, updated.as_bytes()).await {
+            if let Some(sink) = &checkpoint {
+                sink.write_failed(&relative, &path, self.name());
+            }
+            return Err(ToolError::new(format!(
+                "cannot write `{raw_path}`: {error}"
+            )));
+        }
+        if let Some(sink) = &checkpoint {
+            sink.after_write(&relative, &path, self.name(), updated.as_bytes());
+        }
 
         Ok(ToolOutput::text(format!(
             "Replaced {} occurrence{} in `{}`.",

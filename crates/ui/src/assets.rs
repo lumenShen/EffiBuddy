@@ -42,6 +42,7 @@ pub mod icons {
     pub const PIN: &str = "icons/pin.svg";
     pub const ARCHIVE: &str = "icons/archive.svg";
     pub const ARCHIVE_RESTORE: &str = "icons/archive-restore.svg";
+    pub const UNDO: &str = "icons/undo.svg";
     pub const MOUSE: &str = "icons/mouse.svg";
 }
 
@@ -80,6 +81,7 @@ const BRANCH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 
 const PIN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/></svg>"#;
 const ARCHIVE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>"#;
 const ARCHIVE_RESTORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h2"/><path d="M20 8v11a2 2 0 0 1-2 2h-2"/><path d="m9 15 3-3 3 3"/><path d="M12 12v9"/></svg>"#;
+const UNDO: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>"#;
 
 fn svg_for(path: &str) -> Option<&'static str> {
     Some(match path {
@@ -117,6 +119,7 @@ fn svg_for(path: &str) -> Option<&'static str> {
         icons::PIN => PIN,
         icons::ARCHIVE => ARCHIVE,
         icons::ARCHIVE_RESTORE => ARCHIVE_RESTORE,
+        icons::UNDO => UNDO,
         icons::MOUSE => MOUSE,
         _ => return None,
     })

@@ -120,7 +120,8 @@ stateDiagram-v2
 | `TodosUpdated` | 刷新右侧计划 |
 | `ContextCompacted` | 持久化压缩记录 |
 | `UsageUpdated` | 刷新 token 统计 |
-| `RunFinished` | 复位状态、持久化、错误/提示；成功结束后注入待发送的后台通知 |
+| `RunFinished` | 复位状态、持久化、错误/提示；成功结束后自动续跑（排队消息 → 后台通知） |
+| `SteerDrained` | 一条「回合中插入」的用户消息在 step 边界进入 transcript；移除队列条目 |
 
 | 事件（子代理） | UI 行为 |
 | --- | --- |
@@ -129,6 +130,24 @@ stateDiagram-v2
 | `SubagentFinished` | 更新终态、报告、耗时；后台任务入队 `<task-notification>` |
 
 事件通过 `tokio::sync::mpsc::UnboundedSender<AppEvent>` 汇总到一条前台泵，泵在 GPUI 的 `cx.spawn` 中 `await`，逐个调用 `handle_app_event` 并 `cx.notify()`。这样 UI 更新天然串行，不会在渲染线程里做阻塞 IO。
+
+### 消息排队与回合中插入（steer）
+
+任务运行中发送消息**不再被拒绝**，两条车道（参考 DeepSeek Harness 的 next-turn/next-step 双队列与 ZCode 的 guide/queue 投递语义）：
+
+| 车道 | 按键 | 行为 |
+| --- | --- | --- |
+| 排队 | Enter | 进入 `AppView.pending_inputs`（可见、可删、可立即发送）；回合成功结束后 auto-drain 队首，开**新回合** |
+| 插入 | Ctrl/Cmd+Enter | `AgentHandle::steer(text)` 交给 harness；在**下一个 step 边界**追加进当前 transcript，模型在下一请求中看到它，回合继续（turn 延长） |
+
+关键语义：
+
+- **注入点只在 step 边界**：`run_loop` 每次迭代顶部 `drain_steers()`——上一 step 的 tool result / assistant 全部落账之后、下一次请求构建之前。正在流式的响应和执行中的工具永远不会被插入打断。
+- **回合延长**：模型产出纯文本本应结束回合时，若仍有未消费的 steer，循环继续而不是返回 `Completed`（ZCode 的 text-only 续跑边界）。steer 到达但回合已经结束 → 由宿主在 `RunFinished` 时通过 `take_pending_steers()` 收回，转为普通排队消息。
+- **wire 模板**：steer 消息在 transcript 里保存原始文本（`Message.mid_turn = true`），`build_chat_messages` 构建请求时才包上 `<user-steer>` 框架（「这是运行中的真实用户输入，不是重启」），UI 渲染为带「运行中插入」chip 的普通用户气泡。checkpoint 的 turn 归属（`latest_user_turn_id`）跳过 steer 消息。
+- **续跑优先级**：`resume_after_run` 在回合成功后先弹出队首排队消息；待投递的后台子代理通知与它合并进同一新回合（通知在前、用户消息在后）。队列空时才走纯通知路径。
+- **held 队列**：回合 Interrupted/Failed 时队列挂起（`queue_held`），不会 auto-drain，也不会被无关的后台通知轮意外恢复；用户通过队列条的「发送」按钮处置。
+- **队列不持久化**：与 ZCode 的裁决一致——进程死亡即丢，重启后由用户重发；已注入的 steer 消息是普通 transcript 消息，随会话落盘。
 
 ## 5. 一次 turn 的时序
 
@@ -172,7 +191,8 @@ sequenceDiagram
 - 正在等待的流式响应立即结束；
 - 正在执行的工具收到 `cancel`（shell 会 kill 子进程）；
 - 当前 assistant 消息标记 `interrupted = true`，已产生的内容保留；
-- 工具执行中途被中断时，会补一条错误结果保证 transcript 合法。
+- 工具执行中途被中断时，会补一条错误结果保证 transcript 合法；
+- 尚未到达 step 边界的 steer 消息由宿主收回转为排队消息，不会丢文本。
 
 ## 6. Provider 适配与模型注册表
 
@@ -234,7 +254,25 @@ sequenceDiagram
 - Plan 模式下 harness 对**所有**工具询问审批门，不受 `Auto` 策略与「本会话允许」缓存影响：只读工具零打断，编辑与命令被直接拒绝并附「先出计划」文案，`agent` 等其他类仍弹卡由用户决定；
 - 权限模式只装配在主会话上；子代理 harness 用裸 `BrokerApprovalGate`（见 §10），审批卡对子代理请求单独注明「不受主会话权限模式影响」。
 
-工具拿到的 `ToolContext` 包含：工作区 `cwd`、会话 id、调用 id、取消令牌，以及可选的 `NestedToolInvoker`（仅 PTC 使用）。
+工具拿到的 `ToolContext` 包含：工作区 `cwd`、会话 id、调用 id、取消令牌，以及可选的 `NestedToolInvoker`（仅 PTC 使用）与 `FileCheckpointSink`（消息编辑/撤销的文件快照）。
+
+### 文件检查点（消息编辑/撤销）
+
+`agent-core/src/checkpoint.rs` 定义 `FileCheckpointSink`；宿主把实现放进 `HarnessConfig.checkpoint_sink`，`ToolExecutor` 再复制到每次 `ToolContext`：
+
+- `write_file` / `edit_file` 在真正写盘前调用 `before_write`（首次接触该文件时保存原字节），成功后调用 `after_write`（记录写入内容的 FNV-1a 摘要、操作次数、工具名），失败调用 `write_failed`（标记为不可安全还原）；
+- `shell` 只调用 `note_shell`，因为任意命令的文件副作用无法追踪；UI 会把它们列在「无法追踪的改动」里；
+- 子代理 harness 克隆同一份 `HarnessConfig`，因此子代理与后台任务的文件改动都落到父用户消息的 `TurnCheckpoint`；
+- `RunStarted` 时宿主把 recorder 绑定到该 turn 的用户消息 id，避免运行结束后才写盘的后台子代理串到下一轮。
+
+快照存放在 `<数据目录>/checkpoints/<session>/<message>/NNNN.bin`，元数据随 `SessionState.checkpoints` 持久化。回退计划（`app/checkpoint.rs`）按路径合并：取**最早**的 before 快照与**最晚**的 after 摘要；当前内容与 after 不一致即 `ExternalModified`，快照缺失/不可读/路径类型变化/写入未完成各自成为冲突项。存在任一冲突时一个文件都不写，只允许「仅撤销对话」；全部安全时先重新校验当前内容，再逐个原子写入并保留权限。整个过程不调用 Git。
+
+**性能模型**（`checkpoint_perf_lab`，release 下 `cargo test --release -p effibuddy-app --bin effibuddy checkpoint_perf_lab -- --ignored --nocapture`，可用 `EFFI_PERF_FILES/BYTES/TURNS/ROOT` 调参）：
+
+- 常规文件（64KiB）首次写入带快照约 +0.14ms/文件（tmpfs）、+1.6ms/文件（外置挂载盘），重复写入走摘要更新快速路径约 3 倍 baseline；瓶颈是磁盘本身，检查点逻辑只多两次 `fs::write`/`fs::read`。
+- 预检与还原是同步 UI 线程操作，成本 ≈「读快照 + 读当前 + 各哈希一次」：25MiB 轮约 37ms，80MiB 轮约 120ms。超大轮（接近单文件 16MiB 上限 × 120 文件）会卡 UI 一秒级——如果实际使用中出现，考虑给 plan 加总字节预算或把预检/还原挪到后台线程再弹确认。
+- 快照 blob 在会话锁外写入（锁内只登记元数据），64 turn 上限使元数据 JSON 稳定在 ~0.5–2.5MiB；编辑/撤销的持久化走单次序列化（stage → write → 入队同一份 payload），比旧的「save + stage 双序列化」省约 45%（1.27ms → 0.71ms tmpfs，4.71ms → 3.94ms 挂载盘）。
+- 用户消息文本在 `ChatItemKind::User` 里是 `SharedString`，hover 动作条不再每帧克隆全文。
 
 ### 路径沙箱
 
@@ -345,7 +383,7 @@ AgentHarness (child) ── HarnessEvent ──▶ AppEvent::SubagentHarness
 
 1. `SubagentService` 持久化子会话并发送 `SubagentFinished`；
 2. `AppView` 更新任务卡片，并把 `<task-notification>` 文本放入待注入队列；
-3. 若父 turn 空闲，立即把通知作为 `Message::synthetic_user` 追加到父 transcript，并调用 `AgentHarness::run_pending()` 开启新一轮模型调用（不追加新的用户消息）；
+3. 若父 turn 空闲，立即把通知作为 `Message::synthetic_user` 追加到父 transcript 并唤醒（`resume_after_run`：若用户有排队消息，队首消息与本批通知合并进同一新回合，通知在前、用户消息在后）；
 4. 若父 turn 正在运行，通知留在队列，等父 turn 成功结束后再注入，避免插在 tool_call 与 tool_result 之间。
 
 `synthetic` 消息对模型是普通 user 消息，对 UI 是系统通知卡片。由 `agent_send` 触发的唤醒标记 `report.wake = true`，不会再生成第二条父通知。
@@ -526,12 +564,12 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 81 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
+| `agent-core` | 88 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返、steer 注入/回合延长/中断回收、mid_turn wire 框架与 serde 默认值 |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 run_js 禁止 |
-| `agent-tools` | 32 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `agent-tools` | 33 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
-| `ui` | 35 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
-| `app` | 70 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、电脑授权门 |
+| `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
+| `app` | 89 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、电脑授权门 |
 | `deepseek_live` | 4（ignored） | 1-token 探针、单次聊天、工具 loop、PTC loop |
 
 真实 API 测试默认不跑，避免 CI 依赖外部服务；探针用例只断言通路与返回结构，不使用 `max_tokens = 1` 的输出去评估模型质量。
@@ -554,6 +592,9 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - **为什么工具结果单独成消息**：兼容 OpenAI 协议的 tool role，同时让压缩与修复逻辑有明确的配对单位。
 - **为什么子代理只回传报告**：完整子 transcript 可能比父会话还长；只回传最终报告能让父上下文保持可控，同时把证据留给 UI 的只读面板。
 - **为什么后台通知用 synthetic user 消息**：OpenAI 兼容接口没有“系统事件”角色；user 角色是唯一不会破坏 tool-call/result 配对的注入点。`synthetic` 标记把“模型可见”和“用户可见”分开。
+- **为什么 steer 只在 step 边界注入**：正在流式的响应与执行中的工具是原子单元，中途插消息会让 tool-call/result 配对和“用户已看到内容后不重试”的约定同时失效；step 边界是唯一既不打断又能让模型在下一请求立刻看到的点（DSH 的 `preStep` claim 与 ZCode 的 drain 点是同一结论）。
+- **为什么回合结束仍要检查 steer**：模型最后一个纯文本 step 期间到达的 steer 不能落到“回合已关、消息悬空”的窗口里；要么延长回合（有未消费 steer 就继续），要么由宿主收回转排队（中断/失败）。
+- **为什么排队队列不持久化**：排队消息绑定的是“当前会话此刻”的意图，会话被编辑/撤销/删除后语境即失效；持久化账本（ZCode 的 `session_input`）换来的复杂度对单进程桌面应用收益很低，丢队列由用户重发的代价可接受。
 - **为什么子代理取消要跨任务转发**：`ToolExecutor` 在父取消时会 drop 工具 future；如果子任务直接借父 future 执行，就会留下半完成状态。`SubagentService` 把子任务 spawn 到 runtime，并用 watcher 转发取消令牌，保证清理与终态事件一定会发生。
 
 ## 15. Computer Use（桌面读图与键鼠）

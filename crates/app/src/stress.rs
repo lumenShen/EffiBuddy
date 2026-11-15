@@ -225,8 +225,6 @@ pub struct StressState {
     session_tokens: Mutex<std::collections::HashMap<usize, u64>>,
     /// agent_id → completion-token watermark (subagents mode).
     child_tokens: Mutex<std::collections::HashMap<String, u64>>,
-    /// Diagnostic: StepStarted instants, to measure per-step latency.
-    step_started_at: Mutex<std::collections::HashMap<String, Instant>>,
     /// First K spawned children, for subagents-mode mini cards.
     child_order: Vec<String>,
     child_tails: Mutex<std::collections::HashMap<String, String>>,
@@ -474,7 +472,6 @@ impl AppView {
             sampled_indices: sampled_index_set(launch.n),
             session_tokens: Mutex::new(std::collections::HashMap::new()),
             child_tokens: Mutex::new(std::collections::HashMap::new()),
-            step_started_at: Mutex::new(std::collections::HashMap::new()),
             child_order: Vec::new(),
             child_tails: Mutex::new(std::collections::HashMap::new()),
             rows: Rc::new(rows),
@@ -593,19 +590,16 @@ impl AppView {
                             system_prompt: None,
                             tools: None,
                             allow_spawn: false,
-                            read_only: Some(false),
+                            // Read-only children: mutating tools are filtered
+                            // out, so every remaining tool is ApprovalPolicy::Auto
+                            // and no approval round-trip can stall a stream.
+                            read_only: Some(true),
                             output_schema: None,
                             visibility: AgentVisibility::Private,
                             group_id: None,
                             group_name: None,
                         };
-                        let launch_started = std::time::Instant::now();
-                        let launch_result = service_handle.launch(request);
-                        let launch_elapsed = launch_started.elapsed();
-                        if launch_elapsed > Duration::from_millis(5) {
-                            eprintln!("[stress] child {index}: slow launch {launch_elapsed:?}");
-                        }
-                        if let Err(error) = launch_result {
+                        if let Err(error) = service_handle.launch(request) {
                             eprintln!("[stress] child {index}: launch failed: {error}");
                         }
                         // Yield between batches so the pump keeps up.
@@ -1176,27 +1170,8 @@ impl StressState {
     fn observe_child_event(&mut self, agent_id: &str, event: &HarnessEvent) {
         self.metrics.events.fetch_add(1, Ordering::Relaxed);
         match event {
-            HarnessEvent::StepStarted { .. } => {
-                self.step_started_at
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(agent_id.to_string(), Instant::now());
-            }
             HarnessEvent::ToolCallStarted { .. } => {
                 self.metrics.tool_calls.fetch_add(1, Ordering::Relaxed);
-                if let Some(started) = self
-                    .step_started_at
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(agent_id)
-                {
-                    let lag = started.elapsed();
-                    if lag > Duration::from_millis(200) {
-                        eprintln!(
-                            "[stress] step-lag {agent_id}: {lag:?} (StepStarted→ToolCallStarted)"
-                        );
-                    }
-                }
             }
             HarnessEvent::TextDelta { delta, .. } | HarnessEvent::ReasoningDelta { delta, .. } => {
                 let mut tails = self

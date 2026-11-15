@@ -1444,13 +1444,37 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        match &tab.kind {
+        let content = match &tab.kind {
             SidePaneTabKind::Plan => self.render_plan_pane(cx),
             SidePaneTabKind::Agents => self.render_agents_pane(cx),
             SidePaneTabKind::Files => self.render_files_pane(cx),
             SidePaneTabKind::Changes => self.render_changes_pane(cx),
             SidePaneTabKind::Agent(agent_id) => self.render_agent_pane(agent_id, window, cx),
-        }
+        };
+        // Tab switches bridge with a quick fade instead of a hard swap —
+        // opacity only, no movement, so dense functional content stays put.
+        // The id carries the tab id: the animation restarts on a switch but
+        // not on unrelated re-renders of the same tab.
+        // The animation closure styles a `Div`, so wrap the tab content
+        // instead of animating the `AnyElement` directly. The wrapper mirrors
+        // the body slot the pane roots used to occupy (`flex_1` + `min_h(0)`
+        // under the panel's flex column) so scroll regions keep a bounded
+        // height.
+        div()
+            .w_full()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex()
+            .flex_col()
+            .child(content)
+            .with_animation(
+                SharedString::from(format!("side-tab-enter-{}", tab.id)),
+                // `overlay_motion_duration` collapses to one frame under
+                // reduced motion, like the other overlay entrances.
+                Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                |element, delta| element.opacity(delta),
+            )
+            .into_any_element()
     }
 
     fn render_plan_pane(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2027,6 +2051,7 @@ impl AppView {
             let cards: HashMap<String, AgentCard> = HashMap::new();
             let view_state = Rc::new(view.chat.prepare_frame(
                 running,
+                false,
                 &self.expanded_reasoning,
                 &self.expanded_tools,
                 &self.expanded_turns,

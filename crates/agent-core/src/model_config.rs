@@ -246,8 +246,15 @@ impl ModelConfig {
             .any(|level| level.value == value)
     }
 
+    /// Resolve the level to send for this model. `None` (自动) stays `None` so
+    /// the request omits the reasoning field entirely and the provider applies
+    /// its own default. A level the model no longer offers falls back to the
+    /// model's default so stale selections keep working.
     pub fn resolved_reasoning_level(&self, requested: Option<&str>) -> Option<String> {
-        if let Some(requested) = requested.filter(|value| self.supports_reasoning_level(value)) {
+        let Some(requested) = requested else {
+            return None;
+        };
+        if self.supports_reasoning_level(requested) {
             return Some(requested.to_string());
         }
         if let Some(default) = self
@@ -1275,6 +1282,11 @@ mod tests {
 
         let fallback = file.resolve(Some("openai"), Some("gpt-5.1"), Some("bogus"));
         assert_eq!(fallback.reasoning_level.as_deref(), Some("low"));
+
+        // 自动 (None) stays None: the request omits the reasoning field even
+        // for a model that exposes levels.
+        let auto = file.resolve(Some("openai"), Some("gpt-5.1"), None);
+        assert_eq!(auto.reasoning_level, None);
 
         let none = file.resolve(Some("deepseek"), Some("deepseek-chat"), Some("high"));
         assert_eq!(none.reasoning_level, None);

@@ -59,7 +59,11 @@ pub struct PendingSave {
 
 impl PendingSave {
     /// Write the staged JSON to disk (atomic rename, same as [`SessionStore::save`]).
-    pub fn write(self) -> Result<(), String> {
+    ///
+    /// Takes `&self` so the caller can write synchronously and then enqueue the
+    /// same serialized payload behind older staged writes without serializing
+    /// the session a second time.
+    pub fn write(&self) -> Result<(), String> {
         // Hold the lock across the write so a concurrent delete either waits
         // for this write and removes the file afterwards, or lands first and
         // makes this write a no-op.
@@ -72,7 +76,7 @@ impl PendingSave {
         }
         let path = self.directory.join(format!("{}.json", self.id));
         let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, self.json)
+        std::fs::write(&temporary, &self.json)
             .map_err(|error| format!("cannot write {}: {error}", temporary.display()))?;
         if path.exists() {
             let _ = std::fs::remove_file(&path);

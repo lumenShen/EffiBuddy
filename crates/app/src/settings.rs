@@ -1365,21 +1365,23 @@ impl AppView {
             update_rows.push(stat_row(theme, "最新版本", "尚未检查"));
         }
 
-        let mut update_buttons = vec![Button::new(
-            "update-check",
-            if self.update.checking {
-                "检查中…"
-            } else {
-                "检查更新"
-            },
-            theme,
-        )
-        .variant(ButtonVariant::Primary)
-        .size(ButtonSize::Sm)
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.start_update_check(cx);
-        }))
-        .into_any_element()];
+        let mut update_buttons = vec![
+            Button::new(
+                "update-check",
+                if self.update.checking {
+                    "检查中…"
+                } else {
+                    "检查更新"
+                },
+                theme,
+            )
+            .variant(ButtonVariant::Primary)
+            .size(ButtonSize::Sm)
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.start_update_check(cx);
+            }))
+            .into_any_element(),
+        ];
         if let Some(info) = self.available_update() {
             let url = info.html_url.clone();
             update_buttons.push(

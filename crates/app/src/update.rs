@@ -137,7 +137,15 @@ fn linux_prefers_rpm() -> bool {
 }
 
 fn os_release_prefers_rpm(content: &str) -> bool {
-    const RPM_IDS: [&str; 7] = ["fedora", "rhel", "centos", "rocky", "almalinux", "sles", "opensuse"];
+    const RPM_IDS: [&str; 7] = [
+        "fedora",
+        "rhel",
+        "centos",
+        "rocky",
+        "almalinux",
+        "sles",
+        "opensuse",
+    ];
     content.lines().any(|line| {
         line.strip_prefix("ID=")
             .map(|id| id.trim().trim_matches('"'))
@@ -289,7 +297,9 @@ mod tests {
         ));
         assert!(!os_release_prefers_rpm("ID=debian\n"));
         // ID_LIKE 不参与判定（发行版以 ID 为准）。
-        assert!(!os_release_prefers_rpm("ID=arch\nID_LIKE=\"rhel fedora\"\n"));
+        assert!(!os_release_prefers_rpm(
+            "ID=arch\nID_LIKE=\"rhel fedora\"\n"
+        ));
     }
 
     #[test]

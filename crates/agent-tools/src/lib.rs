@@ -70,8 +70,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use effibuddy_agent_core::{
-        AgentHarness, AutoApprovalGate, Completion, HarnessConfig, NestedToolInvoker, SessionState,
-        Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry, new_shared_session,
+        AgentHarness, AutoApprovalGate, Completion, FileCheckpointSink, HarnessConfig,
+        NestedToolInvoker, SessionState, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry,
+        new_shared_session,
     };
     use serde_json::{Value, json};
     use std::sync::{Arc, Mutex};
@@ -88,6 +89,7 @@ mod tests {
             cancel: CancellationToken::new(),
             nested,
             subagents: None,
+            checkpoint_sink: None,
         }
     }
 
@@ -274,5 +276,89 @@ mod tests {
             result.content
         );
         assert_eq!(session.messages[3].text(), "done");
+    }
+
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<String>>,
+    }
+
+    impl FileCheckpointSink for RecordingSink {
+        fn before_write(&self, relative_path: &str, _absolute: &std::path::Path, tool: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("before {tool} {relative_path}"));
+        }
+
+        fn after_write(
+            &self,
+            relative_path: &str,
+            _absolute: &std::path::Path,
+            tool: &str,
+            content: &[u8],
+        ) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("after {tool} {relative_path} {}", content.len()));
+        }
+
+        fn write_failed(&self, relative_path: &str, _absolute: &std::path::Path, tool: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("failed {tool} {relative_path}"));
+        }
+
+        fn note_shell(&self, command: &str) {
+            self.events.lock().unwrap().push(format!("shell {command}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn file_tools_report_checkpoint_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = builtin_tools(directory.path()).unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let mut ctx = context(None);
+        ctx.checkpoint_sink = Some(sink.clone());
+
+        registry
+            .get("write_file")
+            .unwrap()
+            .execute(
+                ctx.clone(),
+                json!({"path": "notes/a.txt", "content": "hello"}),
+            )
+            .await
+            .unwrap();
+        registry
+            .get("edit_file")
+            .unwrap()
+            .execute(
+                ctx.clone(),
+                json!({"path": "notes/a.txt", "old_string": "hello", "new_string": "bye"}),
+            )
+            .await
+            .unwrap();
+        registry
+            .get("shell")
+            .unwrap()
+            .execute(ctx, json!({"command": "echo checkpoint"}))
+            .await
+            .unwrap();
+
+        let events = sink.events.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "before write_file notes/a.txt".to_string(),
+                "after write_file notes/a.txt 5".to_string(),
+                "before edit_file notes/a.txt".to_string(),
+                "after edit_file notes/a.txt 3".to_string(),
+                "shell echo checkpoint".to_string(),
+            ]
+        );
     }
 }

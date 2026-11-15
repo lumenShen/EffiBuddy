@@ -134,12 +134,9 @@ fn combined_highlight(kinds: &[InlineKind], theme: &Theme) -> Option<HighlightSt
                 });
             }
             InlineKind::Link => {
-                highlight.color = Some(theme.accent);
-                highlight.underline = Some(UnderlineStyle {
-                    color: Some(theme.accent),
-                    thickness: px(1.0),
-                    wavy: false,
-                });
+                // ZCode styles links with color alone (underline only on
+                // hover, which plain highlights cannot express).
+                highlight.color = Some(theme.link);
             }
         }
     }
@@ -452,11 +449,11 @@ impl IrBuilder {
             self.inline.clear();
             return;
         }
+        // ZCode heading scale: 18/16/14 with semibold weight, no bold jumps.
         let (size, weight) = match level {
-            1 => (22.0, FontWeight::BOLD),
-            2 => (17.0, FontWeight::SEMIBOLD),
-            3 => (15.0, FontWeight::SEMIBOLD),
-            _ => (14.5, FontWeight::SEMIBOLD),
+            1 => (18.0, FontWeight::SEMIBOLD),
+            2 => (16.0, FontWeight::SEMIBOLD),
+            _ => (14.0, FontWeight::SEMIBOLD),
         };
         let text = TextIr {
             text: self.inline.text.clone().into(),
@@ -573,7 +570,13 @@ fn cache_put(
 /// switch can never serve stale styling.
 fn theme_ir_key(theme: &Theme) -> u64 {
     let mut hasher = DefaultHasher::new();
-    for color in [theme.text, theme.text_muted, theme.accent, theme.code_bg] {
+    for color in [
+        theme.text,
+        theme.text_muted,
+        theme.accent,
+        theme.code_bg,
+        theme.link,
+    ] {
         for channel in [color.h, color.s, color.l, color.a] {
             channel.to_bits().hash(&mut hasher);
         }
@@ -999,10 +1002,12 @@ fn styled_inline(text: SharedString, highlights: &[(Range<usize>, HighlightStyle
 }
 
 fn render_text_block(theme: &Theme, ir: &TextIr) -> AnyElement {
+    // ZCode body copy runs at a 1.75 line height; match it so streamed
+    // markdown breathes the same way.
     let element = div()
         .w_full()
         .text_size(px(ir.size))
-        .line_height(px(ir.size * 1.58))
+        .line_height(px(ir.size * 1.75))
         .font_weight(ir.weight)
         .text_color(theme.text)
         .child(styled_inline(ir.text.clone(), &ir.highlights));
@@ -1045,7 +1050,7 @@ fn render_item_row(theme: &Theme, ir: &ItemIr) -> AnyElement {
             div()
                 .w_full()
                 .text_size(px(text_size::BASE))
-                .line_height(px(text_size::BASE * 1.58))
+                .line_height(px(text_size::BASE * 1.75))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(theme.text)
                 .child(styled_inline(ir.text.clone(), &ir.highlights)),
@@ -1063,9 +1068,13 @@ fn render_code_block(
     let copy_code = code.clone();
     let label = language.unwrap_or("code");
 
+    // ZCode frames code blocks with a hairline border on the card background;
+    // the header sits on the same surface instead of a contrasting strip.
     div()
         .w_full()
         .rounded(px(radius::MD))
+        .border_1()
+        .border_color(theme.border)
         .bg(theme.code_bg)
         .overflow_hidden()
         .child(
@@ -1075,7 +1084,6 @@ fn render_code_block(
                 .justify_between()
                 .px_3()
                 .py(px(6.0))
-                .bg(theme.surface)
                 .child(
                     div()
                         .text_size(px(text_size::XS))

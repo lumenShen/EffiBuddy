@@ -93,6 +93,7 @@ cargo run --release -p effibuddy-stress -- \
 | 子代理转发器**每个结构事件** clone+序列化+保存整个子会话 | 800ms 节流 + 尾随刷新（对齐主会话持久化模式） |
 | 每次 spawn 重扫 profile 目录（真实磁盘） | `refresh_catalog` 2s TTL |
 | 侧栏摘要每次刷新全量解析全部 JSON | `(mtime, size)` 缓存，只解析变更文件 |
+| **子代理审批卡死**：children 的 write_file/edit_file 走 `BrokerApprovalGate`，审批卡片等用户点击 → 子代理挂起 600s（压测中 750/1000 卡死、UI 审批卡片堆积） | 压测子代理设为只读（`read_only: Some(true)`）— 变更类工具被过滤，剩余工具全部 `ApprovalPolicy::Auto`，零审批往返（修复后：取消 750→0、完成 419→1497） |
 
 ## 已验证基准（release，32 核 / 38G）
 
@@ -101,6 +102,7 @@ cargo run --release -p effibuddy-stress -- \
 | headless 1000 会话 × 500 tok/s | 聚合 525k tok/s（105%），事件 9.1 万/s，CPU 均值 4.3 核 / 峰 7.3 核，RSS 峰 1.14G，39k 轮 0 失败 |
 | headless 1000 子代理 × 500 tok/s（RAM 持久化） | 506,855 tok/s（101.4%），24,405 次 RAM 保存，释放 243.7M |
 | 应用内 1000 会话（采样渲染） | 541,906 tok/s（108.4%），UI 存活 |
+| 应用内 1000 子代理（只读） | 全部跑完零卡死（1497 回合 / 0 取消）。聚合均值 ~19k tok/s 是**生产语义天花板**：每个子代理 = 单回合（`execute_run` 一次 `run_turn`，~600-2000 token），1000 路总工作量 ~60 万 token 在 ~30s 内跑完即结束，不是性能瓶颈。要维持持续负载可配合 `--stress-fill`（单回合填充至水位）或由 runner 在子代理完成后继续孵化 |
 | 极限内存（上文） | RSS 3.71G，水位分布精准，零泄漏零失败 |
 
 **隔离验证**：真实会话目录逐次 md5 不变；`/dev/shm/effibuddy-stress-*` 每次退出即清空；仓库零污染。

@@ -322,6 +322,8 @@ pub struct ToolContext {
     pub nested: Option<Arc<dyn NestedToolInvoker>>,
     /// Present when the host supports launching subagents.
     pub subagents: Option<Arc<dyn SubagentSpawner>>,
+    /// Present when the host wants file edits recorded for conversation rewind.
+    pub checkpoint_sink: Option<crate::checkpoint::SharedFileCheckpointSink>,
 }
 
 impl ToolContext {

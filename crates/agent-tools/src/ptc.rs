@@ -300,6 +300,7 @@ mod tests {
             cancel: CancellationToken::new(),
             nested: Some(Arc::new(HugeEchoInvoker)),
             subagents: None,
+            checkpoint_sink: None,
         }
     }
 

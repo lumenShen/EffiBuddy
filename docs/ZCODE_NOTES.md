@@ -225,3 +225,67 @@ EffiBuddy v1 的取舍：
 - 自动截图回传（模型显式 `screenshot`，避免上下文被图片淹没）。
 
 验证：`cargo test --workspace` 242 个离线测试全绿；在 Fedora 45/GNOME Wayland 上用 `--computer-probe screenshot` 实际走通 xdg-desktop-portal 截图（2560×1600 → 1280×800），并用 `--preview-computer` 目视确认悬浮条与输入框提示；Windows 后端因当前环境没有交叉工具链，未实机编译验证。
+
+## 9. 消息编辑与撤销：无 Git 的文件检查点
+
+参考：ZCode 桌面端（`app.asar`，v3.18.0 打包产物）中 `chat.message.edit`、`chat.changeSummary.rewind*`、`chat.edit.resetConversationAndFiles*` 与 `v4/conversation/fileRewindPreview` / `applyFileRewind` / `editUserQuery` 这条链路。
+
+### ZCode 的做法
+
+- 用户消息 hover 出现「复制 / 编辑」；编辑后进入 composer 的 editing 状态，发送时走 `editUserQuery`，返回 `rewind / fork / blocked` 三种处置。
+- 文件回退不是直接写文件，而是先 `fileRewindPreview`：逐文件检查 checkpoint 是否缺失/不可读、当前文件是否被其他进程改过（`external_modified`）、路径是否支持；有冲突时**一个文件都不写**。
+- checkpoint 存在私有 Git ref（`refs/zcode/checkpoints/<workspace>/<id>`）下：临时 index `git add -A` → `write-tree` → `commit-tree` → `update-ref`，恢复时 `git restore --source=...` 并再次校验。bash/shell 的改动被明确标为「已忽略」，不假装能还原。
+- 编辑消息的冲突弹窗只提供「仅重置对话并发送」或取消；撤销对话框则列出可安全撤销、不能安全撤销、已忽略三组文件。
+
+### EffiBuddy 的落地
+
+| ZCode 决策 | EffiBuddy 落地 |
+| --- | --- |
+| Git ref 保存整树 checkpoint | **刻意不用 Git**：`agent-core` 定义 `FileCheckpointSink`；`write_file` / `edit_file` 在真正写入前回调 `before_write`，成功后回调 `after_write`（含写入内容的 FNV-1a 摘要），失败回调 `write_failed`；`shell` 只记录命令并在 UI 标为「无法追踪」。原始字节写在 `<数据目录>/checkpoints/<session>/<user-message>/<NNNN>.bin`。 |
+| 每轮 checkpoint | `SessionState.checkpoints: Vec<TurnCheckpoint>`，按**用户消息 id** 分组。后台通知、子代理写文件都通过同一 sink 追加到父 turn；`RunStarted` 时把 recorder 绑定到该 turn，延迟写回的后台子代理也不会串到下一轮。 |
+| 回退前逐文件预检 | `plan_restore`：每个路径取**最早**一次 before 快照 + **最晚**一次 after 摘要；当前内容与 after 不一致 → `ExternalModified`；快照缺失/不可读、路径变成目录/符号链接、写入失败 → 各自的原因。撤销对话框逐条展示，冲突时禁止写文件（只允许「仅撤销对话」）。 |
+| 安全恢复 | 恢复前再次校验当前内容；逐个文件写临时文件 → 保留原权限 → 原子 rename；新建文件在撤销时删除。不使用 `git`、不依赖仓库是否干净。 |
+| 编辑消息 = 裁剪对话 + 恢复本轮文件 + 重发 | composer 上方出现编辑条，显示将移除多少条消息、多少轮对话，以及「发送时还原 N 个文件」开关；发送前重新预检，冲突则弹「仅重置对话并发送 / 取消」。 |
+| 撤销 = 删消息 + 恢复文件 | 用户消息 hover 的撤销按钮只打开二级确认；确认框列出全部将还原文件、冲突文件、shell 忽略项，并用红色提示「EffiBuddy 不会使用 Git，无法从版本库恢复」。running / 后台子代理未停时拒绝执行。 |
+| checkpoint 清理 | 每个会话最多保留 64 个 turn（超出后最旧的快照目录删除）；会话从归档页永久删除时一并清理 `checkpoints/<session>`。 |
+
+刻意没做的：
+
+- fork / worktree 分支（ZCode 的 `forkAssistant` 与本功能无关）；
+- shell / 外部进程改动的字节级追踪：只能警告，不能还原；
+- 部分恢复：存在冲突文件时全部不写，避免「还原了一半」；
+- Git 仓库状态读取：`不动 git`，恢复结果也不需要工作区干净。
+
+## 10. 消息排队与回合中插入（本次模块）
+
+参考：DeepSeek Harness（本地源码 `../deepseek-harness`，HEAD 0.1.2-rc.1，等待释放语义在 tag `dsh-v0.2.2-alpha.2`）的 `packages/core/agent/src/inbox.ts` 双队列与 `agent-loop` 的 step 边界 claim；ZCode（`../ZCode_ref`）的 `steer/guide/queue` 三词体系、`computeInputRouting` 裁决表与 `pendingInputs` 单数组双车道。
+
+### 两家的共同结论（EffiBuddy 直接采纳）
+
+- **消息只在 step 边界进入上下文**：DSH 在 `preStep` 里 `inbox.claim`，ZCode 在完整 tool batch / text-only 收口后 drain；都不打断正在流式的 LLM 或执行中的工具。
+- **运行中的消息要么延长当前回合，要么排到新回合**，从不静默丢弃。
+- **注入要有防伪框架**：DSH 的通知带 `[SYSTEM NOTIFICATION - NOT USER INPUT]`；ZCode 的 user_steer 模板声明「这是运行中的真实用户输入」，且同轮有通知时改用只否认通知的变体。
+- **队列管理是完整产品面**：删除、立即发送、暂停/恢复、held 时二选一确认。
+
+### 落地
+
+| 两家决策 | EffiBuddy 实现 |
+| --- | --- |
+| DSH `followup/steer/inject` 三入口 | 两条车道：**排队**（Enter → `pending_inputs`，回合成功后 auto-drain 队首开新回合）与**插入**（Ctrl/Cmd+Enter → `AgentHandle::steer`，step 边界注入当前回合）。idle 时两种按键都等于普通发送 |
+| DSH `next-step` 收件箱 | `AgentHarness.steers: Arc<Mutex<Vec<SteerInput>>>`；`run_loop` 每次迭代顶部 `drain_steers()`，消息以 `Message::mid_turn_user` 落 transcript，发 `SteerDrained{steer_id, message_id}` 让宿主摘除队列条目 |
+| DSH「next-step 非空关不上 turn」/ ZCode text-only 续跑 | `tool_calls.is_empty()` 时若 `has_pending_steers()` 则 `continue`——最后一段纯文本期间到达的 steer 延长回合，而不是悬空 |
+| ZCode `fallbackPendingGuidesToQueue` | 中断/失败时宿主 `take_pending_steers()` 收回，队列条目统一转为 Queue；不丢文本 |
+| ZCode `computeInputRouting` reasonCode | 简化为按键分流 + `queue_held`（Interrupted/Failed 挂起队列，通知轮成功也不自动恢复，用户从队列条处置） |
+| DSH 队列编辑/删除/升级 steer | 队列条：每行 chip（排队/待注入）+ 预览 + 删除 + 「发送」（running 时升级为 steer 插队；idle 时立即 start_run） |
+| DSH `source.kind === 'user'` / ZCode wire 模板 | transcript 存原始文本，`build_chat_messages` 对 `mid_turn` 消息包 `<user-steer>` 框架；气泡带「运行中插入」chip，且禁用编辑/撤销（checkpoint turn 属于发起回合的那条消息） |
+| DSH「通知与用户消息同一通道、不同 source」 | 后台通知仍走 `synthetic_user` 独立车道；`resume_after_run` 把队首消息与待投递通知合并进同一新回合（通知在前），DSH e2e「guide 与 launch result 合流进下一次请求」的同构行为 |
+
+刻意没做的：
+
+- **队列持久化账本**（ZCode 的 SQLite `session_input` + 原子 promotion）：单进程桌面应用崩溃丢队列可接受，重启后用户重发；已注入的 steer 是普通消息随会话落盘。
+- **编辑排队消息 / 拖拽重排 / 编辑锁**（ZCode 的 editLock、reorder、reservation 三段式）：第一期只有删除与立即发送。
+- **guide/queue 会话级设置**（ZCode `followupMode`）：按键即模式，无状态可配。
+- **steer 解除工具等待**（DSH 0.2.2 的 `job_output` wait 释放）：EffiBuddy 没有 job 等待原语，后续做后台任务工具时一并考虑。
+- **wake 预算**（DSH `maxConsecutiveWakes`）：EffiBuddy 的唤醒只来自用户排队消息与后台子代理通知，后者已有「等父 turn 结束」的闸门，自激链条暂无成型路径。
+
+验证：`cargo test --workspace` 全绿（agent-core 88，含新增 steer 三个回归：工具执行中注入、纯文本回合延长、中断回收）；`update.rs` 的 `pick_asset_for` 三参数化属并行改动，未触碰。

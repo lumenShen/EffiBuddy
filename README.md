@@ -226,6 +226,7 @@ user message
 - 存在冲突文件时**一个文件都不写**；编辑流程只提供「仅重置对话并发送」，撤销流程只提供「仅撤销对话」。
 - 检查点由 `write_file` / `edit_file` 在真正写入前捕获，按用户消息分组，子代理与后台任务共享父 turn；`shell` 只记录命令并标注为不可追踪。快照保存在 `<数据目录>/checkpoints/`，不读取、不创建任何 Git 状态，因此也不需要工作区干净。
 - 主任务或后台子代理仍在运行时拒绝编辑/撤销；每个会话保留最近 64 个 turn 的检查点。
+- 运行中插入（「运行中插入」标记）的消息不参与编辑/撤销——它们不开启新的 turn，其文件改动归属原始提示词的检查点。
 
 ## PTC：让模型写程序调工具
 
@@ -417,7 +418,7 @@ return g.spec;
 ## 测试
 
 ```bash
-cargo test --workspace   # 276 个离线测试
+cargo test --workspace   # 277 个离线测试
 cargo build --workspace  # 构建通过（gpui 自带 future-incompat 提示）
 ```
 
@@ -428,7 +429,7 @@ cargo build --workspace  # 构建通过（gpui 自带 future-incompat 提示）
 | `agent-tools` | 33 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具、文件检查点回调 |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
 | `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
-| `app` | 89 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门、消息编辑/撤销的恢复预检与冲突检测 |
+| `app` | 90 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门、消息编辑/撤销的恢复预检与冲突检测 |
 
 真实 DeepSeek 测试默认忽略，需要 Key：
 

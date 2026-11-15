@@ -53,6 +53,9 @@ pub struct Theme {
 
     pub selection: Hsla,
     pub code_bg: Hsla,
+    /// Markdown link color. ZCode renders links in a single sky blue that
+    /// reads as clickable without competing with status colors.
+    pub link: Hsla,
     pub user_bubble: Hsla,
     pub tool_bg: Hsla,
     pub shadow: Hsla,
@@ -112,6 +115,7 @@ impl Theme {
             warning_soft: color(0xFFFBEB),
             selection: alpha_color(0x18181B2E),
             code_bg: color(0xF4F4F5),
+            link: color(0x0EA5E9),
             user_bubble: color(0xF4F4F5),
             tool_bg: color(0xFFFFFF),
             shadow: alpha_color(0x0000001A),
@@ -159,6 +163,7 @@ impl Theme {
             warning_soft: color(0x2B2216),
             selection: alpha_color(0xFFFFFF38),
             code_bg: color(0x0E0E0E),
+            link: color(0x0284C7),
             user_bubble: color(0x262626),
             tool_bg: color(0x1C1C1C),
             shadow: alpha_color(0x000000B3),

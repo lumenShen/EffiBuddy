@@ -19,6 +19,7 @@
 //!                                                 ToolRegistry
 //! ```
 
+pub mod checkpoint;
 pub mod context;
 pub mod contract;
 pub mod error;
@@ -47,6 +48,9 @@ pub mod sys_metrics;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use checkpoint::{
+    ContentDigest, FileCheckpoint, FileCheckpointSink, SharedFileCheckpointSink, TurnCheckpoint,
+};
 pub use contract::{extract_json_value, validate_json};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use harness::{AgentHandle, AgentHarness, HarnessConfig, HarnessEvent};

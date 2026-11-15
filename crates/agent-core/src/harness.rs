@@ -94,6 +94,13 @@ pub enum HarnessEvent {
         run_id: String,
         outcome: RunOutcome,
     },
+    /// A user message steered into the running turn was appended to the
+    /// transcript at a step boundary. `steer_id` matches the value returned by
+    /// [`AgentHandle::steer`]; the host uses it to drop its pending entry.
+    SteerDrained {
+        steer_id: String,
+        message_id: String,
+    },
     /// A structural change happened that is not covered by a delta.
     SessionChanged,
 }
@@ -132,6 +139,10 @@ pub struct HarnessConfig {
     pub agent_id: String,
     pub agent_name: Option<String>,
     pub agent_depth: usize,
+    /// Host callback for file rewind checkpoints. File tools report every
+    /// mutation here before/after writing; the host stores the original bytes
+    /// so a user message can later be edited or undone without Git.
+    pub checkpoint_sink: Option<crate::checkpoint::SharedFileCheckpointSink>,
 }
 
 impl Default for HarnessConfig {
@@ -155,8 +166,18 @@ impl Default for HarnessConfig {
             agent_id: "main".to_string(),
             agent_name: None,
             agent_depth: 0,
+            checkpoint_sink: None,
         }
     }
+}
+
+/// A user message handed to a running turn, to be appended at the next step
+/// boundary. The id is minted by [`AgentHandle::steer`] so the host can match
+/// the later [`HarnessEvent::SteerDrained`] against its own pending entry.
+#[derive(Debug, Clone)]
+pub struct SteerInput {
+    pub(crate) id: String,
+    pub(crate) text: String,
 }
 
 /// Cloneable control surface for the UI.
@@ -164,6 +185,7 @@ impl Default for HarnessConfig {
 pub struct AgentHandle {
     session: SharedSession,
     cancel: Arc<Mutex<CancellationToken>>,
+    steers: Arc<Mutex<Vec<SteerInput>>>,
 }
 
 impl AgentHandle {
@@ -181,6 +203,33 @@ impl AgentHandle {
     pub fn is_running(&self) -> bool {
         lock_session(&self.session).status.is_busy()
     }
+
+    /// Hand a user message to the running turn ("steer"). It is appended to
+    /// the transcript at the next step boundary — never mid-stream — and the
+    /// turn keeps running to address it. Returns the steer id.
+    pub fn steer(&self, text: impl Into<String>) -> String {
+        let steer = SteerInput {
+            id: new_id(),
+            text: text.into().trim().to_string(),
+        };
+        self.steers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(steer.clone());
+        steer.id
+    }
+
+    /// Steers that never reached a step boundary (interrupt, hard failure).
+    /// The host re-queues them as ordinary pending messages; the harness queue
+    /// is drained so nothing survives into an unrelated later turn.
+    pub fn take_pending_steers(&self) -> Vec<String> {
+        self.steers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .map(|steer| steer.text)
+            .collect()
+    }
 }
 
 pub struct AgentHarness {
@@ -191,6 +240,7 @@ pub struct AgentHarness {
     config: HarnessConfig,
     events: UnboundedSender<HarnessEvent>,
     cancel: Arc<Mutex<CancellationToken>>,
+    steers: Arc<Mutex<Vec<SteerInput>>>,
     subagents: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
 }
 
@@ -218,6 +268,7 @@ impl AgentHarness {
             config,
             events,
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
+            steers: Arc::new(Mutex::new(Vec::new())),
             subagents: None,
         }
     }
@@ -233,6 +284,7 @@ impl AgentHarness {
         AgentHandle {
             session: self.session.clone(),
             cancel: self.cancel.clone(),
+            steers: self.steers.clone(),
         }
     }
 
@@ -262,6 +314,39 @@ impl AgentHarness {
         self.config
             .context_window_override
             .unwrap_or_else(|| self.provider.context_window())
+    }
+
+    fn has_pending_steers(&self) -> bool {
+        !self
+            .steers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    /// Append every steered user message at this step boundary. Called only
+    /// from the step loop: a stream in flight or a tool mid-execution is never
+    /// interrupted by an injection, matching the way a tool result and the
+    /// next request stay a contiguous unit.
+    fn drain_steers(&self) {
+        let pending: Vec<SteerInput> = self
+            .steers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect();
+        for steer in pending {
+            let message = Message::mid_turn_user(steer.text);
+            let message_id = message.id.clone();
+            {
+                let mut session = lock_session(&self.session);
+                session.push_message(message);
+            }
+            self.emit(HarnessEvent::SteerDrained {
+                steer_id: steer.id,
+                message_id,
+            });
+        }
     }
 
     fn system_prompt(&self) -> String {
@@ -364,6 +449,11 @@ impl AgentHarness {
                 return RunOutcome::Interrupted;
             }
 
+            // Step boundary: steered user messages enter here, after the
+            // previous step's tool results (or assistant text) are fully
+            // committed and before the next request is built.
+            self.drain_steers();
+
             {
                 let mut session = lock_session(&self.session);
                 session.steps = step;
@@ -424,6 +514,13 @@ impl AgentHarness {
 
             let tool_calls = self.commit_completion(&mut stream, completion);
             if tool_calls.is_empty() {
+                // A steer that arrived while the final text was streaming
+                // extends the turn: the assistant message above stays in the
+                // transcript and the model gets another request with the new
+                // user input appended (ZCode's text-only continuation edge).
+                if self.has_pending_steers() {
+                    continue;
+                }
                 return RunOutcome::Completed;
             }
 
@@ -869,6 +966,7 @@ impl ToolExecutor {
                 }) as Arc<dyn crate::tool::NestedToolInvoker>
             }),
             subagents: self.subagents.clone(),
+            checkpoint_sink: self.config.checkpoint_sink.clone(),
         };
 
         let execution =
@@ -1461,5 +1559,221 @@ mod tests {
             .map(|t: &ToolSpec| t.name.as_str())
             .collect();
         assert!(names.contains(&"echo"));
+    }
+
+    /// A tool that parks until the test releases it, so the steer lands while
+    /// a tool is mid-execution — the harshest possible injection timing.
+    struct GateTool {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        _release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for GateTool {
+        fn name(&self) -> &str {
+            "gate"
+        }
+        fn description(&self) -> &str {
+            "Block until released"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _ctx: ToolContext,
+            _arguments: Value,
+        ) -> Result<ToolOutput, ToolError> {
+            let _ = self.entered.send(());
+            self._release.notified().await;
+            Ok(ToolOutput::text("released"))
+        }
+    }
+
+    /// Regression: a steer handed to a running turn enters the transcript at
+    /// the next step boundary (after the tool result is committed), is framed
+    /// with the mid-turn template in the next request, and never interrupts
+    /// the tool itself.
+    #[tokio::test]
+    async fn steer_is_injected_at_the_next_step_boundary() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut tools = ToolRegistry::new();
+        tools.register(GateTool {
+            entered: entered_tx,
+            _release: release.clone(),
+        });
+        let (harness, handle, mut events, provider) = harness_with(
+            vec![
+                Completion::default().with_tool_call(ToolCall::new("gate", json!({}))),
+                Completion::text("done"),
+            ],
+            tools,
+            HarnessConfig::default(),
+        );
+        let requests_provider = provider.clone();
+        let run = tokio::spawn(async move { harness.run_turn("start").await });
+
+        entered_rx.recv().await.expect("tool reported entry");
+        let steer_id = handle.steer("mid-run");
+        release.notify_one();
+        let outcome = run.await.unwrap().unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        {
+            let shared = handle.session();
+            let session = lock_session(&shared);
+            assert_eq!(session.messages.len(), 5);
+            assert!(session.messages[3].mid_turn, "steer is flagged mid_turn");
+            assert_eq!(session.messages[3].text(), "mid-run");
+        }
+        let requests = requests_provider.requests();
+        assert_eq!(requests.len(), 2);
+        let second = requests[1]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            second.contains("<user-steer>"),
+            "wire frame missing: {second}"
+        );
+        assert!(second.contains("mid-run"));
+
+        let mut saw_drained = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(
+                &event,
+                HarnessEvent::SteerDrained { steer_id: drained, .. } if drained.as_str() == steer_id
+            ) {
+                saw_drained = true;
+            }
+        }
+        assert!(saw_drained, "host must be told which steer was drained");
+    }
+
+    /// Provider whose first response waits on a test gate, so a steer can be
+    /// submitted while the final (text-only) answer is streaming.
+    struct GatedTextProvider {
+        script: Mutex<std::collections::VecDeque<Completion>>,
+        requests: Mutex<Vec<ChatRequest>>,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedTextProvider {
+        fn new(script: Vec<Completion>) -> Self {
+            Self {
+                script: Mutex::new(script.into()),
+                requests: Mutex::new(Vec::new()),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn requests(&self) -> Vec<ChatRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for GatedTextProvider {
+        fn name(&self) -> &str {
+            "gated-text"
+        }
+        fn context_window(&self) -> usize {
+            32_768
+        }
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _cancel: CancellationToken,
+            _events: UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            let first = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request);
+                requests.len() == 1
+            };
+            if first {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| ProviderError::Other("gated provider ran dry".into()))
+        }
+    }
+
+    /// Regression: a steer that arrives while the model is streaming its final
+    /// text extends the turn instead of being dropped — the answer above stays
+    /// in the transcript and the model gets another request with the input.
+    #[tokio::test]
+    async fn steer_extends_a_turn_that_finished_its_text() {
+        let provider = Arc::new(GatedTextProvider::new(vec![
+            Completion::text("first answer"),
+            Completion::text("second answer"),
+        ]));
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider.clone(),
+            Arc::new(ToolRegistry::new()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig::default(),
+            tx,
+        );
+        let handle = harness.handle();
+        let run = tokio::spawn(async move { harness.run_turn("q").await });
+
+        provider.entered.notified().await;
+        handle.steer("extra");
+        provider.release.notify_one();
+        let outcome = run.await.unwrap().unwrap();
+
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        let texts: Vec<String> = session
+            .messages
+            .iter()
+            .map(|message| (message.role, message.text()))
+            .filter(|(role, _)| *role == Role::User || *role == Role::Assistant)
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(texts, vec!["q", "first answer", "extra", "second answer"]);
+        assert!(session.messages[2].mid_turn);
+    }
+
+    /// Regression: interrupting a run hands unconsumed steers back to the
+    /// host (which re-queues them) instead of losing the text in the harness.
+    #[tokio::test]
+    async fn interrupted_turn_hands_unconsumed_steers_back_to_the_host() {
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tools = ToolRegistry::new();
+        tools.register(GateTool {
+            entered: entered_tx,
+            _release: Arc::new(tokio::sync::Notify::new()),
+        });
+        let (harness, handle, _events, _provider) = harness_with(
+            vec![Completion::default().with_tool_call(ToolCall::new("gate", json!({})))],
+            tools,
+            HarnessConfig::default(),
+        );
+        let run = tokio::spawn(async move { harness.run_turn("start").await });
+        entered_rx.recv().await.expect("tool reported entry");
+        handle.steer("never drained");
+        handle.interrupt();
+        let outcome = run.await.unwrap().unwrap();
+        assert_eq!(outcome, RunOutcome::Interrupted);
+        assert_eq!(
+            handle.take_pending_steers(),
+            vec!["never drained".to_string()]
+        );
     }
 }

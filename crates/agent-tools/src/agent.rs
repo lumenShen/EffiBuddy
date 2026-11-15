@@ -552,6 +552,7 @@ mod tests {
             cancel: CancellationToken::new(),
             nested: None,
             subagents: Some(spawner),
+            checkpoint_sink: None,
         }
     }
 

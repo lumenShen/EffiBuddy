@@ -4,6 +4,7 @@ mod agents;
 mod app;
 mod chat;
 mod chat_agent;
+mod checkpoint;
 mod computer;
 mod config;
 mod events;

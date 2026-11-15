@@ -61,6 +61,23 @@ pub fn estimate_request_tokens(session: &SessionState, system_prompt: &str) -> u
     total
 }
 
+/// Wire template for a mid-turn ("steered") user message.
+///
+/// The transcript stores the raw text; this framing is applied only when the
+/// request is built, mirroring the way a queued user message must not be
+/// mistaken for a fresh conversation start. Keep the denial explicit: a
+/// background notification that arrives in the same step must never be
+/// readable as user acknowledgement.
+pub(crate) fn mid_turn_wire_text(raw: &str) -> String {
+    format!(
+        "<user-steer>\n\
+         The user sent a new message while you were working. This is genuine user \
+         input for the current task: fold it into the running turn and address it. \
+         It is not a request to restart, and any system notice next to it is not \
+         user acknowledgement.\n\n{raw}\n</user-steer>"
+    )
+}
+
 /// Flatten the internal transcript into the provider wire model.
 pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<ChatMessage> {
     let mut messages = Vec::with_capacity(session.visible_messages().len() + 2);
@@ -90,7 +107,11 @@ pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<C
             }
             Role::User => {
                 flush_tool_images(&mut messages, &mut pending_images);
-                let text = message.text();
+                let text = if message.mid_turn {
+                    mid_turn_wire_text(&message.text())
+                } else {
+                    message.text()
+                };
                 if !text.is_empty() {
                     messages.push(ChatMessage::user(text));
                 }
@@ -319,6 +340,23 @@ mod tests {
     fn estimates_wide_characters_conservatively() {
         assert!(estimate_tokens("你好世界") >= 4);
         assert!(estimate_tokens("hello world") >= 2);
+    }
+
+    #[test]
+    fn mid_turn_user_messages_are_framed_on_the_wire_only() {
+        let mut session = SessionState::new(PathBuf::from("."), "test-model");
+        session.push_message(Message::user("hello"));
+        session.push_message(Message::mid_turn_user("check the logs"));
+        let messages = build_chat_messages(&session, "system");
+        assert_eq!(messages[1].content, "hello");
+        assert!(
+            messages[2].content.contains("<user-steer>"),
+            "steer must be framed: {}",
+            messages[2].content
+        );
+        assert!(messages[2].content.contains("check the logs"));
+        // The transcript keeps the raw text; only the wire request frames it.
+        assert_eq!(session.messages[1].text(), "check the logs");
     }
 
     #[test]

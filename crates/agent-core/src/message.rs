@@ -191,6 +191,12 @@ pub struct Message {
     /// bubble or a background-task notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_message: Option<AgentMessageMeta>,
+    /// The user typed this message while the model was already working and it
+    /// was injected at a step boundary ("steer"). The transcript keeps the raw
+    /// text; the wire request wraps it in a mid-turn template so the model
+    /// treats it as new input for the running task, not a restart.
+    #[serde(default)]
+    pub mid_turn: bool,
 }
 
 /// UI-facing metadata for an inter-agent message. The text itself lives in the
@@ -221,6 +227,7 @@ impl Message {
             interrupted: false,
             synthetic: false,
             agent_message: None,
+            mid_turn: false,
         }
     }
 
@@ -236,6 +243,15 @@ impl Message {
     pub fn synthetic_user(text: impl Into<String>) -> Self {
         let mut message = Self::user(text);
         message.synthetic = true;
+        message
+    }
+
+    /// A user message typed while the model was already working ("steer").
+    /// Stored with the raw text the user wrote; `build_chat_messages` wraps
+    /// `mid_turn` messages so the model keeps them inside the running task.
+    pub fn mid_turn_user(text: impl Into<String>) -> Self {
+        let mut message = Self::user(text);
+        message.mid_turn = true;
         message
     }
 
@@ -485,6 +501,19 @@ impl TodoItem {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn mid_turn_flag_round_trips_and_defaults_false_for_old_sessions() {
+        let mut message = Message::mid_turn_user("sent while running");
+        message.mid_turn = true;
+        let encoded = serde_json::to_string(&message).unwrap();
+        assert!(encoded.contains("mid_turn"));
+
+        // A session saved before the flag existed must load unchanged.
+        let legacy = r#"{"id":"m1","role":"user","created_at":"2026-01-01T00:00:00Z","blocks":[{"type":"text","text":"old"}]}"#;
+        let loaded: Message = serde_json::from_str(legacy).unwrap();
+        assert!(!loaded.mid_turn);
+    }
 
     #[test]
     fn add_keeps_last_prompt_tokens_as_the_current_footprint() {
