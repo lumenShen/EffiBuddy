@@ -1,7 +1,7 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig};
+use crate::platform::blade::{BladeContext, BladeRenderer, BladeSurfaceConfig, default_vsync};
 use crate::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
@@ -668,6 +668,7 @@ impl X11WindowState {
                     // If the window appearance changes, then the renderer will get updated
                     // too
                     transparent: false,
+                    vsync: default_vsync(),
                 };
                 BladeRenderer::new(gpu_context, &raw_window, config)?
             };
@@ -1235,6 +1236,14 @@ impl PlatformWindow for X11Window {
 
     fn scale_factor(&self) -> f32 {
         self.0.state.borrow().effective_scale()
+    }
+
+    fn set_vsync(&self, enabled: bool) {
+        self.0.state.borrow_mut().renderer.update_vsync(enabled);
+    }
+
+    fn vsync_enabled(&self) -> bool {
+        self.0.state.borrow().renderer.vsync_enabled()
     }
 
     fn set_ui_zoom(&self, zoom: f32) {

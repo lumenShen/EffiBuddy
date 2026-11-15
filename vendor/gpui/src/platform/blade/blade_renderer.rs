@@ -318,6 +318,61 @@ impl BladePipelines {
 pub struct BladeSurfaceConfig {
     pub size: gpu::Extent,
     pub transparent: bool,
+    /// Vertical sync (presentation pacing) for this surface.
+    ///
+    /// `true` (the default) selects [`gpu::DisplaySync::Block`], i.e. Vulkan
+    /// `FIFO` / Metal `displaySyncEnabled`: presenting blocks until the
+    /// display's next vblank, so the render loop is capped at the monitor's
+    /// refresh rate and never burns GPU/CPU on frames the user cannot see.
+    ///
+    /// `false` selects [`gpu::DisplaySync::Recent`] (Vulkan `MAILBOX`), which
+    /// never blocks: useful for latency-sensitive work and for the perf lab,
+    /// but it lets an animation loop run at several hundred fps.
+    pub vsync: bool,
+}
+
+impl BladeSurfaceConfig {
+    /// Map the vsync preference onto a blade display-sync mode.
+    fn display_sync(&self) -> gpu::DisplaySync {
+        if self.vsync {
+            gpu::DisplaySync::Block
+        } else {
+            gpu::DisplaySync::Recent
+        }
+    }
+}
+
+/// Default `vsync` for a freshly created surface.
+///
+/// Historically this vendored renderer hard-coded `DisplaySync::Recent`, which
+/// let animation frames race far past the monitor's refresh rate (400+ fps
+/// while a panel slide or typewriter reveal is running). Frames are now paced
+/// to the display by default; `EFFIBUDDY_VSYNC=0` restores the old unlocked
+/// behaviour for the performance lab, which needs to measure raw throughput.
+pub fn default_vsync() -> bool {
+    static DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        std::env::var("EFFIBUDDY_VSYNC").map_or(true, |value| value != "0")
+    })
+}
+
+/// Report the presentation pacing chosen for a new surface.
+///
+/// Gated behind `EFFIBUDDY_PERF=1` because there is no logger installed in the
+/// release binary — `log::info!` from the blade backend goes nowhere, so the
+/// perf lab would otherwise have no way to tell a paced run from an unlocked
+/// one. `Block` maps to Vulkan `FIFO` / Metal `displaySyncEnabled`, which syncs
+/// with whatever the monitor actually runs at (60Hz, 120Hz, 144Hz, 240Hz, or a
+/// VRR range) — never a hard-coded rate.
+fn report_pacing(display_sync: gpu::DisplaySync) {
+    if std::env::var("EFFIBUDDY_PERF").is_ok_and(|value| value == "1") {
+        let mode = match display_sync {
+            gpu::DisplaySync::Block => "FIFO (synced to display refresh)",
+            gpu::DisplaySync::Recent => "MAILBOX (unlocked, may fall back)",
+            gpu::DisplaySync::Tear => "IMMEDIATE (tearing)",
+        };
+        eprintln!("[gpu] requested surface display sync: {mode}");
+    }
 }
 
 //Note: we could see some of these fields moved into `BladeContext`
@@ -352,7 +407,7 @@ impl BladeRenderer {
         let surface_config = gpu::SurfaceConfig {
             size: config.size,
             usage: gpu::TextureUsage::TARGET,
-            display_sync: gpu::DisplaySync::Recent,
+            display_sync: config.display_sync(),
             color_space: gpu::ColorSpace::Srgb,
             allow_exclusive_full_screen: false,
             transparent: config.transparent,
@@ -361,6 +416,7 @@ impl BladeRenderer {
             .gpu
             .create_surface_configured(window, surface_config)
             .map_err(|err| anyhow::anyhow!("Failed to create surface: {err:?}"))?;
+        report_pacing(surface_config.display_sync);
 
         let command_encoder = context.gpu.create_command_encoder(gpu::CommandEncoderDesc {
             name: "main",
@@ -535,6 +591,33 @@ impl BladeRenderer {
                 self.rendering_parameters.path_sample_count,
             );
         }
+    }
+
+    /// Enable or disable vertical sync for this surface.
+    ///
+    /// Reconfigures the swap chain in place, so it takes effect on the next
+    /// presented frame without reopening the window. `true` caps the render
+    /// loop at the display refresh rate (`FIFO` / `displaySyncEnabled`),
+    /// `false` restores the unlocked `MAILBOX` path used by the perf lab.
+    pub fn update_vsync(&mut self, vsync: bool) {
+        let display_sync = if vsync {
+            gpu::DisplaySync::Block
+        } else {
+            gpu::DisplaySync::Recent
+        };
+        if display_sync != self.surface_config.display_sync {
+            self.wait_for_gpu();
+            self.surface_config.display_sync = display_sync;
+            self.gpu
+                .reconfigure_surface(&mut self.surface, self.surface_config);
+            report_pacing(display_sync);
+        }
+    }
+
+    /// Whether the surface currently presents in sync with the display.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn vsync_enabled(&self) -> bool {
+        self.surface_config.display_sync == gpu::DisplaySync::Block
     }
 
     #[cfg_attr(

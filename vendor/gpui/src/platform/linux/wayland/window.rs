@@ -35,7 +35,7 @@ use crate::{
     Capslock,
     platform::{
         PlatformAtlas, PlatformInputHandler, PlatformWindow,
-        blade::{BladeContext, BladeRenderer, BladeSurfaceConfig},
+        blade::{BladeContext, BladeRenderer, BladeSurfaceConfig, default_vsync},
         linux::wayland::{display::WaylandDisplay, serial::SerialKind},
     },
 };
@@ -169,6 +169,7 @@ impl WaylandWindowState {
                     depth: 1,
                 },
                 transparent: true,
+                vsync: default_vsync(),
             };
             BladeRenderer::new(gpu_context, &raw_window, config)?
         };
@@ -934,6 +935,14 @@ impl PlatformWindow for WaylandWindow {
 
     fn set_ui_zoom(&self, zoom: f32) {
         self.0.set_ui_zoom(zoom);
+    }
+
+    fn set_vsync(&self, enabled: bool) {
+        self.0.state.borrow_mut().renderer.update_vsync(enabled);
+    }
+
+    fn vsync_enabled(&self) -> bool {
+        self.0.state.borrow().renderer.vsync_enabled()
     }
 
     fn appearance(&self) -> WindowAppearance {

@@ -1670,6 +1670,18 @@ impl AppView {
                             ),
                     ),
                 )
+                .child(
+                    settings_card(theme, "渲染", "画面与显示器刷新率的同步方式").child(toggle_row(
+                        theme,
+                        "垂直同步",
+                        "开启后按显示器刷新率呈现画面（60Hz 屏即最多 60 帧）。关闭会以远超刷新率的速度重绘，徒增 GPU/CPU 开销，仅用于性能调试。",
+                        self.config.vsync,
+                        cx.listener(|this, _, window, cx| {
+                            let next = !this.config.vsync;
+                            this.set_vsync(next, window, cx);
+                        }),
+                    )),
+                )
                 .into_any_element(),
         )
     }

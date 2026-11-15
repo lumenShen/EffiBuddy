@@ -54,6 +54,7 @@ pub unsafe fn new_renderer(
                 depth: 1,
             },
             transparent,
+            vsync: default_vsync(),
         },
     )
     .unwrap()

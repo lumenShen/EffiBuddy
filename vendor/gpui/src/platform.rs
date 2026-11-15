@@ -471,6 +471,20 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// their buffers to `logical_size * scale_factor() * zoom`; the default is
     /// a no-op, so zooming silently does nothing where unsupported.
     fn set_ui_zoom(&self, _zoom: f32) {}
+    /// Enable or disable vertical sync for this window's surface.
+    ///
+    /// With vsync on (the default) presentation blocks until the display's
+    /// next vblank, capping the render loop at the monitor refresh rate
+    /// instead of painting frames the user never sees. Turning it off is only
+    /// meant for the performance lab and latency investigations.
+    ///
+    /// Backends that cannot reconfigure the swap chain at runtime leave this
+    /// as a no-op.
+    fn set_vsync(&self, _enabled: bool) {}
+    /// Whether this window currently presents in sync with the display.
+    fn vsync_enabled(&self) -> bool {
+        true
+    }
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;

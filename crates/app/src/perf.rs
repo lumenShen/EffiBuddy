@@ -17,6 +17,11 @@
 //!   into the vendored gpui present/fence wait (see `vendor/gpui`), so the
 //!   main thread parks longer per frame with the CPU free — the real
 //!   signature of a GPU-bound pipeline.
+//! * `EFFIBUDDY_VSYNC=0` — present frames without waiting for the display,
+//!   restoring the unlocked loop (several hundred fps during animations).
+//!   Vertical sync is on by default so animations are paced to the monitor;
+//!   the unlocked mode exists so this lab can still measure raw throughput,
+//!   and runs that use it are tagged `NO-VSYNC` in the HUD and bench logs.
 
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -333,6 +338,15 @@ pub fn bench_summary() -> String {
     )
 }
 
+/// Whether the app is currently presenting in sync with the display.
+///
+/// Read from the platform layer so the HUD, the bench summary and the settings
+/// page all agree: `EFFIBUDDY_VSYNC=0` forces presentation off-sync for the
+/// performance lab, and the user's setting can turn it off at runtime.
+pub fn vsync_enabled() -> bool {
+    gpui::platform_vsync_enabled()
+}
+
 /// Active degradation-mode badges, for the HUD and bench logs.
 pub fn mode_badges() -> String {
     let mut badges = Vec::new();
@@ -346,6 +360,11 @@ pub fn mode_badges() -> String {
     }
     if std::env::var_os("EFFIBUDDY_NO_SPLIT").is_some() {
         badges.push("NOSPLIT".to_string());
+    }
+    if !vsync_enabled() {
+        // Unlocked presentation: frame counts here are not comparable with a
+        // vsynced run on the same machine.
+        badges.push("NO-VSYNC".to_string());
     }
     if badges.is_empty() {
         "baseline".to_string()

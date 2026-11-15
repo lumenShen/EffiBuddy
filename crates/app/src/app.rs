@@ -6278,6 +6278,22 @@ impl AppView {
         cx.notify();
     }
 
+    /// Turn vertical sync on or off for the main window.
+    ///
+    /// With vsync on, presenting a frame blocks until the display's next
+    /// vblank, so an in-flight animation advances at most once per refresh
+    /// instead of spinning the render loop at several hundred fps. The choice
+    /// is persisted app-wide and applied to the swap chain immediately.
+    pub(crate) fn set_vsync(&mut self, enabled: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.config.vsync == enabled {
+            return;
+        }
+        self.config.vsync = enabled;
+        window.set_vsync(enabled);
+        let _ = self.config.save();
+        cx.notify();
+    }
+
     /// Hide the entire left sidebar (or restore it), leaving only the main
     /// column. Persisted app-wide so the shell reopens in the chosen layout.
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -10604,6 +10620,14 @@ fn render_perf_hud(theme: &Theme) -> AnyElement {
         .child(line(format!(
             "render avg {:.2} · p95 {:.2} ms · hits {}/s",
             hud.render_avg_ms, hud.render_p95_ms, hud.cache_hits_per_s
+        )))
+        .child(line(format!(
+            "pacing {}",
+            if perf::vsync_enabled() {
+                "vsync"
+            } else {
+                "unlocked"
+            }
         )))
         .child(line(perf::mode_badges()))
         .into_any_element()

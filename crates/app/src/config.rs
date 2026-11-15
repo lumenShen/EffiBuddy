@@ -89,6 +89,13 @@ pub struct AppConfig {
     /// small local models and large hosted ones.
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// Present frames in sync with the display (vertical sync). On by default:
+    /// animations then advance at most once per refresh, so a sliding panel or
+    /// typewriter reveal no longer drives the window to several hundred fps —
+    /// work the user cannot see and on a 60Hz screen pure waste. Turn it off
+    /// only for the performance lab, which measures unlocked throughput.
+    #[serde(default = "default_true")]
+    pub vsync: bool,
 }
 
 fn default_true() -> bool {
@@ -158,6 +165,7 @@ impl Default for AppConfig {
             update_skip_version: None,
             ui_zoom: default_ui_zoom(),
             compaction: CompactionConfig::default(),
+            vsync: true,
         }
     }
 }

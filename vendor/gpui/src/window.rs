@@ -822,6 +822,19 @@ impl Frame {
 pub static LAST_FRAME_WORK_MICROS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 
+/// Whether the most recently touched window presents in sync with the display.
+///
+/// Mirrors [`Window::set_vsync`] so hosts can show the effective state (the
+/// performance HUD, settings pages) without holding a window handle. Starts at
+/// the platform default, which is vsync on.
+static VSYNC_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// The effective vertical-sync state of the app's window(s).
+pub fn platform_vsync_enabled() -> bool {
+    VSYNC_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1862,6 +1875,25 @@ impl Window {
         self.platform_window.set_ui_zoom(zoom);
         self.scale_factor = self.platform_window.scale_factor();
         self.refresh();
+    }
+
+    /// Enable or disable vertical sync, i.e. whether presenting a frame blocks
+    /// until the display's next vblank.
+    ///
+    /// Vsync is on by default: an animation (panel slide, typewriter reveal,
+    /// smooth scroll) then advances at most once per refresh, so the window is
+    /// never redrawn hundreds of times per second for output the user cannot
+    /// see. Turning it off lifts the cap, which is only useful for the
+    /// performance lab and latency measurements. Persisting the preference
+    /// across launches is the caller's job.
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.platform_window.set_vsync(enabled);
+        VSYNC_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether this window currently presents in sync with the display.
+    pub fn vsync_enabled(&self) -> bool {
+        self.platform_window.vsync_enabled()
     }
 
     /// The size of an em for the base font of the application. Adjusting this value allows the

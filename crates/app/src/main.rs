@@ -124,9 +124,20 @@ fn main() {
                 window.activate_window();
                 // Restore the persisted whole-app zoom before the first frame
                 // the user interacts with; 1.0 skips the extra re-layout.
-                let ui_zoom = AppConfig::load().ui_zoom;
+                let config = AppConfig::load();
+                let ui_zoom = config.ui_zoom;
                 if (ui_zoom - 1.0).abs() > 1e-4 {
                     window.set_ui_zoom(ui_zoom);
+                }
+                // Pace presentation to the display. The window backend already
+                // defaults to vsync, so only an explicit opt-out costs a swap
+                // chain reconfigure here. `EFFIBUDDY_VSYNC=0` wins over the
+                // persisted setting: the performance lab needs an unlocked
+                // run even when the user has vsync on.
+                let lab_vsync = std::env::var("EFFIBUDDY_VSYNC").map_or(true, |value| value != "0");
+                let vsync = config.vsync && lab_vsync;
+                if !vsync {
+                    window.set_vsync(false);
                 }
                 if std::env::args().any(|argument| argument == "--preview-composer") {
                     view.seed_composer_preview(window, cx);
