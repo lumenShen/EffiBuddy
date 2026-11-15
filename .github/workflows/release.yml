@@ -98,8 +98,30 @@ jobs:
 
       - name: 冒烟测试
         run: |
-          ./target/release/effibuddy --version
-          runtime/bash -lc 'echo bundled-bash-ok; ls --version | head -1'
+          set -o pipefail
+          if ! {
+            echo "== files =="
+            ls -l target/release/effibuddy runtime/bash || true
+            file target/release/effibuddy runtime/bash || true
+            status=0
+            ./target/release/effibuddy --version || status=$?
+            if [ "$status" -eq 0 ]; then
+              runtime/bash --noprofile --norc -c 'echo bundled-bash-ok; printf "BASH_VERSION=%s\n" "$BASH_VERSION"; uname -m' || status=$?
+            fi
+            exit "$status"
+          } 2>&1 | tee smoke.log; then
+            msg="$(tail -c 2500 smoke.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':b' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+            echo "::error::Linux 冒烟测试失败，日志尾部：%0A$msg"
+            exit 1
+          fi
+
+      - name: 上传冒烟日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-smoke-log
+          path: smoke.log
+          if-no-files-found: ignore
 
       - name: 打包 tar.gz
         run: |
@@ -381,8 +403,30 @@ jobs:
 
       - name: 冒烟测试
         run: |
-          ./target/release/effibuddy --version
-          runtime/bash -lc 'echo bundled-bash-ok; ls --version | head -1'
+          set -o pipefail
+          if ! {
+            echo "== files =="
+            ls -l target/release/effibuddy runtime/bash || true
+            file target/release/effibuddy runtime/bash || true
+            status=0
+            ./target/release/effibuddy --version || status=$?
+            if [ "$status" -eq 0 ]; then
+              runtime/bash --noprofile --norc -c 'echo bundled-bash-ok; printf "BASH_VERSION=%s\n" "$BASH_VERSION"; uname -m' || status=$?
+            fi
+            exit "$status"
+          } 2>&1 | tee smoke.log; then
+            msg="$(tail -c 2500 smoke.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':b' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+            echo "::error::macOS 冒烟测试失败，日志尾部：%0A$msg"
+            exit 1
+          fi
+
+      - name: 上传冒烟日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-smoke-log
+          path: smoke.log
+          if-no-files-found: ignore
 
       - name: 打包 tar.gz
         run: |
