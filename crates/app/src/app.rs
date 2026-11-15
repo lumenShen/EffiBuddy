@@ -2092,7 +2092,7 @@ impl AppView {
             cx.notify();
             return;
         } else {
-            match resolved.build_provider() {
+            match resolved.build_provider_for(Some(&session_id)) {
                 Ok(provider) => provider,
                 Err(error) => {
                     self.last_error = Some(format!("无法创建模型客户端：{error}"));

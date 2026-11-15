@@ -232,9 +232,14 @@ impl SubagentService {
                     resolved.provider_label()
                 )));
             }
-            provider = resolved.build_provider().map_err(|error| {
-                ToolError::new(format!("无法为 `{requested}` 创建模型客户端：{error}"))
-            })?;
+            // Children inherit the parent conversation's routing id: the child
+            // session is created below, and a stable id keeps gateway cache
+            // hits for fan-outs instead of a fresh one per child.
+            provider = resolved
+                .build_provider_for(Some(&self.parent_session_id))
+                .map_err(|error| {
+                    ToolError::new(format!("无法为 `{requested}` 创建模型客户端：{error}"))
+                })?;
             provider_id = resolved.provider.id.clone();
             model = resolved.model.id.clone();
             reasoning = resolved.reasoning_level.clone();

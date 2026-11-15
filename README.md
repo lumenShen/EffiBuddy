@@ -41,7 +41,7 @@
 - **代理网络**：子代理可命名、可自定义提示词/工具、可继续派生孙代理；`agent_send` / `agent_list` 支持代理间文本与结构化数据；每个代理对象可选私有（仅创建者）或公开（会话内可复用），只读父代理不会派生出可写子代理。
 - **智能体组与关系图**：`workflow_run` 用 JSON 或 JavaScript builder 定义带类型化输入/输出契约的 DAG（支持批量输入）；标题栏「智能体关系图」提供可平移缩放的画布、委派/消息/数据连线、组框与节点检查器。
 - **PTC 工具调用**：模型写一段同步 JavaScript，通过 `tools.*` 编排多次工具调用，只把聚合结果带回上下文。解释器是纯 Rust 的 Boa，无 C/C++ 依赖。
-- **多供应商模型注册表**：预置 DeepSeek / OpenAI / Anthropic / Z.ai / BigModel / Kimi / OpenRouter / SiliconFlow / Ollama，支持自定义供应商与模型；每个会话可独立选择供应商、模型与推理档位。设置页可编辑端点、Key、上下文窗口、最大输出、能力与默认模型，并支持连通性测试和从 API 拉取模型。
+- **多供应商模型注册表**：预置 DeepSeek / OpenAI / Anthropic / Z.ai / BigModel / Kimi / OpenRouter / SiliconFlow / OpenCode Zen / OpenCode Go / Ollama，支持自定义供应商与模型；每个会话可独立选择供应商、模型与推理档位。设置页可编辑端点、Key、上下文窗口、最大输出、能力与默认模型，并支持连通性测试和从 API 拉取模型。
 - **三种流式协议**：OpenAI Chat Completions、Anthropic Messages、OpenAI Responses；统一映射到 `ProviderEvent`，支持 reasoning/thinking、流式 tool-call 重组、usage 与 prompt cache 统计。
 - **本地优先**：会话保存为 `%LOCALAPPDATA%\EffiBuddy\sessions\*.json`，模型注册表保存为 `%LOCALAPPDATA%\EffiBuddy\providers.json`；API Key 只从环境变量或本地文件读取，设置页不回显明文。
 - **可测试**：离线测试覆盖 agent loop、工具、沙箱、JSON 契约、工作流 DAG、运行时可见性与图布局，外加默认忽略的真实模型集成测试。
@@ -76,14 +76,16 @@ cargo run -p effibuddy-app --release  # 发布构建
 
 | 协议 | 请求路径 | 典型供应商 |
 | --- | --- | --- |
-| OpenAI Chat Completions | `/chat/completions` | DeepSeek、OpenAI、Z.ai、BigModel、Kimi、OpenRouter、SiliconFlow、Ollama |
+| OpenAI Chat Completions | `/chat/completions` | DeepSeek、OpenAI、Z.ai、BigModel、Kimi、OpenRouter、SiliconFlow、OpenCode Zen、OpenCode Go、Ollama |
 | Anthropic Messages | `/v1/messages` | Anthropic，以及 Anthropic 兼容端点 |
 | OpenAI Responses | `/responses` | OpenAI Responses API |
+
+OpenCode 的两个网关都走 OpenAI Chat Completions：Zen（`https://opencode.ai/inference/openai/v1`，旧版 `/zen/v1` 仍可用）只需 Bearer Key；Go（`https://opencode.ai/inference/go/openai/v1`）额外要求每次请求带 `x-opencode-session`，EffiBuddy 会用当前会话 ID 自动填充（自定义供应商只要 Base URL 指向 Go 网关，同样生效）。两者都会带上 `EffiBuddy/<版本>` 的 User-Agent；免费档模型只对 OpenCode 官方客户端开放，第三方客户端请使用付费模型或 Go。
 
 Key 的解析顺序：
 
 1. 供应商各自的 `api_key`（在设置页保存）；
-2. 内置环境变量：`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`ZAI_API_KEY`、`BIGMODEL_API_KEY`、`MOONSHOT_API_KEY`、`OPENROUTER_API_KEY`、`SILICONFLOW_API_KEY`；
+2. 内置环境变量：`DEEPSEEK_API_KEY`、`OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`ZAI_API_KEY`、`BIGMODEL_API_KEY`、`MOONSHOT_API_KEY`、`OPENROUTER_API_KEY`、`SILICONFLOW_API_KEY`、`OPENCODE_API_KEY`（Zen）、`OPENCODE_GO_API_KEY`（Go）；
 3. 旧版 `EFFIBUDDY_API_KEY` 以及 `<workspace>/deepseekAPIKey.env` 会迁移到 DeepSeek 供应商。
 
 本地地址（`localhost` / `127.0.0.1`，例如 Ollama）不要求 Key。设置页中的 Key 输入框始终为空：已配置时提示「已配置 · 留空不修改」，保存时留空不会覆盖已有 Key。

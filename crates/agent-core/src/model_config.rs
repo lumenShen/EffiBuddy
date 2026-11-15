@@ -375,6 +375,28 @@ impl ProviderConfig {
             trimmed
         }
     }
+
+    /// True when the endpoint is an OpenCode Console/Go gateway. Both share
+    /// one wire protocol; only the base URL path differs.
+    pub fn is_opencode_gateway(&self) -> bool {
+        let base = self.base_url.trim().to_ascii_lowercase();
+        self.id.starts_with("opencode")
+            || base.contains("opencode.ai/inference")
+            || base.contains("opencode.ai/zen")
+    }
+
+    /// Gateways that route and cache per conversation want a stable session
+    /// id on every request. OpenCode Go answers a request without
+    /// `x-opencode-session` with HTTP 400 `MissingSessionID`, so the id is
+    /// injected rather than left to the user's custom provider headers.
+    ///
+    /// Detection is by endpoint too: a hand-written custom provider pointing
+    /// at the Go gateway gets the header without any extra configuration.
+    pub fn session_id_header(&self) -> Option<&'static str> {
+        let base = self.base_url.trim().to_ascii_lowercase();
+        let gateway = self.id == "opencode-go" || base.contains("opencode.ai/inference/go");
+        gateway.then_some("x-opencode-session")
+    }
 }
 
 fn builtin_env_key(provider_id: &str) -> Option<&'static str> {
@@ -387,6 +409,8 @@ fn builtin_env_key(provider_id: &str) -> Option<&'static str> {
         "moonshot" => Some("MOONSHOT_API_KEY"),
         "openrouter" => Some("OPENROUTER_API_KEY"),
         "siliconflow" => Some("SILICONFLOW_API_KEY"),
+        "opencode-zen" => Some("OPENCODE_API_KEY"),
+        "opencode-go" => Some("OPENCODE_GO_API_KEY"),
         _ => None,
     }
 }
@@ -717,6 +741,20 @@ impl ResolvedModel {
     }
 
     pub fn build_provider(&self) -> Result<Arc<dyn ModelProvider>, ProviderError> {
+        self.build_provider_for(None)
+    }
+
+    /// Build the client for one conversation. `session_id` is forwarded as the
+    /// gateway's routing id when the endpoint asks for one (see
+    /// [`ProviderConfig::session_id_header`]); one-shot probes without a
+    /// session fall back to a random id so the request is still routed.
+    ///
+    /// Passing the same id for every turn of a session keeps the gateway's
+    /// prompt cache warm; rebuilding a client is otherwise stateless.
+    pub fn build_provider_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Arc<dyn ModelProvider>, ProviderError> {
         let api_key = self.provider.effective_api_key();
         let base_url = if self.provider.base_url.trim().is_empty() {
             if self.provider.id == DEFAULT_PROVIDER_ID {
@@ -730,12 +768,7 @@ impl ResolvedModel {
         } else {
             self.provider.base_url.trim()
         };
-        let extra_headers = self
-            .provider
-            .headers
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect::<Vec<_>>();
+        let extra_headers = self.request_headers(session_id);
 
         match self.provider.api_format {
             ApiFormat::OpenAiChatCompletions => {
@@ -774,6 +807,42 @@ impl ResolvedModel {
                 Ok(Arc::new(OpenAiResponsesProvider::new(config)?))
             }
         }
+    }
+
+    /// Configured provider headers plus the ones a gateway expects. A
+    /// user-set header with the same name wins.
+    fn request_headers(&self, session_id: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = self
+            .provider
+            .headers
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        let mut set = |name: &str, value: String| {
+            if !headers
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case(name))
+            {
+                headers.push((name.to_string(), value));
+            }
+        };
+        // The Console docs ask harnesses to identify themselves instead of
+        // presenting a generic HTTP-library user agent.
+        if self.provider.is_opencode_gateway() {
+            set(
+                "user-agent",
+                format!("EffiBuddy/{}", env!("CARGO_PKG_VERSION")),
+            );
+        }
+        if let Some(header) = self.provider.session_id_header() {
+            let value = session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(crate::ids::new_id);
+            set(header, value);
+        }
+        headers
     }
 }
 
@@ -885,6 +954,33 @@ fn reasoning_model(
 ) -> ModelConfig {
     model(id, name, context_window, max_output_tokens, capabilities)
         .with_reasoning_levels(standard_reasoning_levels())
+}
+
+/// Reasoning presets advertise only the levels the gateway accepts: the
+/// standard three are not universal (DeepSeek and GLM have no `medium`).
+fn reasoning_model_with_levels(
+    id: &str,
+    name: &str,
+    context_window: usize,
+    max_output_tokens: u32,
+    capabilities: ModelCapabilities,
+    reasoning_levels: &[&str],
+) -> ModelConfig {
+    let levels = reasoning_levels
+        .iter()
+        .map(|value| {
+            let label = match *value {
+                "low" => "低",
+                "medium" => "中",
+                "high" => "高",
+                "xhigh" => "极高",
+                "max" => "最高",
+                other => other,
+            };
+            ReasoningLevel::new(*value, label)
+        })
+        .collect();
+    model(id, name, context_window, max_output_tokens, capabilities).with_reasoning_levels(levels)
 }
 
 fn provider(
@@ -1205,6 +1301,163 @@ pub fn builtin_providers() -> Vec<ProviderConfig> {
             ],
         ),
         provider(
+            "opencode-zen",
+            "OpenCode Zen",
+            ApiFormat::OpenAiChatCompletions,
+            "https://opencode.ai/inference/openai/v1",
+            vec![
+                reasoning_model(
+                    "claude-sonnet-5",
+                    "Claude Sonnet 5",
+                    1_048_576,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "claude-opus-5",
+                    "Claude Opus 5",
+                    1_048_576,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "gpt-6.1-sol",
+                    "GPT-6.1 Sol",
+                    1_050_000,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "gemini-4-argon",
+                    "Gemini 4 Argon",
+                    1_048_576,
+                    65_536,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model_with_levels(
+                    "deepseek-v4.1-flash",
+                    "DeepSeek V4.1 Flash",
+                    1_000_000,
+                    384_000,
+                    ModelCapabilities::full(),
+                    &["low", "high"],
+                ),
+                reasoning_model_with_levels(
+                    "glm-5.3",
+                    "GLM-5.3",
+                    1_000_000,
+                    131_072,
+                    ModelCapabilities::reasoning(),
+                    &["low", "high"],
+                ),
+                reasoning_model_with_levels(
+                    "glm-5.3-flash",
+                    "GLM-5.3 Flash",
+                    1_000_000,
+                    131_072,
+                    ModelCapabilities::full(),
+                    &["low", "high"],
+                ),
+                reasoning_model_with_levels(
+                    "kimi-k3",
+                    "Kimi K3",
+                    1_048_576,
+                    1_048_576,
+                    ModelCapabilities::full(),
+                    &["low", "high"],
+                ),
+                reasoning_model(
+                    "grok-4.7",
+                    "Grok 4.7",
+                    500_000,
+                    500_000,
+                    ModelCapabilities::full(),
+                ),
+            ],
+        ),
+        provider(
+            "opencode-go",
+            "OpenCode Go",
+            ApiFormat::OpenAiChatCompletions,
+            "https://opencode.ai/inference/go/openai/v1",
+            vec![
+                reasoning_model_with_levels(
+                    "deepseek-v4.1-flash",
+                    "DeepSeek V4.1 Flash",
+                    1_000_000,
+                    384_000,
+                    ModelCapabilities::full(),
+                    &["low", "high"],
+                ),
+                reasoning_model_with_levels(
+                    "deepseek-v4-pro",
+                    "DeepSeek V4 Pro",
+                    1_000_000,
+                    384_000,
+                    ModelCapabilities::reasoning(),
+                    &["high", "max"],
+                ),
+                reasoning_model_with_levels(
+                    "glm-5.3",
+                    "GLM-5.3",
+                    1_000_000,
+                    131_072,
+                    ModelCapabilities::reasoning(),
+                    &["low", "high"],
+                ),
+                reasoning_model_with_levels(
+                    "kimi-k3.1-pro",
+                    "Kimi K3.1 Pro",
+                    1_048_576,
+                    1_048_576,
+                    ModelCapabilities::full(),
+                    &["low", "high"],
+                ),
+                reasoning_model(
+                    "claude-haiku-5-5",
+                    "Claude Haiku 5.5",
+                    1_000_000,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "gpt-6-luna",
+                    "GPT-6 Luna",
+                    1_050_000,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "gpt-5.6-luna",
+                    "GPT-5.6 Luna",
+                    1_050_000,
+                    128_000,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "gemini-4-argon",
+                    "Gemini 4 Argon",
+                    1_048_576,
+                    65_536,
+                    ModelCapabilities::full(),
+                ),
+                reasoning_model(
+                    "grok-4.7",
+                    "Grok 4.7",
+                    500_000,
+                    500_000,
+                    ModelCapabilities::full(),
+                ),
+                model(
+                    "minimax-m3",
+                    "MiniMax-M3",
+                    1_000_000,
+                    131_072,
+                    ModelCapabilities::full(),
+                ),
+            ],
+        ),
+        provider(
             "ollama",
             "Ollama（本地）",
             ApiFormat::OpenAiChatCompletions,
@@ -1243,7 +1496,7 @@ mod tests {
     #[test]
     fn builtin_registry_is_valid_and_complete() {
         let file = ModelConfigFile::with_builtins();
-        assert!(file.providers.len() >= 9);
+        assert!(file.providers.len() >= 11);
         for provider in &file.providers {
             assert!(provider.builtin);
             assert!(!provider.base_url.trim().is_empty());
@@ -1351,5 +1604,81 @@ mod tests {
         assert!(!ollama.requires_api_key());
         assert!(ollama.has_credentials());
         assert!(file.provider("openai").unwrap().requires_api_key());
+    }
+
+    fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn opencode_go_requests_carry_a_session_header() {
+        let file = ModelConfigFile::with_builtins();
+        let go = file.provider("opencode-go").expect("opencode-go");
+        assert_eq!(
+            go.base_url.trim(),
+            "https://opencode.ai/inference/go/openai/v1"
+        );
+        let resolved = file.resolve(Some("opencode-go"), Some("glm-5.3"), None);
+        let headers = resolved.request_headers(Some("session-42"));
+        assert_eq!(header(&headers, "x-opencode-session"), Some("session-42"));
+        assert!(
+            header(&headers, "user-agent").is_some_and(|agent| agent.starts_with("EffiBuddy/")),
+            "gateway should see a product user agent: {headers:?}"
+        );
+
+        // One-shot probes (test connection) still get a routed id.
+        let generated = resolved.request_headers(None);
+        assert!(
+            header(&generated, "x-opencode-session").is_some_and(|id| !id.trim().is_empty()),
+            "missing session id: {generated:?}"
+        );
+    }
+
+    #[test]
+    fn opencode_zen_does_not_need_a_session_header() {
+        let file = ModelConfigFile::with_builtins();
+        let zen = file.provider("opencode-zen").expect("opencode-zen");
+        assert_eq!(
+            zen.base_url.trim(),
+            "https://opencode.ai/inference/openai/v1"
+        );
+        assert_eq!(zen.session_id_header(), None);
+        let resolved = file.resolve(Some("opencode-zen"), None, None);
+        let headers = resolved.request_headers(Some("session-42"));
+        assert_eq!(header(&headers, "x-opencode-session"), None);
+        assert!(header(&headers, "user-agent").is_some());
+    }
+
+    #[test]
+    fn custom_opencode_go_endpoint_gets_the_session_header() {
+        let mut provider =
+            ProviderConfig::new("opencode", "opencode", ApiFormat::OpenAiChatCompletions);
+        provider.base_url = "https://opencode.ai/inference/go/openai/v1".to_string();
+        let resolved = ResolvedModel::new(provider, Some("glm-5.3"), None);
+        assert_eq!(
+            header(
+                &resolved.request_headers(Some("session-7")),
+                "x-opencode-session"
+            ),
+            Some("session-7")
+        );
+
+        // A header the user configured by hand is not overwritten.
+        let mut explicit =
+            ProviderConfig::new("custom-go", "Custom Go", ApiFormat::OpenAiChatCompletions);
+        explicit.base_url = "https://opencode.ai/inference/go/openai/v1".to_string();
+        explicit
+            .headers
+            .insert("x-opencode-session".to_string(), "pinned".to_string());
+        explicit
+            .headers
+            .insert("User-Agent".to_string(), "my-agent/2.0".to_string());
+        let resolved = ResolvedModel::new(explicit, None, None);
+        let headers = resolved.request_headers(Some("session-7"));
+        assert_eq!(header(&headers, "x-opencode-session"), Some("pinned"));
+        assert_eq!(header(&headers, "user-agent"), Some("my-agent/2.0"));
     }
 }
