@@ -190,7 +190,12 @@ jobs:
           Compress-Archive -Path "dist/EffiBuddy-$env:VERSION-windows-x86_64" -DestinationPath "EffiBuddy-$env:VERSION-windows-x86_64.zip"
 
       - name: 安装 NSIS
-        run: choco install nsis -y --no-progress
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          if ($LASTEXITCODE -notin 0, 3010) { exit $LASTEXITCODE }
+          # choco 的 shim 机制不覆盖 makensis，把安装目录显式加进 PATH。
+          Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\NSIS"
 
       # 占位符注入版本号（NSIS 的 $ 变量不能出现在 PowerShell 可展开的
       # 字符串里，所以这里用单引号 here-string + __VERSION__）。
