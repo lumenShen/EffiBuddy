@@ -257,6 +257,8 @@ pub struct X11WindowState {
     pub(crate) last_sync_counter: Option<sync::Int64>,
     bounds: Bounds<Pixels>,
     scale_factor: f32,
+    /// User zoom multiplier on top of `scale_factor`; see `effective_scale`.
+    ui_zoom: f32,
     renderer: BladeRenderer,
     display: Rc<dyn PlatformDisplay>,
     input_handler: Option<PlatformInputHandler>,
@@ -278,6 +280,12 @@ pub struct X11WindowState {
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
+    }
+
+    /// Scale the window's contents are painted with: the platform scale
+    /// (xft DPI) times the user zoom multiplier (see `set_ui_zoom`).
+    fn effective_scale(&self) -> f32 {
+        self.scale_factor * self.ui_zoom
     }
 }
 
@@ -673,6 +681,7 @@ impl X11WindowState {
                 x_root_window: visual_set.root,
                 bounds: bounds.to_pixels(scale_factor),
                 scale_factor,
+                ui_zoom: 1.0,
                 renderer,
                 atoms: *atoms,
                 input_handler: None,
@@ -839,8 +848,8 @@ impl X11Window {
             self.0.xcb.translate_coordinates(
                 self.0.x_window,
                 state.x_root_window,
-                (position.x.0 * state.scale_factor) as i16,
-                (position.y.0 * state.scale_factor) as i16,
+                (position.x.0 * state.effective_scale()) as i16,
+                (position.y.0 * state.effective_scale()) as i16,
             ),
         )
     }
@@ -1059,7 +1068,7 @@ impl X11WindowStatePtr {
 
     pub fn get_ime_area(&self) -> Option<Bounds<ScaledPixels>> {
         let mut state = self.state.borrow_mut();
-        let scale_factor = state.scale_factor;
+        let scale_factor = state.effective_scale();
         let mut bounds: Option<Bounds<Pixels>> = None;
         if let Some(mut input_handler) = state.input_handler.take() {
             drop(state);
@@ -1077,7 +1086,7 @@ impl X11WindowStatePtr {
         let is_resize;
         {
             let mut state = self.state.borrow_mut();
-            let bounds = bounds.map(|f| px(f as f32 / state.scale_factor));
+            let bounds = bounds.map(|f| px(f as f32 / state.effective_scale()));
 
             is_resize = bounds.size.width != state.bounds.size.width
                 || bounds.size.height != state.bounds.size.height;
@@ -1096,7 +1105,7 @@ impl X11WindowStatePtr {
                     DevicePixels(gpu_size.width as i32),
                     DevicePixels(gpu_size.height as i32),
                 ));
-                resize_args = Some((state.content_size(), state.scale_factor));
+                resize_args = Some((state.content_size(), state.effective_scale()));
             }
             if let Some(value) = state.last_sync_counter.take() {
                 check_reply(
@@ -1176,10 +1185,10 @@ impl PlatformWindow for X11Window {
             let [left, right, top, bottom] = state.last_insets;
 
             let [left, right, top, bottom] = [
-                Pixels((left as f32) / state.scale_factor),
-                Pixels((right as f32) / state.scale_factor),
-                Pixels((top as f32) / state.scale_factor),
-                Pixels((bottom as f32) / state.scale_factor),
+                Pixels((left as f32) / state.effective_scale()),
+                Pixels((right as f32) / state.effective_scale()),
+                Pixels((top as f32) / state.effective_scale()),
+                Pixels((bottom as f32) / state.effective_scale()),
             ];
 
             bounds.origin.x += left;
@@ -1197,12 +1206,12 @@ impl PlatformWindow for X11Window {
         let state = self.0.state.borrow();
         state
             .content_size()
-            .map(|size| size.div(state.scale_factor))
+            .map(|size| size.div(state.effective_scale()))
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.0.state.borrow();
-        let size = size.to_device_pixels(state.scale_factor);
+        let size = size.to_device_pixels(state.effective_scale());
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
 
@@ -1225,7 +1234,59 @@ impl PlatformWindow for X11Window {
     }
 
     fn scale_factor(&self) -> f32 {
-        self.0.state.borrow().scale_factor
+        self.0.state.borrow().effective_scale()
+    }
+
+    fn set_ui_zoom(&self, zoom: f32) {
+        let (logical_size, effective_scale, xcb, x_window) = {
+            let mut state = self.0.state.borrow_mut();
+            if state.ui_zoom == zoom {
+                return;
+            }
+            state.ui_zoom = zoom;
+            let effective_scale = state.effective_scale();
+            // The X window holds `logical * effective` device pixels; size the
+            // buffer right away so the frame painted after `Window::set_ui_zoom`
+            // returns already matches, instead of waiting for ConfigureNotify.
+            let device_size = state.bounds.size.to_device_pixels(effective_scale);
+            state.renderer.update_drawable_size(size(
+                DevicePixels(device_size.width.0 as i32),
+                DevicePixels(device_size.height.0 as i32),
+            ));
+            // Keep the client-level copy (XInput events, XIM spot position)
+            // in sync; X11 scaling is client-global, and the app opens a
+            // single window.
+            if let Some(client_state) = state.client.0.upgrade() {
+                client_state.borrow_mut().scale_factor = effective_scale;
+            }
+            (
+                state.bounds.size,
+                effective_scale,
+                self.0.xcb.clone(),
+                self.0.x_window,
+            )
+        };
+
+        // Resize the X window to `logical * effective` device pixels; the
+        // ConfigureNotify that comes back re-runs `set_bounds`, which is a
+        // no-op in logical terms.
+        let device_size = logical_size.to_device_pixels(effective_scale);
+        check_reply(
+            || {
+                format!(
+                    "X11 ConfigureWindow failed. width: {}, height: {}",
+                    device_size.width.0, device_size.height.0
+                )
+            },
+            xcb.configure_window(
+                x_window,
+                &xproto::ConfigureWindowAux::new()
+                    .width(device_size.width.0 as u32)
+                    .height(device_size.height.0 as u32),
+            ),
+        )
+        .log_err();
+        xcb_flush(&xcb);
     }
 
     fn appearance(&self) -> WindowAppearance {
@@ -1557,7 +1618,7 @@ impl PlatformWindow for X11Window {
     fn set_client_inset(&self, inset: Pixels) {
         let mut state = self.0.state.borrow_mut();
 
-        let dp = (inset.0 * state.scale_factor) as u32;
+        let dp = (inset.0 * state.effective_scale()) as u32;
 
         let insets = if state.fullscreen {
             [0, 0, 0, 0]

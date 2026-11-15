@@ -28,8 +28,9 @@ use gpui::{
 
 use crate::app::{
     AppView, CyclePermissionMode, FocusComposer, NewSession, OpenCommandPalette, StopRun,
-    ToggleGraph, ToggleSettings, ToggleSidebar, ToggleTheme,
+    ToggleGraph, ToggleSettings, ToggleSidebar, ToggleTheme, ZoomIn, ZoomOut, ZoomReset,
 };
+use crate::config::AppConfig;
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
 
 fn main() {
@@ -58,6 +59,12 @@ fn main() {
                 KeyBinding::new("ctrl-shift-g", ToggleGraph, Some("EffiBuddy")),
                 KeyBinding::new("shift-tab", CyclePermissionMode, Some("EffiBuddy")),
                 KeyBinding::new("escape", StopRun, Some("EffiBuddy")),
+                // Whole-app zoom; `=` and `+` cover both the unshifted and
+                // shifted keysym, layouts differ on where `+` lives.
+                KeyBinding::new("ctrl-=", ZoomIn, Some("EffiBuddy")),
+                KeyBinding::new("ctrl-+", ZoomIn, Some("EffiBuddy")),
+                KeyBinding::new("ctrl--", ZoomOut, Some("EffiBuddy")),
+                KeyBinding::new("ctrl-0", ZoomReset, Some("EffiBuddy")),
             ]);
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(840.0)), cx);
@@ -83,6 +90,12 @@ fn main() {
                 window.set_window_title("EffiBuddy");
                 window.set_app_id("effibuddy");
                 window.activate_window();
+                // Restore the persisted whole-app zoom before the first frame
+                // the user interacts with; 1.0 skips the extra re-layout.
+                let ui_zoom = AppConfig::load().ui_zoom;
+                if (ui_zoom - 1.0).abs() > 1e-4 {
+                    window.set_ui_zoom(ui_zoom);
+                }
                 if std::env::args().any(|argument| argument == "--preview-composer") {
                     view.seed_composer_preview(window, cx);
                 }

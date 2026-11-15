@@ -39,7 +39,7 @@ use crate::chat::{
 };
 use crate::checkpoint::{RestoreAction, RestorePlan};
 use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
-use crate::config::AppConfig;
+use crate::config::{AppConfig, MAX_UI_ZOOM, MIN_UI_ZOOM};
 use crate::events::{AppEvent, SubagentSpawnedInfo};
 use crate::graph::{GraphView, ViewMode, persist as graph_persist};
 use crate::model_config::ModelConfigStore;
@@ -116,7 +116,10 @@ actions!(
         StopRun,
         OpenCommandPalette,
         ToggleGraph,
-        CyclePermissionMode
+        CyclePermissionMode,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset
     ]
 );
 
@@ -4016,6 +4019,26 @@ impl AppView {
         cx.notify();
     }
 
+    /// Step the whole-app UI zoom (see `Window::set_ui_zoom`) by `delta`,
+    /// snapping to 0.1 so repeated shortcuts land on clean percentages.
+    pub(crate) fn zoom_by(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let next = ((self.config.ui_zoom + delta) * 10.0).round() / 10.0;
+        self.zoom_to(next, window, cx);
+    }
+
+    /// Set the whole-app UI zoom. Persisted app-wide so the shell reopens at
+    /// the zoom the user left it at.
+    pub(crate) fn zoom_to(&mut self, zoom: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let zoom = zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        if (zoom - self.config.ui_zoom).abs() < 1e-4 {
+            return;
+        }
+        self.config.ui_zoom = zoom;
+        window.set_ui_zoom(zoom);
+        let _ = self.config.save();
+        cx.notify();
+    }
+
     /// Hide the entire left sidebar (or restore it), leaving only the main
     /// column. Persisted app-wide so the shell reopens in the chosen layout.
     pub(crate) fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -7276,6 +7299,15 @@ impl Render for AppView {
             }))
             .on_action(cx.listener(|this, _: &CyclePermissionMode, _, cx| {
                 this.cycle_permission_mode(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomIn, window, cx| {
+                this.zoom_by(0.1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, window, cx| {
+                this.zoom_by(-0.1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, window, cx| {
+                this.zoom_to(1.0, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleGraph, _, cx| {
                 let next = if this.view_mode == ViewMode::Graph {

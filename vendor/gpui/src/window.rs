@@ -1851,6 +1851,19 @@ impl Window {
         self.scale_factor
     }
 
+    /// Set a UI zoom multiplier applied on top of the platform scale factor,
+    /// scaling the entire window's contents (layout measurement included) the
+    /// same way a browser zoom does. `1.0` restores the platform scale.
+    ///
+    /// Backends that control their own buffer scaling (Wayland) resize the
+    /// drawable accordingly; where the backend doesn't support it this is a
+    /// no-op. Persisting the value across launches is the caller's job.
+    pub fn set_ui_zoom(&mut self, zoom: f32) {
+        self.platform_window.set_ui_zoom(zoom);
+        self.scale_factor = self.platform_window.scale_factor();
+        self.refresh();
+    }
+
     /// The size of an em for the base font of the application. Adjusting this value allows the
     /// UI to scale, just like zooming a web page.
     pub fn rem_size(&self) -> Pixels {

@@ -99,6 +99,8 @@ pub struct WaylandWindowState {
     renderer: BladeRenderer,
     bounds: Bounds<Pixels>,
     scale: f32,
+    /// User zoom multiplier on top of `scale`; see `effective_scale`.
+    ui_zoom: f32,
     input_handler: Option<PlatformInputHandler>,
     decorations: WindowDecorations,
     background_appearance: WindowBackgroundAppearance,
@@ -186,6 +188,7 @@ impl WaylandWindowState {
             renderer,
             bounds: options.bounds,
             scale: 1.0,
+            ui_zoom: 1.0,
             input_handler: None,
             decorations: WindowDecorations::Client,
             background_appearance: WindowBackgroundAppearance::Opaque,
@@ -209,6 +212,12 @@ impl WaylandWindowState {
     pub fn is_transparent(&self) -> bool {
         self.decorations == WindowDecorations::Client
             || self.background_appearance != WindowBackgroundAppearance::Opaque
+    }
+
+    /// Scale the window's contents are painted with: the compositor scale
+    /// times the user zoom multiplier (see `set_ui_zoom`).
+    pub fn effective_scale(&self) -> f32 {
+        self.scale * self.ui_zoom
     }
 
     pub fn primary_output_scale(&mut self) -> i32 {
@@ -725,9 +734,9 @@ impl WaylandWindowStatePtr {
             if let Some(scale) = scale {
                 state.scale = scale;
             }
-            let device_bounds = state.bounds.to_device_pixels(state.scale);
+            let device_bounds = state.bounds.to_device_pixels(state.effective_scale());
             state.renderer.update_drawable_size(device_bounds.size);
-            (state.bounds.size, state.scale)
+            (state.bounds.size, state.effective_scale())
         };
 
         if let Some(ref mut fun) = self.callbacks.borrow_mut().resize {
@@ -748,6 +757,20 @@ impl WaylandWindowStatePtr {
 
     pub fn rescale(&self, scale: f32) {
         self.set_size_and_scale(None, Some(scale));
+    }
+
+    /// Set the user zoom multiplier (see `PlatformWindow::set_ui_zoom`). The
+    /// buffer is resized synchronously; `Window::set_ui_zoom` re-reads the
+    /// effective scale and refreshes right after, so no resize callback is
+    /// needed here.
+    pub fn set_ui_zoom(&self, zoom: f32) {
+        let mut state = self.state.borrow_mut();
+        if state.ui_zoom == zoom {
+            return;
+        }
+        state.ui_zoom = zoom;
+        let device_bounds = state.bounds.to_device_pixels(state.effective_scale());
+        state.renderer.update_drawable_size(device_bounds.size);
     }
 
     pub fn close(&self) {
@@ -886,7 +909,9 @@ impl PlatformWindow for WaylandWindow {
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.borrow();
         let state_ptr = self.0.clone();
-        let dp_size = size.to_device_pixels(self.scale_factor());
+        // `set_window_geometry` is surface-local (logical); the compositor
+        // scale is applied by it, the user zoom is not.
+        let dp_size = size.to_device_pixels(state.scale);
 
         state.xdg_surface.set_window_geometry(
             state.bounds.origin.x.0 as i32,
@@ -903,7 +928,12 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn scale_factor(&self) -> f32 {
-        self.borrow().scale
+        let state = self.borrow();
+        state.effective_scale()
+    }
+
+    fn set_ui_zoom(&self, zoom: f32) {
+        self.0.set_ui_zoom(zoom);
     }
 
     fn appearance(&self) -> WindowAppearance {

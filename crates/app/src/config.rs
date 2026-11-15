@@ -79,11 +79,24 @@ pub struct AppConfig {
     /// that version until a newer one is published.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_skip_version: Option<String>,
+    /// Whole-app UI zoom multiplier (1.0 = platform scale), driven by the
+    /// ctrl-= / ctrl-- / ctrl-0 shortcuts; see `Window::set_ui_zoom`.
+    #[serde(default = "default_ui_zoom")]
+    pub ui_zoom: f32,
 }
 
 fn default_true() -> bool {
     true
 }
+
+fn default_ui_zoom() -> f32 {
+    1.0
+}
+
+/// Bounds for the whole-app UI zoom, shared by `load()` and the ctrl-= /
+/// ctrl-- shortcuts.
+pub(crate) const MIN_UI_ZOOM: f32 = 0.6;
+pub(crate) const MAX_UI_ZOOM: f32 = 2.0;
 
 fn default_side_bar_open() -> bool {
     true
@@ -137,6 +150,7 @@ impl Default for AppConfig {
             projects: Vec::new(),
             update_check_enabled: true,
             update_skip_version: None,
+            ui_zoom: default_ui_zoom(),
         }
     }
 }
@@ -169,6 +183,7 @@ impl AppConfig {
             config.model = default_model();
         }
         config.side_bar_width = config.side_bar_width.clamp(260.0, 620.0);
+        config.ui_zoom = config.ui_zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
         config
     }
 

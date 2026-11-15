@@ -464,6 +464,13 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn content_size(&self) -> Size<Pixels>;
     fn resize(&mut self, size: Size<Pixels>);
     fn scale_factor(&self) -> f32;
+    /// Set a UI zoom multiplier applied on top of the platform scale factor,
+    /// scaling every painted primitive (quads, glyphs, shadows, images) the
+    /// same way a browser zoom does. `1.0` restores the platform scale.
+    /// Backends that control their own buffer scaling implement this and resize
+    /// their buffers to `logical_size * scale_factor() * zoom`; the default is
+    /// a no-op, so zooming silently does nothing where unsupported.
+    fn set_ui_zoom(&self, _zoom: f32) {}
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
