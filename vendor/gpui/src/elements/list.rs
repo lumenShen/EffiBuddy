@@ -368,7 +368,13 @@ impl ListState {
 
         let start_pixel_offset = cursor.start().height + current_offset.offset_in_item;
         let new_pixel_offset = (start_pixel_offset + distance).max(px(0.));
-        if new_pixel_offset > start_pixel_offset {
+        // `offset_in_item` can be negative when a caller intentionally leaves
+        // breathing room above an item. The cursor after seeking to `item_ix`
+        // sits at the item's top, which is past that logical start, so whether
+        // to seek forward must be decided against the cursor position rather
+        // than the logical start. A forward seek to an earlier position would
+        // trip sum_tree's "cannot seek backward" assert.
+        if new_pixel_offset >= cursor.start().height {
             cursor.seek_forward(&Height(new_pixel_offset), Bias::Right);
         } else {
             cursor.seek(&Height(new_pixel_offset), Bias::Right);
@@ -1322,6 +1328,52 @@ mod test {
         state.scroll_by(px(0.));
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
+        assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_scroll_by_from_negative_offset(cx: &mut TestAppContext) {
+        use crate::{
+            AppContext, Context, Element, IntoElement, ListOffset, ListState, Render, Styled,
+            Window, div, list, point, px, size,
+        };
+
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestView(state.clone()))
+        });
+
+        // Leave breathing room above item 2, as the prompt rail jump does.
+        state.scroll_to(ListOffset {
+            item_ix: 2,
+            offset_in_item: px(-16.),
+        });
+
+        // A small positive glide step lands before the cursor's anchor item.
+        // This used to panic with "cannot seek backward".
+        state.scroll_by(px(8.));
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 1);
+        assert_eq!(offset.offset_in_item, px(12.));
+
+        // Once past the anchor, the regular forward path resumes.
+        state.scroll_by(px(8.));
+        let offset = state.logical_scroll_top();
+        assert_eq!(offset.item_ix, 2);
         assert_eq!(offset.offset_in_item, px(0.));
     }
 }

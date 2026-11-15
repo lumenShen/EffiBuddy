@@ -27,9 +27,9 @@ use effibuddy_ui::{
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Div,
     Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, actions, anchored, div, img, linear_color_stop, linear_gradient,
-    list, point, prelude::*, px, size, svg, transparent_black,
+    Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowControlArea,
+    WindowHandle, WindowKind, WindowOptions, actions, anchored, div, img, linear_color_stop,
+    linear_gradient, list, point, prelude::*, px, size, svg, transparent_black,
 };
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -5174,35 +5174,6 @@ impl AppView {
             .unwrap_or_else(|| self.config.workspace())
     }
 
-    /// Label and tooltip for the sidebar footer: the active project's name and
-    /// primary folder, else the configured workspace.
-    fn sidebar_workspace_label(&self) -> (String, String) {
-        if let Some(active) = &self.active {
-            let (project_id, legacy) = {
-                let session = lock_session(&active.shared);
-                (session.project_id.clone(), session.project.clone())
-            };
-            if let Some(project) = self
-                .projects
-                .project_for_session(project_id.as_deref(), legacy.as_deref())
-            {
-                let path = project
-                    .primary()
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_default();
-                return (project.name.clone(), path);
-            }
-        }
-        let workspace = self.config.workspace();
-        let label = workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| workspace.display().to_string());
-        (label, workspace.display().to_string())
-    }
-
     /// Create a conversation. `project_id = None` without an override goes to
     /// the sidebar's 任务 section and runs in the configured workspace.
     /// `project_id = Some(id)` opens it in that project's primary folder;
@@ -6864,16 +6835,18 @@ impl AppView {
                             }),
                     ),
             )
-            .child(div().flex_1().h_full().on_mouse_down(
-                MouseButton::Left,
-                move |event, window, _| {
-                    if event.click_count == 2 {
-                        window.titlebar_double_click();
-                    } else {
-                        window.start_window_move();
-                    }
-                },
-            ))
+            // Drag region. `start_window_move()` is a no-op on Windows (it is
+            // implemented only for Wayland/X11), which is why dragging here did
+            // nothing and the hand-rolled double-click test never matched.
+            // `window_control_area(Drag)` is the portable path: GPUI records a
+            // hit-test hitbox and Windows answers WM_NCHITTEST with HTCAPTION,
+            // so the OS handles both dragging and double-click-to-maximize.
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
             .when(self.sidebar_p < 0.999, |element| {
                 element.child(
                     div()
@@ -7831,7 +7804,6 @@ impl AppView {
         let scroll_entity = cx.entity().downgrade();
         let active_id = self.active_id();
         let running = self.active_run.is_some();
-        let (workspace_label, workspace_path) = self.sidebar_workspace_label();
         // Partition once; groups are keyed by project id (legacy session paths
         // resolve through the project roots). Projects appear in order of their
         // most recent conversation; registered projects without sessions stay
@@ -8186,30 +8158,6 @@ impl AppView {
                     .py_3()
                     .flex()
                     .flex_col()
-                    .child(
-                        div()
-                            .id("sidebar-workspace")
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .h(px(26.0))
-                            .text_size(px(11.5))
-                            .text_color(theme.text_muted)
-                            .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
-                            .child(
-                                svg()
-                                    .path(icons::FOLDER)
-                                    .size(px(13.0))
-                                    .text_color(theme.text_faint),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .child(workspace_label),
-                            ),
-                    )
                     .child(
                         div()
                             .flex()

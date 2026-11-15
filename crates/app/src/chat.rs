@@ -1667,6 +1667,9 @@ struct StreamReveal {
     active: bool,
     reasoning_started: Option<Instant>,
     reasoning_elapsed: Option<Duration>,
+    /// Timestamp of the previous `advance`, used to derive the real frame
+    /// delta so the reveal speed does not depend on the refresh rate.
+    last_advance: Option<Instant>,
 }
 
 impl StreamReveal {
@@ -1679,6 +1682,9 @@ impl StreamReveal {
             active: true,
             ..Self::default()
         };
+        // A fresh stream must not inherit the previous stream's timestamp, or
+        // the first dt would span the whole idle gap between sessions.
+        self.last_advance = None;
     }
 
     fn push_text(&mut self, message_id: &str, delta: &str) {
@@ -1706,6 +1712,7 @@ impl StreamReveal {
         self.shown_text = self.text.borrow().len();
         *self.reasoning.borrow_mut() = reasoning;
         self.shown_reasoning = self.reasoning.borrow().len();
+        self.last_advance = None;
         if self.reasoning_started.is_some() && self.reasoning_elapsed.is_none() {
             self.reasoning_elapsed = self.reasoning_started.map(|start| start.elapsed());
         }
@@ -1721,20 +1728,36 @@ impl StreamReveal {
     }
 
     fn advance(&mut self) -> bool {
+        let now = Instant::now();
+        // Frame-rate independence: the previous version advanced a fixed
+        // 4 + backlog/10 bytes per frame, so the visible speed was tied to the
+        // display refresh rate (120 Hz drained twice as fast as 60 Hz) and a
+        // stalled frame produced a visible stutter. Speed now derives from the
+        // real elapsed time since the last tick.
+        let dt = match self.last_advance {
+            Some(last) => now.duration_since(last).as_secs_f32().clamp(0.0, 0.1),
+            None => 1.0 / 60.0,
+        };
+        self.last_advance = Some(now);
+
         {
             let text = self.text.borrow_mut();
-            let text_backlog = text.len().saturating_sub(self.shown_text);
-            if text_backlog > 0 {
-                let step = (4 + text_backlog / 10).min(160);
-                self.shown_text = advance_chars(&text, self.shown_text, step);
+            let backlog = text.len().saturating_sub(self.shown_text);
+            if backlog > 0 {
+                let step = reveal_step(backlog, dt, TEXT_REVEAL_BASE, TEXT_REVEAL_TAU);
+                if step > 0 {
+                    self.shown_text = advance_chars(&text, self.shown_text, step);
+                }
             }
         }
         {
             let reasoning = self.reasoning.borrow_mut();
-            let reasoning_backlog = reasoning.len().saturating_sub(self.shown_reasoning);
-            if reasoning_backlog > 0 {
-                let step = (3 + reasoning_backlog / 12).min(140);
-                self.shown_reasoning = advance_chars(&reasoning, self.shown_reasoning, step);
+            let backlog = reasoning.len().saturating_sub(self.shown_reasoning);
+            if backlog > 0 {
+                let step = reveal_step(backlog, dt, REASONING_REVEAL_BASE, REASONING_REVEAL_TAU);
+                if step > 0 {
+                    self.shown_reasoning = advance_chars(&reasoning, self.shown_reasoning, step);
+                }
             }
         }
         self.text.borrow().len() > self.shown_text
@@ -1770,6 +1793,34 @@ fn stream_chunk_table(stream: &StreamSnapshot) -> Vec<TextChunk> {
             key: markdown_source_key(&revealed[range]),
         })
         .collect()
+}
+
+/// Characters revealed per second when the backlog is small. The rate rises
+/// with the backlog so a large burst (a tool result dumping thousands of bytes
+/// in one delta) still catches up instead of typing forever.
+const TEXT_REVEAL_BASE: f32 = 900.0;
+const REASONING_REVEAL_BASE: f32 = 600.0;
+/// Backlog (bytes) at which the reveal rate roughly doubles.
+const TEXT_REVEAL_TAU: f32 = 2200.0;
+const REASONING_REVEAL_TAU: f32 = 2600.0;
+/// Hard ceiling per frame so a huge backlog cannot dump the whole buffer in a
+/// single repaint (which looks like an instant paste, not typing).
+const REVEAL_STEP_CAP: usize = 640;
+
+/// How many characters to reveal this frame.
+///
+/// `backlog` is the remaining byte count, `dt` the real seconds since the last
+/// tick. The rate scales with the backlog (so it accelerates to catch up) and
+/// is multiplied by `dt` (so the animation runs at the same speed regardless
+/// of the display refresh rate). Always returns at least 1 while work remains,
+/// otherwise a slow frame could round down to zero and stall the reveal.
+fn reveal_step(backlog: usize, dt: f32, base: f32, tau: f32) -> usize {
+    if backlog == 0 {
+        return 0;
+    }
+    let scale = 1.0 + (backlog as f32) / tau;
+    let chars = (base * scale * dt) as usize;
+    chars.clamp(1, REVEAL_STEP_CAP)
 }
 
 /// Advance `from` by `count` characters, always landing on a UTF-8 boundary.

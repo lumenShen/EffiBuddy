@@ -708,32 +708,30 @@ impl TextInputState {
         }
     }
 
-    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_submit(window, cx);
+    fn submit(&mut self, _: &Submit, cx: &mut Context<Self>) -> Option<SubmitRequest> {
+        self.finish_submit(self.on_submit.clone(), cx)
     }
 
     fn submit_alternate(
         &mut self,
         _: &SubmitAlternate,
-        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        self.finish_submit_with(self.on_submit_alternate.clone(), window, cx);
+    ) -> Option<SubmitRequest> {
+        self.finish_submit(self.on_submit_alternate.clone(), cx)
     }
 
-    fn finish_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_submit_with(self.on_submit.clone(), window, cx);
-    }
-
-    fn finish_submit_with(
+    /// Take the submitted text and handler out of the state without invoking
+    /// the handler. The caller dispatches the request after the update that
+    /// leased this entity has finished, because hosts routinely react to a
+    /// submit by updating this same input (the palette clears its query, the
+    /// composer restores a rejected edit), and a nested `update` panics with
+    /// "cannot update ... while it is already being updated".
+    fn finish_submit(
         &mut self,
         handler: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
-        window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let Some(handler) = handler else {
-            return;
-        };
+    ) -> Option<SubmitRequest> {
+        let handler = handler?;
         let text = std::mem::take(&mut self.content);
         self.selected_range = 0..0;
         self.selection_reversed = false;
@@ -742,14 +740,20 @@ impl TextInputState {
         self.scroll_top = px(0.0);
         self.pending_scroll_to_caret = false;
         cx.notify();
-        handler(text, window, cx);
+        Some(SubmitRequest { text, handler })
     }
 
-    fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
+    fn insert_newline(
+        &mut self,
+        _: &InsertNewline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<SubmitRequest> {
         if self.multiline {
             self.replace_text_in_range(None, "\n", window, cx);
+            None
         } else {
-            self.finish_submit(window, cx);
+            self.finish_submit(self.on_submit.clone(), cx)
         }
     }
 
@@ -1253,6 +1257,21 @@ fn line_starts(lines: &[gpui::WrappedLine]) -> Vec<usize> {
     starts
 }
 
+/// A submit captured while [`TextInputState`] is leased.
+///
+/// `dispatch` must run only after the update that produced the request has
+/// ended; see [`TextInputState::finish_submit`].
+struct SubmitRequest {
+    text: String,
+    handler: Rc<dyn Fn(String, &mut Window, &mut App)>,
+}
+
+impl SubmitRequest {
+    fn dispatch(self, window: &mut Window, cx: &mut App) {
+        (self.handler)(self.text, window, cx);
+    }
+}
+
 pub struct TextInputView {
     state: Entity<TextInputState>,
     on_submit: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
@@ -1436,9 +1455,40 @@ fn bind_actions(
     element = bind!(element, Paste, paste);
     element = bind!(element, Cut, cut);
     element = bind!(element, Copy, copy);
-    element = bind!(element, Submit, submit);
-    element = bind!(element, SubmitAlternate, submit_alternate);
-    element = bind!(element, InsertNewline, insert_newline);
+
+    // Submits are different: the host handler may update this same entity
+    // (clearing the palette query, restoring a rejected composer edit), so it
+    // must run after the state lease is released. Invoking it inside
+    // `state.update` would panic with "cannot update ... while it is already
+    // being updated".
+    macro_rules! bind_submit {
+        ($action:ty, $method:ident) => {{
+            let state = state.clone();
+            element =
+                element.on_action(move |action: &$action, window: &mut Window, cx: &mut App| {
+                    let request = state.update(cx, |input, cx| input.$method(action, cx));
+                    if let Some(request) = request {
+                        request.dispatch(window, cx);
+                    }
+                });
+        }};
+    }
+
+    bind_submit!(Submit, submit);
+    bind_submit!(SubmitAlternate, submit_alternate);
+
+    // A single-line input treats Shift+Enter as submit (multiline inserts a
+    // newline), so this action can produce a request too.
+    let state_newline = state.clone();
+    element = element.on_action(
+        move |action: &InsertNewline, window: &mut Window, cx: &mut App| {
+            let request =
+                state_newline.update(cx, |input, cx| input.insert_newline(action, window, cx));
+            if let Some(request) = request {
+                request.dispatch(window, cx);
+            }
+        },
+    );
     element
 }
 
