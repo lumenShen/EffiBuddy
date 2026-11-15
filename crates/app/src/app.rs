@@ -4631,8 +4631,21 @@ impl AppView {
         action: impl Fn(&mut Window) + 'static,
     ) -> AnyElement {
         let theme = self.theme.clone();
+        let hover_theme = theme.clone();
+        let group = SharedString::from(format!("window-button-group-{icon}"));
+        // Icons rest at text_muted like the other titlebar buttons; the danger
+        // button only flips to on_accent on hover, on top of the danger hover
+        // bg. (SVGs don't inherit text color, hence group_hover on the icon.)
+        let mut icon_element = svg().path(icon).size(px(12.0)).text_color(theme.text_muted);
+        if danger {
+            let hover_icon_theme = theme.clone();
+            icon_element = icon_element.group_hover(group.clone(), move |style| {
+                style.text_color(hover_icon_theme.on_accent)
+            });
+        }
         div()
             .id(SharedString::from(format!("window-button-{icon}")))
+            .group(group)
             .flex()
             .items_center()
             .justify_center()
@@ -4642,18 +4655,14 @@ impl AppView {
             .cursor_pointer()
             .hover(move |style| {
                 if danger {
-                    style.bg(theme.danger)
+                    style.bg(hover_theme.danger_hover)
                 } else {
-                    style.bg(theme.hover)
+                    style.bg(hover_theme.hover)
                 }
             })
             .tooltip(effibuddy_ui::tooltip(&self.theme, label))
             .on_click(move |_, window, _| action(window))
-            .child(svg().path(icon).size(px(12.0)).text_color(if danger {
-                theme.on_accent
-            } else {
-                theme.text_muted
-            }))
+            .child(icon_element)
             .into_any_element()
     }
 
