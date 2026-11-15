@@ -1948,10 +1948,7 @@ mod tests {
         session.push_message(Message::user("inspect everything"));
         for index in 0..40 {
             let mut assistant = Message::assistant();
-            let call = ToolCall::new(
-                "read_file",
-                json!({"path": format!("src/{index}.rs")}),
-            );
+            let call = ToolCall::new("read_file", json!({"path": format!("src/{index}.rs")}));
             assistant.push_tool_call(call.clone());
             session.push_message(assistant);
             session.push_message(Message::from_tool_result(ToolResult::success(&call, body)));

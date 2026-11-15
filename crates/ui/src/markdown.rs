@@ -23,17 +23,111 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, ClipboardItem, FontStyle, FontWeight, HighlightStyle, IntoElement, SharedString,
-    StrikethroughStyle, StyledText, UnderlineStyle, div, prelude::*, px, svg,
+    AnyElement, ClipboardItem, ElementId, FontStyle, FontWeight, HighlightStyle, IntoElement,
+    MouseButton, ObjectFit, SharedString, StrikethroughStyle, StyledText, UnderlineStyle, Window,
+    div, img, prelude::*, px, svg,
 };
 use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::assets::icons;
 use crate::table::{TableCollector, TableData, render_table};
 use crate::theme::{Theme, radius, text as text_size};
+
+/// What a clickable run of markdown points at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkdownTarget {
+    /// An external URL (web, mail, or another app scheme).
+    Url(SharedString),
+    /// A file-system path exactly as it appeared in the source. Relative paths
+    /// are resolved against [`MarkdownInteraction::base_dir`] on click so the
+    /// cached IR never bakes in a workspace.
+    File(SharedString),
+}
+
+/// Click hooks for rendered markdown. The app owns the menu that opens; the
+/// renderer only reports *what* was clicked and *where*.
+#[derive(Clone)]
+pub struct MarkdownInteraction {
+    base_dir: PathBuf,
+    activate: Rc<
+        dyn Fn(
+            MarkdownTarget,
+            MouseButton,
+            gpui::Point<gpui::Pixels>,
+            &Path,
+            &mut Window,
+            &mut gpui::App,
+        ),
+    >,
+}
+
+impl MarkdownInteraction {
+    pub fn new(
+        base_dir: impl Into<PathBuf>,
+        activate: impl Fn(
+            MarkdownTarget,
+            MouseButton,
+            gpui::Point<gpui::Pixels>,
+            &Path,
+            &mut Window,
+            &mut gpui::App,
+        ) + 'static,
+    ) -> Self {
+        Self {
+            base_dir: base_dir.into(),
+            activate: Rc::new(activate),
+        }
+    }
+
+    pub fn base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
+    fn activate(
+        &self,
+        target: MarkdownTarget,
+        button: MouseButton,
+        position: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        (self.activate)(target, button, position, &self.base_dir, window, cx);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LinkTargetIr {
+    Url(SharedString),
+    File(SharedString),
+}
+
+/// A clickable byte range inside one inline buffer. Ranges are relative to the
+/// text of the [`TextIr`]/[`ItemIr`] that owns them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LinkIr {
+    range: Range<usize>,
+    target: LinkTargetIr,
+}
+
+impl LinkIr {
+    fn markdown_target(&self) -> MarkdownTarget {
+        match &self.target {
+            LinkTargetIr::Url(url) => MarkdownTarget::Url(url.clone()),
+            LinkTargetIr::File(path) => MarkdownTarget::File(path.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ImageIr {
+    alt: SharedString,
+    src: SharedString,
+}
+
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InlineKind {
@@ -47,6 +141,7 @@ enum InlineKind {
 pub(crate) struct TextIr {
     text: SharedString,
     highlights: Rc<[(Range<usize>, HighlightStyle)]>,
+    links: Rc<[LinkIr]>,
     size: f32,
     weight: FontWeight,
     /// Headings keep the small top padding the renderer has always applied.
@@ -61,6 +156,7 @@ pub(crate) struct ItemIr {
     indent: usize,
     text: SharedString,
     highlights: Rc<[(Range<usize>, HighlightStyle)]>,
+    links: Rc<[LinkIr]>,
 }
 
 /// One parsed block, independent of the theme and of GPUI elements so it can
@@ -79,6 +175,9 @@ pub(crate) enum BlockIr {
         code: SharedString,
         code_hash: u64,
     },
+    /// A `![alt](src)` image. Rendering resolves `src` against the interaction
+    /// base directory; remote sources are loaded by the GPUI asset loader.
+    Image(ImageIr),
     Table(TableData),
     Rule,
 }
@@ -89,6 +188,10 @@ type Blocks = Rc<[Rc<BlockIr>]>;
 struct InlineBuffer {
     text: String,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
+    links: Vec<LinkIr>,
+    /// Ranges whose text must not be re-scanned for bare paths: explicit
+    /// Markdown links and inline code already decided what is clickable.
+    protected: Vec<Range<usize>>,
 }
 
 impl InlineBuffer {
@@ -110,8 +213,340 @@ impl InlineBuffer {
     fn clear(&mut self) {
         self.text.clear();
         self.highlights.clear();
+        self.links.clear();
+        self.protected.clear();
+    }
+
+    fn add_link(&mut self, range: Range<usize>, target: LinkTargetIr, protect: bool) {
+        if range.start >= range.end || range.end > self.text.len() {
+            return;
+        }
+        if self
+            .links
+            .iter()
+            .any(|link| overlaps(&link.range, &range))
+        {
+            return;
+        }
+        if protect {
+            self.protected.push(range.clone());
+        }
+        self.links.push(LinkIr { range, target });
+    }
+
+    /// Resolve clickable targets for the finished buffer: inline code paths
+    /// were added as they were emitted, explicit links on their end tag, and
+    /// this pass adds bare paths/URLs in plain prose.
+    fn finish_targets(&mut self) {
+        if self.text.is_empty() {
+            return;
+        }
+        for (range, target) in detect_plain_targets(&self.text) {
+            if self.protected.iter().any(|protected| overlaps(protected, &range))
+                || self.links.iter().any(|link| overlaps(&link.range, &range))
+            {
+                continue;
+            }
+            self.links.push(LinkIr { range, target });
+        }
+        self.links.sort_by_key(|link| link.range.start);
     }
 }
+
+fn overlaps(left: &Range<usize>, right: &Range<usize>) -> bool {
+    left.start < right.end && right.start < left.end
+}
+
+/// Extensions that make a bare token look like a file in prose. The list is
+/// deliberately code/document/image-heavy: it keeps `example.com`, versions
+/// (`v1.2.3`) and abbreviations (`e.g.`) from turning into links.
+const KNOWN_EXTENSIONS: &[&str] = &[
+    "rs", "md", "markdown", "mdx", "toml", "json", "jsonc", "json5", "yaml", "yml", "txt", "text",
+    "log", "csv", "tsv", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "py", "pyi", "pyx",
+    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "svelte", "astro", "css",
+    "scss", "sass", "less", "styl", "html", "htm", "xhtml", "xml", "xsl", "xslt", "svg", "png",
+    "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "tif", "tiff", "heic", "psd", "pdf",
+    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "zip", "tar", "gz",
+    "tgz", "bz2", "xz", "zst", "7z", "rar", "jar", "war", "lock", "cfg", "ini", "conf", "config",
+    "env", "properties", "plist", "desktop", "service", "c", "h", "cc", "cpp", "cxx", "hpp",
+    "hh", "hxx", "m", "mm", "swift", "kt", "kts", "java", "class", "go", "rb", "php", "pl", "pm",
+    "lua", "r", "rmd", "sql", "db", "sqlite", "sqlite3", "proto", "graphql", "gql", "dart", "ex",
+    "exs", "erl", "hrl", "hs", "lhs", "clj", "cljs", "cljc", "scala", "sc", "cs", "fs", "fsx",
+    "vb", "asm", "s", "wat", "wasm", "ipynb", "tex", "bib", "org", "adoc", "rst", "diff", "patch",
+    "puml", "plantuml", "drawio",
+];
+
+/// Extension-less files people reference by name.
+const KNOWN_FILE_NAMES: &[&str] = &[
+    "Dockerfile",
+    "Containerfile",
+    "Makefile",
+    "GNUmakefile",
+    "CMakeLists.txt",
+    "LICENSE",
+    "LICENCE",
+    "README",
+    "CHANGELOG",
+    "CHANGES",
+    "NOTICE",
+    "AUTHORS",
+    "Gemfile",
+    "Rakefile",
+    "Justfile",
+    "Procfile",
+    ".gitignore",
+    ".dockerignore",
+    ".npmignore",
+    ".editorconfig",
+    ".gitattributes",
+    ".npmrc",
+    ".prettierrc",
+    ".eslintrc",
+    ".babelrc",
+    ".bashrc",
+    ".zshrc",
+    ".profile",
+    ".env",
+    ".python-version",
+    ".tool-versions",
+    ".nvmrc",
+];
+
+fn is_token_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '/' | '\\' | '.' | '_' | '-' | '~' | '@' | '+' | '=' | '%' | '#' | '?' | '&' | ':'
+        )
+}
+
+fn is_path_char(ch: char) -> bool {
+    // Inline code spans are explicitly delimited, so non-ASCII file names
+    // (`docs/设计.md`) are safe here. Anything that would be prose punctuation
+    // or shell syntax still disqualifies the span.
+    !ch.is_whitespace()
+        && !ch.is_control()
+        && !matches!(
+            ch,
+            '"' | '\''
+                | '<'
+                | '>'
+                | '|'
+                | '?'
+                | '*'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | '`'
+        )
+}
+
+/// Bare paths and URLs in plain prose. Conservative on purpose: plain text has
+/// to carry an explicit relative prefix or a known extension, while inline
+/// code is allowed to hold extension-less paths such as `crates/agent-core`.
+fn detect_plain_targets(text: &str) -> Vec<(Range<usize>, LinkTargetIr)> {
+    let mut out = Vec::new();
+    let mut start = None;
+    for (index, ch) in text.char_indices() {
+        if is_token_char(ch) {
+            if start.is_none() {
+                start = Some(index);
+            }
+        } else if let Some(token_start) = start.take() {
+            push_plain_candidate(text, token_start, index, &mut out);
+        }
+    }
+    if let Some(token_start) = start {
+        push_plain_candidate(text, token_start, text.len(), &mut out);
+    }
+    out
+}
+
+fn push_plain_candidate(
+    text: &str,
+    start: usize,
+    end: usize,
+    out: &mut Vec<(Range<usize>, LinkTargetIr)>,
+) {
+    let (start, end) = trim_token_bounds(text, start, end);
+    if start >= end {
+        return;
+    }
+    let token = &text[start..end];
+    let range = start..end;
+    if is_http_url(token) {
+        out.push((range, LinkTargetIr::Url(token.to_string().into())));
+        return;
+    }
+    if looks_like_plain_path(token) {
+        out.push((range, LinkTargetIr::File(token.to_string().into())));
+    }
+}
+
+fn trim_token_bounds(text: &str, mut start: usize, mut end: usize) -> (usize, usize) {
+    while end > start {
+        let ch = text[..end].chars().next_back().unwrap_or_default();
+        if matches!(ch, '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"') {
+            // A trailing slash or a path prefix alone is not a usable token
+            // once its tail is punctuation.
+            end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    while start < end {
+        let ch = text[start..].chars().next().unwrap_or_default();
+        if matches!(ch, '\'' | '"' | '(' | '[' | '{') {
+            start += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (start, end)
+}
+
+fn is_http_url(token: &str) -> bool {
+    token.starts_with("http://") || token.starts_with("https://")
+}
+
+fn strip_line_suffix(token: &str) -> &str {
+    if let Some(index) = token.rfind(':') {
+        let suffix = &token[index + 1..];
+        if !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit()) {
+            let head = &token[..index];
+            if let Some(second) = head.rfind(':') {
+                let line = &head[second + 1..];
+                if !line.is_empty() && line.chars().all(|ch| ch.is_ascii_digit()) {
+                    return &head[..second];
+                }
+            }
+            return head;
+        }
+    }
+    token
+}
+
+fn file_name_part(token: &str) -> &str {
+    token
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(token)
+}
+
+fn has_known_extension(token: &str) -> bool {
+    let name = file_name_part(token);
+    let Some((stem, extension)) = name.rsplit_once('.') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !extension.is_empty()
+        && extension.len() <= 12
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && KNOWN_EXTENSIONS
+            .iter()
+            .any(|known| extension.eq_ignore_ascii_case(known))
+}
+
+fn is_known_file_name(token: &str) -> bool {
+    let name = file_name_part(token);
+    KNOWN_FILE_NAMES
+        .iter()
+        .any(|known| name.eq_ignore_ascii_case(known))
+}
+
+fn has_path_separator(token: &str) -> bool {
+    token.contains('/') || token.contains('\\')
+}
+
+fn is_windows_absolute(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+}
+
+fn looks_like_plain_path(token: &str) -> bool {
+    if token.len() > 260 || token.starts_with('-') {
+        return false;
+    }
+    if token.contains("://") || token.starts_with("www.") {
+        return false;
+    }
+    let token = token.strip_prefix('@').unwrap_or(token);
+    let token = strip_line_suffix(token);
+    if token.is_empty() || token.contains('@') || token.contains(' ') {
+        return false;
+    }
+    if is_known_file_name(token) || has_known_extension(token) {
+        return true;
+    }
+    // Extension-less paths are only auto-linked when the writer made the path
+    // explicit; `and/or` must not become a link.
+    token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || token.starts_with('/')
+        || is_windows_absolute(token)
+}
+
+fn looks_like_code_path(content: &str) -> bool {
+    let token = content.trim();
+    if token.is_empty() || token.len() > 260 {
+        return false;
+    }
+    if token.chars().any(|ch| !is_path_char(ch)) {
+        return false;
+    }
+    if token.contains("://") || token.starts_with('-') || token.starts_with("www.") {
+        return false;
+    }
+    let token = token.strip_prefix('@').unwrap_or(token);
+    let token = strip_line_suffix(token);
+    if token.is_empty() || token.contains('@') {
+        return false;
+    }
+    is_known_file_name(token) || has_known_extension(token) || has_path_separator(token)
+}
+
+/// Classify a Markdown link destination. Anything that is not an external URL
+/// is treated as a file reference; the click resolver decides whether it
+/// exists and whether it is a directory.
+fn link_target(dest: &str) -> Option<LinkTargetIr> {
+    let dest = dest.trim();
+    if dest.is_empty() || dest.starts_with('#') {
+        return None;
+    }
+    let lower = dest.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+    {
+        return Some(LinkTargetIr::Url(dest.to_string().into()));
+    }
+    if let Some(path) = dest.strip_prefix("file://") {
+        return Some(LinkTargetIr::File(path.to_string().into()));
+    }
+    // Unknown schemes (`vscode://`, `zotero://`, …) still belong to the
+    // browser/app branch; Windows drive letters are not schemes.
+    if let Some(scheme_end) = dest.find(':') {
+        let scheme = &dest[..scheme_end];
+        if scheme.len() > 1
+            && scheme
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+        {
+            return Some(LinkTargetIr::Url(dest.to_string().into()));
+        }
+    }
+    Some(LinkTargetIr::File(dest.to_string().into()))
+}
+
+
 
 /// Merges the currently open inline kinds into one [`HighlightStyle`].
 fn combined_highlight(kinds: &[InlineKind], theme: &Theme) -> Option<HighlightStyle> {
@@ -157,6 +592,10 @@ struct IrBuilder {
     blocks: Vec<Rc<BlockIr>>,
     inline: InlineBuffer,
     inline_kinds: Vec<InlineKind>,
+    /// Byte offset in `inline.text` where each open Markdown link started.
+    link_starts: Vec<usize>,
+    /// Destination of each open Markdown link, aligned with `link_starts`.
+    link_dests: Vec<String>,
     lists: Vec<ListIrState>,
     item_marker: Option<String>,
     item_indent: usize,
@@ -165,6 +604,11 @@ struct IrBuilder {
     heading_level: Option<u8>,
     in_table: bool,
     table: Option<TableCollector>,
+    /// Inside an image tag: alt text is collected here instead of leaking into
+    /// the surrounding paragraph.
+    in_image: bool,
+    pending_image: Option<ImageIr>,
+    image_alt: String,
 }
 
 impl IrBuilder {
@@ -174,6 +618,8 @@ impl IrBuilder {
             blocks: Vec::new(),
             inline: InlineBuffer::default(),
             inline_kinds: Vec::new(),
+            link_starts: Vec::new(),
+            link_dests: Vec::new(),
             lists: Vec::new(),
             item_marker: None,
             item_indent: 0,
@@ -182,10 +628,33 @@ impl IrBuilder {
             heading_level: None,
             in_table: false,
             table: None,
+            in_image: false,
+            pending_image: None,
+            image_alt: String::new(),
         }
     }
 
     fn handle_event(&mut self, event: Event<'_>) {
+        if self.in_image {
+            match event {
+                Event::Text(text) => self.image_alt.push_str(&text),
+                Event::Code(text) => self.image_alt.push_str(&text),
+                Event::SoftBreak | Event::HardBreak => self.image_alt.push(' '),
+                Event::End(TagEnd::Image) => {
+                    if let Some(mut image) = self.pending_image.take() {
+                        let alt = self.image_alt.trim();
+                        if !alt.is_empty() {
+                            image.alt = alt.to_string().into();
+                        }
+                        self.blocks.push(Rc::new(BlockIr::Image(image)));
+                    }
+                    self.image_alt.clear();
+                    self.in_image = false;
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.in_table {
             let Some(collector) = self.table.as_mut() else {
                 self.in_table = false;
@@ -211,6 +680,7 @@ impl IrBuilder {
                 }
             }
             Event::Code(text) => {
+                let start = self.inline.text.len();
                 self.inline.push(
                     &text,
                     Some(HighlightStyle {
@@ -219,6 +689,17 @@ impl IrBuilder {
                         ..Default::default()
                     }),
                 );
+                let range = start..self.inline.text.len();
+                if range.start < range.end {
+                    self.inline.protected.push(range.clone());
+                    if looks_like_code_path(&text) {
+                        self.inline.add_link(
+                            range,
+                            LinkTargetIr::File(text.trim().to_string().into()),
+                            false,
+                        );
+                    }
+                }
             }
             Event::InlineMath(text) | Event::DisplayMath(text) => {
                 let highlight = combined_highlight(&self.inline_kinds, &self.theme);
@@ -318,27 +799,32 @@ impl IrBuilder {
             Tag::Strong => self.inline_kinds.push(InlineKind::Strong),
             Tag::Emphasis => self.inline_kinds.push(InlineKind::Emphasis),
             Tag::Strikethrough => self.inline_kinds.push(InlineKind::Strikethrough),
-            Tag::Link { .. } => self.inline_kinds.push(InlineKind::Link),
+            Tag::Link { dest_url, .. } => {
+                self.inline_kinds.push(InlineKind::Link);
+                self.link_starts.push(self.inline.text.len());
+                self.link_dests.push(dest_url.to_string());
+            }
             Tag::Image {
                 dest_url, title, ..
             } => {
-                let label = if title.is_empty() {
+                // An image is a block of its own. Flush the text before it (and
+                // close an open list item) so the paragraph keeps its shape.
+                if self.item_marker.is_some() {
+                    self.flush_list_item();
+                } else {
+                    self.flush_inline();
+                }
+                let alt = if title.is_empty() {
                     dest_url.to_string()
                 } else {
                     title.to_string()
                 };
-                self.inline.push(
-                    &format!("[{label}]"),
-                    Some(HighlightStyle {
-                        color: Some(self.theme.accent),
-                        underline: Some(UnderlineStyle {
-                            color: Some(self.theme.accent),
-                            thickness: px(1.0),
-                            wavy: false,
-                        }),
-                        ..Default::default()
-                    }),
-                );
+                self.pending_image = Some(ImageIr {
+                    alt: alt.into(),
+                    src: dest_url.to_string().into(),
+                });
+                self.image_alt.clear();
+                self.in_image = true;
             }
             Tag::HtmlBlock
             | Tag::FootnoteDefinition(_)
@@ -392,8 +878,18 @@ impl IrBuilder {
                 self.flush_list_item();
             }
             TagEnd::Table => {}
-            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link => {
+            TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough => {
                 self.inline_kinds.pop();
+            }
+            TagEnd::Link => {
+                self.inline_kinds.pop();
+                if let Some(start) = self.link_starts.pop() {
+                    let range = start..self.inline.text.len();
+                    if let Some(target) = self.link_dests.pop().and_then(|dest| link_target(&dest))
+                    {
+                        self.inline.add_link(range, target, true);
+                    }
+                }
             }
             _ => {}
         }
@@ -410,11 +906,13 @@ impl IrBuilder {
         if self.inline.is_empty() {
             return;
         }
+        self.inline.finish_targets();
         let item = Rc::new(ItemIr {
             marker: marker.into(),
             indent: self.item_indent,
             text: self.inline.text.clone().into(),
             highlights: self.inline.highlights.clone().into(),
+            links: self.inline.links.clone().into(),
         });
         self.inline.clear();
         if let Some(list) = self.lists.last_mut() {
@@ -432,9 +930,11 @@ impl IrBuilder {
         if self.item_marker.is_some() {
             return;
         }
+        self.inline.finish_targets();
         let text = TextIr {
             text: self.inline.text.clone().into(),
             highlights: self.inline.highlights.clone().into(),
+            links: self.inline.links.clone().into(),
             size: text_size::BASE,
             weight: FontWeight::NORMAL,
             heading: false,
@@ -455,9 +955,11 @@ impl IrBuilder {
             2 => (16.0, FontWeight::SEMIBOLD),
             _ => (14.0, FontWeight::SEMIBOLD),
         };
+        self.inline.finish_targets();
         let text = TextIr {
             text: self.inline.text.clone().into(),
             highlights: self.inline.highlights.clone().into(),
+            links: self.inline.links.clone().into(),
             size,
             weight,
             heading: true,
@@ -468,6 +970,11 @@ impl IrBuilder {
     }
 
     fn finish(mut self) -> Blocks {
+        // A malformed image without its end tag still renders as an image
+        // rather than disappearing from the document.
+        if let Some(image) = self.pending_image.take() {
+            self.blocks.push(Rc::new(BlockIr::Image(image)));
+        }
         self.flush_inline();
         self.blocks.into()
     }
@@ -612,7 +1119,20 @@ pub fn render_markdown(theme: &Theme, source: &str) -> AnyElement {
 /// that already know the hash (e.g. computed at rebuild time) and must not
 /// re-hash a potentially megabyte-sized document every frame.
 pub fn render_markdown_keyed(theme: &Theme, source: &str, key: u64) -> AnyElement {
-    let key = DocKey {
+    render_markdown_keyed_with(theme, source, key, key, None)
+}
+
+/// [`render_markdown_keyed`] with clickable file/URL targets and images.
+/// `element_key` only needs to be unique among rows that are on screen at the
+/// same time; it keeps state and hit-testing separate for identical bodies.
+pub fn render_markdown_keyed_with(
+    theme: &Theme,
+    source: &str,
+    key: u64,
+    element_key: u64,
+    interaction: Option<&MarkdownInteraction>,
+) -> AnyElement {
+    let cache_key = DocKey {
         theme_key: theme_ir_key(theme),
         hash: key,
         len: source.len(),
@@ -622,16 +1142,16 @@ pub fn render_markdown_keyed(theme: &Theme, source: &str, key: u64) -> AnyElemen
         let MarkdownCache {
             docs, stamp, hits, ..
         } = &mut *cache;
-        match cache_get(docs, &key, stamp, hits) {
+        match cache_get(docs, &cache_key, stamp, hits) {
             Some(blocks) => blocks,
             None => {
                 let blocks = build_blocks(source, theme);
-                cache_put(docs, key, blocks.clone(), stamp, MAX_CACHED_DOCS);
+                cache_put(docs, cache_key, blocks.clone(), stamp, MAX_CACHED_DOCS);
                 blocks
             }
         }
     });
-    render_parsed(theme, &blocks)
+    render_parsed(theme, &blocks, interaction, element_key)
 }
 
 /// Like [`render_markdown`], but keeps a block cursor at the end of the text.
@@ -644,6 +1164,17 @@ pub fn render_markdown_keyed(theme: &Theme, source: &str, key: u64) -> AnyElemen
 /// whole-document parsing because cuts that would tear a list or an indented
 /// continuation in half are merged back together.
 pub fn render_markdown_streaming(theme: &Theme, source: &str) -> AnyElement {
+    render_markdown_streaming_with(theme, source, hash_source(source), None)
+}
+
+/// [`render_markdown_streaming`] with clickable targets. `doc_key` keeps
+/// element identities stable while the tail of the stream grows.
+pub fn render_markdown_streaming_with(
+    theme: &Theme,
+    source: &str,
+    doc_key: u64,
+    interaction: Option<&MarkdownInteraction>,
+) -> AnyElement {
     let mut streaming = String::with_capacity(source.len() + 2);
     streaming.push_str(source);
     if !streaming.is_empty() {
@@ -660,7 +1191,7 @@ pub fn render_markdown_streaming(theme: &Theme, source: &str) -> AnyElement {
                 .cloned(),
         );
     }
-    render_parsed(theme, &Rc::from(blocks))
+    render_parsed(theme, &Rc::from(blocks), interaction, doc_key)
 }
 
 /// Render one pre-split markdown block, memoized in the chunk cache under the
@@ -668,7 +1199,23 @@ pub fn render_markdown_streaming(theme: &Theme, source: &str) -> AnyElement {
 /// slice of a longer document call this every frame; the hash makes the
 /// per-frame cost an O(len) scan instead of a re-parse.
 pub fn render_markdown_chunk(theme: &Theme, source: &str, hash: u64) -> AnyElement {
-    render_parsed(theme, &Rc::from(cached_chunk_blocks(theme, source, hash)))
+    render_markdown_chunk_with(theme, source, hash, hash, None)
+}
+
+/// [`render_markdown_chunk`] with clickable targets.
+pub fn render_markdown_chunk_with(
+    theme: &Theme,
+    source: &str,
+    hash: u64,
+    element_key: u64,
+    interaction: Option<&MarkdownInteraction>,
+) -> AnyElement {
+    render_parsed(
+        theme,
+        &Rc::from(cached_chunk_blocks(theme, source, hash)),
+        interaction,
+        element_key,
+    )
 }
 
 /// Chunk-cache lookup keyed by theme + content hash + length.
@@ -944,8 +1491,16 @@ fn is_list_marker_line(line: &str) -> bool {
 
 // --- IR → elements ----------------------------------------------------------
 
-fn render_parsed(theme: &Theme, blocks: &[Rc<BlockIr>]) -> AnyElement {
-    let children = blocks.iter().map(|block| render_block(theme, block));
+fn render_parsed(
+    theme: &Theme,
+    blocks: &[Rc<BlockIr>],
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+) -> AnyElement {
+    let children = blocks
+        .iter()
+        .enumerate()
+        .map(|(index, block)| render_block(theme, block, interaction, doc_key, index));
     div()
         .flex()
         .flex_col()
@@ -955,17 +1510,25 @@ fn render_parsed(theme: &Theme, blocks: &[Rc<BlockIr>]) -> AnyElement {
         .into_any_element()
 }
 
-fn render_block(theme: &Theme, block: &Rc<BlockIr>) -> AnyElement {
+fn render_block(
+    theme: &Theme,
+    block: &Rc<BlockIr>,
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    block_ix: usize,
+) -> AnyElement {
     match block.as_ref() {
-        BlockIr::Text(text) => render_text_block(theme, text),
-        BlockIr::Item(item) => render_item_row(theme, item),
+        BlockIr::Text(text) => render_text_block(theme, text, interaction, doc_key, block_ix),
+        BlockIr::Item(item) => render_item_row(theme, item, interaction, doc_key, block_ix),
         BlockIr::List { items, quote } => {
             let mut container = div()
                 .w_full()
                 .flex()
                 .flex_col()
                 .gap_1()
-                .children(items.iter().map(|item| render_item_row(theme, item)));
+                .children(items.iter().enumerate().map(|(index, item)| {
+                    render_item_row(theme, item, interaction, doc_key, block_ix + index)
+                }));
             if *quote {
                 container = container
                     .border_l_2()
@@ -984,6 +1547,7 @@ fn render_block(theme: &Theme, block: &Rc<BlockIr>) -> AnyElement {
             code,
             *code_hash,
         ),
+        BlockIr::Image(image) => render_image_block(theme, image, interaction, doc_key, block_ix),
         BlockIr::Table(data) => render_table(theme, data),
         BlockIr::Rule => div()
             .w_full()
@@ -1001,7 +1565,114 @@ fn styled_inline(text: SharedString, highlights: &[(Range<usize>, HighlightStyle
     }
 }
 
-fn render_text_block(theme: &Theme, ir: &TextIr) -> AnyElement {
+/// Plain-prose paths get link color. A clickable range that already carries a
+/// highlight (inline code) keeps its background and gains the link color, so
+/// the run still reads as a file chip. Ranges are split at highlight/link
+/// boundaries because `StyledText::with_highlights` requires sorted,
+/// non-overlapping runs.
+fn styled_inline_with_links(
+    theme: &Theme,
+    text: SharedString,
+    highlights: &[(Range<usize>, HighlightStyle)],
+    links: &[LinkIr],
+) -> StyledText {
+    if links.is_empty() {
+        return styled_inline(text, highlights);
+    }
+    let mut points: Vec<usize> = Vec::with_capacity(highlights.len() * 2 + links.len() * 2 + 2);
+    points.push(0);
+    points.push(text.len());
+    for (range, _) in highlights {
+        points.push(range.start);
+        points.push(range.end);
+    }
+    for link in links {
+        points.push(link.range.start);
+        points.push(link.range.end);
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut runs: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    for pair in points.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        if start >= end {
+            continue;
+        }
+        let mut style = HighlightStyle::default();
+        for (range, highlight) in highlights {
+            if range.start <= start && end <= range.end {
+                style = style.highlight(*highlight);
+            }
+        }
+        if links
+            .iter()
+            .any(|link| link.range.start <= start && end <= link.range.end)
+        {
+            style.color = Some(theme.link);
+        }
+        if style == HighlightStyle::default() {
+            continue;
+        }
+        if let Some((range, previous)) = runs.last_mut()
+            && range.end == start
+            && *previous == style
+        {
+            range.end = end;
+            continue;
+        }
+        runs.push((start..end, style));
+    }
+    if runs.is_empty() {
+        StyledText::new(text)
+    } else {
+        StyledText::new(text).with_highlights(runs)
+    }
+}
+
+/// The inline element for one text run: a plain styled text when nothing is
+/// clickable, an [`gpui::InteractiveText`] with per-target hit areas otherwise.
+fn text_run_element(
+    theme: &Theme,
+    text: SharedString,
+    highlights: &[(Range<usize>, HighlightStyle)],
+    links: &[LinkIr],
+    interaction: Option<&MarkdownInteraction>,
+    id: SharedString,
+) -> AnyElement {
+    let styled = styled_inline_with_links(theme, text, highlights, links);
+    let Some(interaction) = interaction.filter(|_| !links.is_empty()) else {
+        return styled.into_any_element();
+    };
+    let ranges: Vec<Range<usize>> = links.iter().map(|link| link.range.clone()).collect();
+    let targets: Vec<MarkdownTarget> = links.iter().map(LinkIr::markdown_target).collect();
+    let click_interaction = interaction.clone();
+    let click_targets = targets.clone();
+    let right_interaction = interaction.clone();
+    let right_targets = targets;
+    let mut element = gpui::InteractiveText::new(ElementId::Name(id), styled);
+    if !ranges.is_empty() {
+        element = element.on_click(ranges.clone(), move |index, position, window, cx| {
+            if let Some(target) = click_targets.get(index).cloned() {
+                click_interaction.activate(target, MouseButton::Left, position, window, cx);
+            }
+        });
+        element = element.on_right_click(ranges, move |index, position, window, cx| {
+            if let Some(target) = right_targets.get(index).cloned() {
+                right_interaction.activate(target, MouseButton::Right, position, window, cx);
+            }
+        });
+    }
+    element.into_any_element()
+}
+
+fn render_text_block(
+    theme: &Theme,
+    ir: &TextIr,
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    block_ix: usize,
+) -> AnyElement {
     // ZCode body copy runs at a 1.75 line height; match it so streamed
     // markdown breathes the same way.
     let element = div()
@@ -1010,11 +1681,35 @@ fn render_text_block(theme: &Theme, ir: &TextIr) -> AnyElement {
         .line_height(px(ir.size * 1.75))
         .font_weight(ir.weight)
         .text_color(theme.text)
-        .child(styled_inline(ir.text.clone(), &ir.highlights));
+        .child(text_run_element(
+            theme,
+            ir.text.clone(),
+            &ir.highlights,
+            &ir.links,
+            interaction,
+            SharedString::from(format!("md-{doc_key}-t{block_ix}")),
+        ));
     let element = if ir.heading {
         div().w_full().pt(px(2.0)).child(element).into_any_element()
     } else {
         element.into_any_element()
+    };
+    let element = match render_linked_image_strip(
+        theme,
+        &ir.links,
+        interaction,
+        doc_key,
+        block_ix,
+    ) {
+        Some(strip) => div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(element)
+            .child(strip)
+            .into_any_element(),
+        None => element,
     };
     if ir.quote {
         div()
@@ -1030,7 +1725,108 @@ fn render_text_block(theme: &Theme, ir: &TextIr) -> AnyElement {
     }
 }
 
-fn render_item_row(theme: &Theme, ir: &ItemIr) -> AnyElement {
+/// A text paragraph that references a local image path (usually inline code)
+/// gets a thumbnail strip underneath, so an artifact is visible without
+/// opening the link menu. Only images that actually exist are shown.
+fn render_linked_image_strip(
+    theme: &Theme,
+    links: &[LinkIr],
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    block_ix: usize,
+) -> Option<AnyElement> {
+    let interaction = interaction?;
+    let mut images: Vec<(SharedString, PathBuf)> = Vec::new();
+    for link in links {
+        let LinkTargetIr::File(src) = &link.target else {
+            continue;
+        };
+        if !is_image_source(src) {
+            continue;
+        }
+        let Some(path) = resolve_local_image(src, interaction.base_dir()) else {
+            continue;
+        };
+        if images.iter().any(|(existing, _)| existing == src) {
+            continue;
+        }
+        images.push((src.clone(), path));
+        if images.len() >= 4 {
+            break;
+        }
+    }
+    if images.is_empty() {
+        return None;
+    }
+
+    let mut row = div().flex().flex_wrap().gap(px(6.0));
+    for (index, (src, path)) in images.into_iter().enumerate() {
+        let click_interaction = interaction.clone();
+        let click_target = MarkdownTarget::File(src.clone());
+        let right_interaction = interaction.clone();
+        let right_target = MarkdownTarget::File(src);
+        row = row.child(
+            img(path)
+                .id(ElementId::named_usize(
+                    SharedString::from(format!("md-{doc_key}-strip")),
+                    block_ix * 8 + index,
+                ))
+                .w(px(220.0))
+                .h(px(140.0))
+                .bg(theme.surface)
+                .object_fit(ObjectFit::Contain)
+                .rounded(px(radius::SM))
+                .border_1()
+                .border_color(theme.border)
+                .on_click(move |event, window, cx| {
+                    click_interaction.activate(
+                        click_target.clone(),
+                        MouseButton::Left,
+                        event.position(),
+                        window,
+                        cx,
+                    );
+                })
+                .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                    cx.stop_propagation();
+                    right_interaction.activate(
+                        right_target.clone(),
+                        MouseButton::Right,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }),
+        );
+    }
+    Some(row.into_any_element())
+}
+
+fn is_image_source(src: &str) -> bool {
+    let src = src.trim();
+    if src.starts_with("http://") || src.starts_with("https://") || src.starts_with("data:") {
+        return false;
+    }
+    let src = src.split(['#', '?']).next().unwrap_or(src);
+    Path::new(src)
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .is_some_and(|extension| {
+            matches!(
+                extension.as_str(),
+                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+                    | "svg"
+            )
+        })
+}
+
+fn render_item_row(
+    theme: &Theme,
+    ir: &ItemIr,
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    item_ix: usize,
+) -> AnyElement {
     div()
         .w_full()
         .flex()
@@ -1053,9 +1849,228 @@ fn render_item_row(theme: &Theme, ir: &ItemIr) -> AnyElement {
                 .line_height(px(text_size::BASE * 1.75))
                 .font_weight(FontWeight::NORMAL)
                 .text_color(theme.text)
-                .child(styled_inline(ir.text.clone(), &ir.highlights)),
+                .child(text_run_element(
+                    theme,
+                    ir.text.clone(),
+                    &ir.highlights,
+                    &ir.links,
+                    interaction,
+                    SharedString::from(format!("md-{doc_key}-i{item_ix}")),
+                )),
         )
         .into_any_element()
+}
+
+fn render_image_block(
+    theme: &Theme,
+    image: &ImageIr,
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    block_ix: usize,
+) -> AnyElement {
+    let Some(interaction) = interaction else {
+        return render_image_fallback(theme, image, None, doc_key, block_ix);
+    };
+    let src = image.src.as_ref();
+    let target = if is_http_url(src) {
+        MarkdownTarget::Url(image.src.clone())
+    } else {
+        MarkdownTarget::File(image.src.clone())
+    };
+    let source = if is_http_url(src) {
+        Some(img(src.to_string()))
+    } else {
+        resolve_local_image(src, interaction.base_dir()).map(img)
+    };
+    let Some(base) = source else {
+        return render_image_fallback(theme, image, Some(interaction), doc_key, block_ix);
+    };
+
+    let click_interaction = interaction.clone();
+    let click_target = target.clone();
+    let right_interaction = interaction.clone();
+    let element = base
+        .id(ElementId::Name(
+            format!("md-{doc_key}-img{block_ix}").into(),
+        ))
+        .w_full()
+        .max_w(px(640.0))
+        .h(px(340.0))
+        .bg(theme.surface)
+        .object_fit(ObjectFit::Contain)
+        .rounded(px(radius::MD))
+        .border_1()
+        .border_color(theme.border)
+        .on_click(move |event, window, cx| {
+            click_interaction.activate(
+                click_target.clone(),
+                MouseButton::Left,
+                event.position(),
+                window,
+                cx,
+            );
+        })
+        .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+            cx.stop_propagation();
+            right_interaction.activate(
+                target.clone(),
+                MouseButton::Right,
+                event.position,
+                window,
+                cx,
+            );
+        })
+        .into_any_element();
+
+    let mut column = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .items_start()
+        .gap(px(4.0))
+        .child(element);
+    if !image.alt.is_empty() && image.alt.as_ref() != src {
+        column = column.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(image.alt.clone()),
+        );
+    }
+    column.into_any_element()
+}
+
+fn render_image_fallback(
+    theme: &Theme,
+    image: &ImageIr,
+    interaction: Option<&MarkdownInteraction>,
+    doc_key: u64,
+    block_ix: usize,
+) -> AnyElement {
+    let label = if image.alt.is_empty() || image.alt.as_ref() == image.src.as_ref() {
+        image.src.clone()
+    } else {
+        SharedString::from(format!("{} · {}", image.alt, image.src))
+    };
+    let base = div()
+        .id(ElementId::Name(
+            format!("md-{doc_key}-imgfallback{block_ix}").into(),
+        ))
+        .flex()
+        .items_center()
+        .gap(px(7.0))
+        .h(px(28.0))
+        .px(px(9.0))
+        .rounded(px(radius::SM))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.hover))
+        .child(
+            svg()
+                .path(icons::IMAGE)
+                .size(px(12.0))
+                .text_color(theme.text_faint),
+        )
+        .child(
+            div()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(11.5))
+                .text_color(theme.link)
+                .child(label),
+        );
+    let Some(interaction) = interaction else {
+        return base.into_any_element();
+    };
+    let target = if is_http_url(image.src.as_ref()) {
+        MarkdownTarget::Url(image.src.clone())
+    } else {
+        MarkdownTarget::File(image.src.clone())
+    };
+    let click_interaction = interaction.clone();
+    let click_target = target.clone();
+    let right_interaction = interaction.clone();
+    let right_target = target;
+    base.on_click(move |event, window, cx| {
+        click_interaction.activate(
+            click_target.clone(),
+            MouseButton::Left,
+            event.position(),
+            window,
+            cx,
+        );
+    })
+    .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+        cx.stop_propagation();
+        right_interaction.activate(
+            right_target.clone(),
+            MouseButton::Right,
+            event.position,
+            window,
+            cx,
+        );
+    })
+    .into_any_element()
+}
+
+fn resolve_local_image(src: &str, base_dir: &Path) -> Option<PathBuf> {
+    let src = src.trim();
+    if src.is_empty() || src.starts_with("data:") {
+        return None;
+    }
+    let src = src.strip_prefix("file://").unwrap_or(src);
+    // Windows file URLs arrive as `/C:/dir/file`.
+    #[cfg(target_os = "windows")]
+    let src = src
+        .strip_prefix('/')
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(src);
+    let src = src.split(['#', '?']).next().unwrap_or(src);
+    let decoded = percent_decode(src);
+    let path = if let Some(rest) = decoded.strip_prefix("~/") {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(|home| PathBuf::from(home).join(rest))
+            .unwrap_or_else(|| base_dir.join(rest))
+    } else {
+        let path = Path::new(&decoded);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        }
+    };
+    path.is_file().then_some(path)
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn render_code_block(
@@ -1260,6 +2275,85 @@ mod tests {
         assert!(matches!(code[0].as_ref(), BlockIr::Code { .. }));
     }
 
+    #[test]
+    fn inline_code_paths_and_markdown_links_become_targets() {
+        let theme = theme();
+        let blocks = build_blocks(
+            "改 `crates/agent-core` 与 [README](README.md)，外加 src/main.rs:12 和 https://example.com/a?b=1。",
+            &theme,
+        );
+        let BlockIr::Text(text) = blocks[0].as_ref() else {
+            panic!("expected text block");
+        };
+        let targets: Vec<&LinkTargetIr> = text
+            .links
+            .iter()
+            .map(|link| &link.target)
+            .collect();
+        assert_eq!(targets.len(), 4, "links: {targets:?}");
+        assert!(matches!(targets[0], LinkTargetIr::File(path) if path == "crates/agent-core"));
+        assert!(matches!(targets[1], LinkTargetIr::File(path) if path == "README.md"));
+        assert!(matches!(targets[2], LinkTargetIr::File(path) if path == "src/main.rs:12"));
+        assert!(matches!(targets[3], LinkTargetIr::Url(url) if url == "https://example.com/a?b=1"));
+        // The clickable ranges cover exactly the visible token, not the
+        // surrounding prose or the trailing punctuation.
+        assert_eq!(
+            &text.text[text.links[0].range.clone()],
+            "crates/agent-core"
+        );
+        assert_eq!(
+            &text.text[text.links[3].range.clone()],
+            "https://example.com/a?b=1"
+        );
+    }
+
+    #[test]
+    fn prose_is_not_mistaken_for_paths() {
+        assert!(looks_like_plain_path("src/main.rs"));
+        assert!(looks_like_plain_path("README.md"));
+        assert!(looks_like_plain_path("./scripts"));
+        assert!(!looks_like_plain_path("and/or"));
+        assert!(!looks_like_plain_path("example.com"));
+        assert!(!looks_like_plain_path("v1.2.3"));
+        assert!(!looks_like_plain_path("e.g."));
+        assert!(!looks_like_plain_path("foo@bar.com"));
+        assert!(looks_like_code_path("crates/agent-core"));
+        assert!(looks_like_code_path("Cargo.toml"));
+        assert!(looks_like_code_path("docs/设计.md"));
+        assert!(!looks_like_code_path("cargo test -p effibuddy-ui"));
+        assert!(!looks_like_code_path("--features"));
+    }
+
+    #[test]
+    fn markdown_images_become_image_blocks() {
+        let theme = theme();
+        let blocks = build_blocks(
+            "before\n\n![dark chat](docs/screenshots/dark-chat.png)\n\nafter",
+            &theme,
+        );
+        assert_eq!(blocks.len(), 3);
+        let BlockIr::Image(image) = blocks[1].as_ref() else {
+            panic!("expected image block, got {:?}", blocks[1]);
+        };
+        assert_eq!(image.src, "docs/screenshots/dark-chat.png");
+        assert_eq!(image.alt, "dark chat");
+    }
+
+    #[test]
+    fn inline_image_splits_the_paragraph_without_losing_text() {
+        let theme = theme();
+        let blocks = build_blocks("before ![shot](a.png) after", &theme);
+        let texts: Vec<String> = blocks
+            .iter()
+            .filter_map(|block| match block.as_ref() {
+                BlockIr::Text(text) => Some(text.text.trim().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["before", "after"]);
+        assert!(blocks.iter().any(|block| matches!(block.as_ref(), BlockIr::Image(_))));
+    }
+
     /// Manual benchmark: simulates a typewriter streaming a ~30 KB document
     /// over 60 frames and prints the per-frame render cost, first frame vs
     /// steady state. Run with:
@@ -1311,7 +2405,7 @@ mod tests {
             .map(|_| {
                 let started = std::time::Instant::now();
                 let blocks = build_blocks(full, &theme);
-                let element = render_parsed(&theme, &blocks);
+                let element = render_parsed(&theme, &blocks, None, 0);
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 drop(element);
                 elapsed

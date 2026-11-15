@@ -22,24 +22,28 @@ use std::cell::{Ref, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use effibuddy_agent_core::{
     AgentMessageMeta, AttachmentKind, ContentBlock, Message, Role, RunStatus, SessionState,
     SubagentColor, SubagentStatus, ToolCall, ToolResult, UserAttachment,
 };
 use effibuddy_ui::{
-    BadgeTone, GlideTick, IconButton, ScrollGlide, Spinner, Theme, badge, chunk_ranges,
-    disclosure_chevron, ease_out_cubic, icons, markdown_source_key, radius, reduce_motion,
-    render_markdown_chunk, render_markdown_keyed, shadow_float, wheel_capture_overlay,
+    BadgeTone, GlideTick, IconButton, MarkdownInteraction, ScrollGlide, Spinner, Theme, badge,
+    chunk_ranges, disclosure_chevron, ease_out_cubic, icons, markdown_source_key, reduce_motion,
+    render_markdown_chunk_with, render_markdown_keyed_with,
+    render_markdown_streaming_with, shadow_float, wheel_capture_overlay,
 };
 use gpui::prelude::*;
 use gpui::{
-    Animation, AnimationExt, AnyElement, Canvas, ClipboardItem, Div, Hsla, IntoElement,
-    ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, WeakEntity, canvas, div,
-    pulsating_between, px, svg,
+    Animation, AnimationExt, AnyElement, Canvas, ClipboardItem, Div, Hsla, Image, ImageFormat,
+    IntoElement, ListAlignment, ListOffset, ListState, ObjectFit, ScrollHandle, SharedString,
+    WeakEntity, canvas, div, img, pulsating_between, px, svg,
 };
 
 use crate::app::AppView;
@@ -124,6 +128,11 @@ pub(crate) struct ChatViewState {
     pub reasoning_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
     /// Per-code-panel scroll handles (shared with the chat list).
     pub code_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
+    /// Click hooks + base directory for links and images in markdown bodies.
+    pub markdown: MarkdownInteraction,
+    /// Lazily decoded tool-result rasters, keyed `call_id:index` (shared with
+    /// the chat list so session switches drop the memory).
+    pub tool_images: Rc<RefCell<HashMap<String, Option<Arc<Image>>>>>,
     /// Set by the rail after a jump: the target user bubble paints a one-shot
     /// accent border so the destination is obvious in a long transcript.
     pub jump_flash: Option<JumpFlash>,
@@ -194,7 +203,6 @@ const PROMPT_RAIL_POPOVER_ESTIMATE: f32 = 140.0;
 const PROMPT_PREVIEW_CHARS: usize = 220;
 const PROMPT_PREVIEW_PARAGRAPHS: usize = 2;
 const PROMPT_LINE_IDLE: f32 = 12.0;
-const PROMPT_LINE_ACTIVE: f32 = 16.0;
 const PROMPT_LINE_HOVER: f32 = 30.0;
 const PROMPT_LINE_MOTION: Duration = Duration::from_millis(140);
 
@@ -412,6 +420,11 @@ pub(crate) struct ChatList {
     reasoning_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
     /// Per-code-panel scroll handles, keyed `call-id + title`.
     code_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
+    /// Session cwd of the rebuilt transcript; markdown file links and relative
+    /// image sources resolve against it.
+    workspace: PathBuf,
+    /// Decoded tool-result images, created lazily at render time.
+    tool_images: Rc<RefCell<HashMap<String, Option<Arc<Image>>>>>,
     /// One mark per user query for the left-edge rail, in transcript order.
     prompt_marks: Rc<Vec<PromptMark>>,
     /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
@@ -455,6 +468,8 @@ impl ChatList {
             reveal: StreamReveal::default(),
             reasoning_scrolls: Rc::new(RefCell::new(HashMap::new())),
             code_scrolls: Rc::new(RefCell::new(HashMap::new())),
+            workspace: PathBuf::new(),
+            tool_images: Rc::new(RefCell::new(HashMap::new())),
             prompt_marks: Rc::new(Vec::new()),
             first_slots: Vec::new(),
             reveal_frame_scheduled: false,
@@ -508,6 +523,7 @@ impl ChatList {
         self.reveal = StreamReveal::default();
         self.reasoning_scrolls = Rc::new(RefCell::new(HashMap::new()));
         self.code_scrolls = Rc::new(RefCell::new(HashMap::new()));
+        self.tool_images = Rc::new(RefCell::new(HashMap::new()));
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
         self.glide = ScrollGlide::new();
@@ -525,6 +541,7 @@ impl ChatList {
     /// Rebuild the item snapshot from the session. Only invoked when a
     /// structural event happened, never on token deltas.
     pub fn rebuild(&mut self, session: &SessionState, run: &RunSnapshot) {
+        self.workspace = session.cwd.clone();
         let now = Instant::now();
         let old_items = self.items.clone();
         let old_results = self.results.clone();
@@ -751,6 +768,7 @@ impl ChatList {
         expanded_turns: &HashSet<String>,
         collapsed_turns: &HashSet<String>,
         agents: &HashMap<String, AgentCard>,
+        entity: &WeakEntity<AppView>,
     ) -> ChatViewState {
         let stream = self.reveal.snapshot();
         let streaming_id = stream.as_ref().map(|stream| stream.message_id.clone());
@@ -897,6 +915,7 @@ impl ChatList {
         self.slot_keys = new_keys;
         self.first_sync = false;
 
+        let markdown = markdown_interaction(&self.workspace, entity);
         ChatViewState {
             items: self.items.clone(),
             slots: Rc::clone(&self.slots),
@@ -912,6 +931,8 @@ impl ChatList {
             stream,
             reasoning_scrolls: Rc::clone(&self.reasoning_scrolls),
             code_scrolls: Rc::clone(&self.code_scrolls),
+            markdown,
+            tool_images: Rc::clone(&self.tool_images),
             jump_flash: None,
             turn_expand_at: Rc::new(self.turn_expand_at.clone()),
             turn_block_heights: Rc::clone(&self.turn_block_heights),
@@ -1730,6 +1751,23 @@ fn advance_chars(text: &str, from: usize, count: usize) -> usize {
 
 // --- rendering -------------------------------------------------------------
 
+/// Markdown click hook shared by every row: the app owns the menu, the
+/// renderer only reports the target and the click position.
+fn markdown_interaction(
+    base_dir: &std::path::Path,
+    entity: &WeakEntity<AppView>,
+) -> MarkdownInteraction {
+    let entity = entity.clone();
+    MarkdownInteraction::new(
+        base_dir.to_path_buf(),
+        move |target, button, position, base_dir, window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.activate_markdown_target(target, button, position, base_dir, window, cx);
+            });
+        },
+    )
+}
+
 pub(crate) fn render_chat_item(
     index: usize,
     view: &ChatViewState,
@@ -1754,6 +1792,7 @@ pub(crate) fn render_chat_item(
                 steered,
                 attachments,
             } => render_user(
+                view,
                 theme,
                 text,
                 attachments,
@@ -1874,6 +1913,7 @@ pub(crate) fn render_chat_item(
 /// Right-aligned user bubble plus the hover-revealed actions. The action row
 /// always reserves its height, so hovering cannot shift the transcript.
 fn render_user(
+    view: &ChatViewState,
     theme: &Theme,
     text: &SharedString,
     attachments: &[UserAttachment],
@@ -1936,6 +1976,67 @@ fn render_user(
         .text_size(px(14.0))
         .line_height(px(21.0))
         .text_color(theme.text);
+    let image_attachments: Vec<&UserAttachment> = attachments
+        .iter()
+        .filter(|attachment| attachment.kind == AttachmentKind::Image)
+        .collect();
+    if !image_attachments.is_empty() {
+        let mut thumbnails = div().flex().flex_wrap().items_end().gap(px(6.0));
+        for (index, attachment) in image_attachments.into_iter().enumerate() {
+            if let Some(image) = attachment_image(view, attachment) {
+                let click_path = attachment.path.clone();
+                let right_path = attachment.path.clone();
+                let click_base = view.markdown.base_dir().to_path_buf();
+                let right_base = view.markdown.base_dir().to_path_buf();
+                let click_entity = entity.clone();
+                let right_entity = entity.clone();
+                let element_id = SharedString::from(format!("user-image-{message_id}-{index}"));
+                thumbnails = thumbnails.child(
+                    img(image)
+                        .id(gpui::ElementId::Name(element_id))
+                        .w(px(184.0))
+                        .h(px(120.0))
+                        .bg(theme.surface)
+                        .object_fit(ObjectFit::Contain)
+                        .rounded(px(8.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .cursor_pointer()
+                        .on_click(move |event, window, cx| {
+                            let path = click_path.clone();
+                            let _ = click_entity.update(cx, |this, cx| {
+                                this.activate_markdown_target(
+                                    effibuddy_ui::MarkdownTarget::File(path.into()),
+                                    gpui::MouseButton::Left,
+                                    event.position(),
+                                    &click_base,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        })
+                        .on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+                            cx.stop_propagation();
+                            let path = right_path.clone();
+                            let _ = right_entity.update(cx, |this, cx| {
+                                this.activate_markdown_target(
+                                    effibuddy_ui::MarkdownTarget::File(path.into()),
+                                    gpui::MouseButton::Right,
+                                    event.position,
+                                    &right_base,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }),
+                );
+            }
+        }
+        if !text.is_empty() {
+            thumbnails = thumbnails.mb(px(8.0));
+        }
+        bubble = bubble.child(thumbnails);
+    }
     if !attachments.is_empty() {
         let mut chips = div().flex().flex_wrap().items_center().gap(px(6.0));
         if !text.is_empty() {
@@ -2234,9 +2335,21 @@ fn render_assistant(
     if has_text || texts.active() {
         let markdown = if texts.active() {
             let streaming = with_stream_caret(texts.text());
-            render_markdown_chunk(theme, &streaming, markdown_source_key(&streaming))
+            render_markdown_chunk_with(
+                theme,
+                &streaming,
+                markdown_source_key(&streaming),
+                hash_values(&(assistant.message.id.as_str(), "stream")),
+                Some(&view.markdown),
+            )
         } else {
-            render_markdown_keyed(theme, &assistant.text, assistant.text_key)
+            render_markdown_keyed_with(
+                theme,
+                &assistant.text,
+                assistant.text_key,
+                hash_values(&(assistant.message.id.as_str(), "body")),
+                Some(&view.markdown),
+            )
         };
         column = column.child(markdown);
     }
@@ -2273,10 +2386,12 @@ fn render_assistant_lead(
     }
 
     if let Some(chunk) = slot_chunk(assistant, view, 0) {
-        column = column.child(render_markdown_chunk(
+        column = column.child(render_markdown_chunk_with(
             theme,
             chunk.slice(texts.text()),
             chunk.key,
+            hash_values(&(assistant.message.id.as_str(), "lead")),
+            Some(&view.markdown),
         ));
     }
     column.into_any_element()
@@ -2291,7 +2406,13 @@ fn render_assistant_chunk(
 ) -> AnyElement {
     let texts = assistant_texts(assistant, view);
     match slot_chunk(assistant, view, chunk_ix) {
-        Some(chunk) => render_markdown_chunk(theme, chunk.slice(texts.text()), chunk.key),
+        Some(chunk) => render_markdown_chunk_with(
+            theme,
+            chunk.slice(texts.text()),
+            chunk.key,
+            hash_values(&(assistant.message.id.as_str(), chunk_ix)),
+            Some(&view.markdown),
+        ),
         None => div().into_any_element(),
     }
 }
@@ -2313,9 +2434,21 @@ fn render_assistant_tail(
         let chunk_text = chunk.slice(texts.text());
         let markdown = if texts.active() {
             let streaming = with_stream_caret(chunk_text);
-            render_markdown_chunk(theme, &streaming, markdown_source_key(&streaming))
+            render_markdown_chunk_with(
+                theme,
+                &streaming,
+                markdown_source_key(&streaming),
+                hash_values(&(message_group.as_ref(), "tail-stream")),
+                Some(&view.markdown),
+            )
         } else {
-            render_markdown_chunk(theme, chunk_text, chunk.key)
+            render_markdown_chunk_with(
+                theme,
+                chunk_text,
+                chunk.key,
+                hash_values(&(message_group.as_ref(), "tail", chunk.key)),
+                Some(&view.markdown),
+            )
         };
         column = column.child(markdown);
     }
@@ -2588,12 +2721,22 @@ fn render_turn_header(
     let turn_id = turn.id.clone();
     let toggle_entity = entity.clone();
     let row_group = SharedString::from(format!("turn-row-{}", turn.id));
+    // 可展开只靠文字提亮暗示：静息用 muted，悬停留意行内文字变亮，
+    // 不再铺一层背景色块。
+    let label_hover = if turn.any_error {
+        theme.danger_hover
+    } else {
+        theme.text
+    };
     let label_element = if live && !unresolved {
         div()
             .min_w(px(0.0))
             .truncate()
             .text_size(px(13.0))
             .text_color(theme.text_muted)
+            .group_hover(row_group.clone(), move |style| {
+                style.text_color(label_hover)
+            })
             .child(label)
             .with_animation(
                 SharedString::from(format!("turn-pulse-{}", turn.id)),
@@ -2611,6 +2754,9 @@ fn render_turn_header(
             } else {
                 theme.text_muted
             })
+            .group_hover(row_group.clone(), move |style| {
+                style.text_color(label_hover)
+            })
             .child(label)
             .into_any_element()
     };
@@ -2619,8 +2765,7 @@ fn render_turn_header(
         .w_full()
         .flex()
         .flex_col()
-        // 悬停高亮做成内嵌圆角小条（负外边距保持文字与内容栏对齐），和
-        // 下方分隔线分离：高亮不再是盖住细线的整条色块。
+        // 悬停不铺背景：只有状态文字提亮，暗示整行可点开。
         .child(
             div()
                 .id(SharedString::from(format!("turn-head-{}", turn.id)))
@@ -2628,12 +2773,8 @@ fn render_turn_header(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .mx(px(-6.0))
-                .px(px(6.0))
                 .py(px(4.0))
-                .rounded(px(radius::SM))
                 .cursor_pointer()
-                .hover(|style| style.bg(theme.hover))
                 .on_click(move |_, _, cx| {
                     let turn_id = turn_id.clone();
                     let _ = toggle_entity.update(cx, |this, cx| {
@@ -2706,10 +2847,12 @@ fn render_turn_member(
         *reveal_ix += 1;
     }
     if !member.text.trim().is_empty() {
-        let text_element = div().opacity(0.72).child(render_markdown_keyed(
+        let text_element = div().opacity(0.72).child(render_markdown_keyed_with(
             theme,
             &member.text,
             member.text_key,
+            hash_values(&(member.message.id.as_str(), "member")),
+            Some(&view.markdown),
         ));
         column = column.child(reveal.apply(text_element, *reveal_ix));
         *reveal_ix += 1;
@@ -2800,9 +2943,20 @@ fn render_turn(
     if has_text || texts.active() {
         let markdown = if texts.active() {
             let streaming = with_stream_caret(texts.text());
-            render_markdown_chunk(theme, &streaming, markdown_source_key(&streaming))
+            render_markdown_streaming_with(
+                theme,
+                &streaming,
+                hash_values(&body.message.id),
+                Some(&view.markdown),
+            )
         } else {
-            render_markdown_keyed(theme, &body.text, body.text_key)
+            render_markdown_keyed_with(
+                theme,
+                &body.text,
+                body.text_key,
+                hash_values(&(body.message.id.as_str(), "turn-body")),
+                Some(&view.markdown),
+            )
         };
         column = column.child(markdown);
     }
@@ -2863,10 +3017,12 @@ fn render_turn_lead(
         ));
     }
     if let Some(chunk) = slot_chunk(body, view, 0) {
-        column = column.child(render_markdown_chunk(
+        column = column.child(render_markdown_chunk_with(
             theme,
             chunk.slice(texts.text()),
             chunk.key,
+            hash_values(&(body.message.id.as_str(), "lead")),
+            Some(&view.markdown),
         ));
     }
     column.into_any_element()
@@ -2892,9 +3048,21 @@ fn render_turn_tail(
         let chunk_text = chunk.slice(texts.text());
         let markdown = if texts.active() {
             let streaming = with_stream_caret(chunk_text);
-            render_markdown_chunk(theme, &streaming, markdown_source_key(&streaming))
+            render_markdown_chunk_with(
+                theme,
+                &streaming,
+                markdown_source_key(&streaming),
+                hash_values(&(message_group.as_ref(), "tail-stream")),
+                Some(&view.markdown),
+            )
         } else {
-            render_markdown_chunk(theme, chunk_text, chunk.key)
+            render_markdown_chunk_with(
+                theme,
+                chunk_text,
+                chunk.key,
+                hash_values(&(message_group.as_ref(), "tail", chunk.key)),
+                Some(&view.markdown),
+            )
         };
         column = column.child(markdown);
     }
@@ -3403,7 +3571,15 @@ fn render_tool_row(
     let failed = result.is_some_and(|result| result.is_error);
     let pending = result.is_none() && running;
     let label = tool_action_label(&call.name, result, running);
-    let detail = tool_detail(call);
+    let detail = {
+        let detail = tool_detail(call);
+        match result {
+            Some(result) if !result.images.is_empty() => {
+                format!("{detail} · {} 张图片", result.images.len())
+            }
+            _ => detail,
+        }
+    };
     let call_id = call.id.clone();
     let toggle_entity = entity.clone();
     // Expanded-only work: JSON pretty-printing and cloning the (possibly
@@ -3414,6 +3590,19 @@ fn render_tool_row(
     } else {
         None
     };
+    // File-tool rows double as artifact links: the path is visible and a
+    // right-click opens the same open/save/copy/quote menu as a Markdown link.
+    let file_path = matches!(
+        call.name.as_str(),
+        "read_file" | "write_file" | "edit_file" | "list_dir"
+    )
+    .then(|| {
+        call.arguments
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    })
+    .flatten();
 
     // ZCode keeps the tool icon static and expresses "running" through the
     // shimmering label; the pulse animation stands in for the shimmer here.
@@ -3463,6 +3652,24 @@ fn render_tool_row(
                         this.toggle_tool(&call_id);
                         cx.notify();
                     });
+                })
+                .when_some(file_path, |element, path| {
+                    let entity = entity.clone();
+                    let base_dir = view.markdown.base_dir().to_path_buf();
+                    element.on_mouse_down(gpui::MouseButton::Right, move |event, window, cx| {
+                        cx.stop_propagation();
+                        let path = path.clone();
+                        let _ = entity.update(cx, |this, cx| {
+                            this.activate_markdown_target(
+                                effibuddy_ui::MarkdownTarget::File(path.into()),
+                                gpui::MouseButton::Right,
+                                event.position,
+                                &base_dir,
+                                window,
+                                cx,
+                            );
+                        });
+                    })
                 })
                 .child(
                     svg()
@@ -3521,7 +3728,13 @@ fn render_tool_row(
                             view,
                             entity,
                         ))
-                    }),
+                    })
+                    .when_some(
+                        result.filter(|result| !result.images.is_empty()),
+                        |element, result| {
+                            element.child(render_tool_images(theme, &call.id, result, view))
+                        },
+                    ),
             )
         })
         .into_any_element()
@@ -3914,11 +4127,9 @@ pub(crate) fn render_prompt_rail(
         } else {
             with_alpha(theme.text_faint, 0.55)
         };
-        let idle = if is_active || mark.running {
-            PROMPT_LINE_ACTIVE
-        } else {
-            PROMPT_LINE_IDLE
-        };
+        // Every bar rests at the same width; only hover widens one. Active and
+        // running queries are distinguished by color/opacity instead.
+        let idle = PROMPT_LINE_IDLE;
         let target = if hovered { PROMPT_LINE_HOVER } else { idle };
         // A row that was hovered last frame starts wide so leaving animates
         // back down; every other row starts and ends at its resting width.
@@ -4396,6 +4607,93 @@ fn tool_detail(call: &ToolCall) -> String {
         _ => serde_json::to_string(arguments).unwrap_or_default(),
     };
     truncate_text(&detail, 140)
+}
+
+/// Decoded rasters are big (RGBA, not the compressed payload); keep only a
+/// short window of recent ones. Revisiting an evicted image decodes it again.
+const MAX_DECODED_IMAGES: usize = 16;
+
+fn cache_decoded_image(
+    view: &ChatViewState,
+    key: String,
+    image: Option<Arc<Image>>,
+) {
+    let mut cache = view.tool_images.borrow_mut();
+    if cache.len() >= MAX_DECODED_IMAGES && !cache.contains_key(&key) {
+        if let Some(victim) = cache.keys().next().cloned() {
+            cache.remove(&victim);
+        }
+    }
+    cache.insert(key, image);
+}
+
+/// Rasters attached by the user. Decoded once per path/size pair; the same
+/// cache as tool screenshots (the keys are prefixed so they cannot collide).
+fn attachment_image(view: &ChatViewState, attachment: &UserAttachment) -> Option<Arc<Image>> {
+    let raster = attachment.image.as_ref()?;
+    let key = format!("attachment:{}:{}", attachment.path, raster.data.len());
+    let cached = view.tool_images.borrow().get(&key).cloned();
+    if let Some(cached) = cached {
+        return cached;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&raster.data)
+        .ok();
+    let decoded = bytes.map(|bytes| {
+        let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
+        Arc::new(Image::from_bytes(format, bytes))
+    });
+    cache_decoded_image(view, key, decoded.clone());
+    decoded
+}
+
+/// Rasters attached to a tool result (usually computer-use screenshots).
+/// Base64 decoding is cached per `call_id:index`; the map lives on the chat
+/// list so a session switch releases the decoded pixels.
+fn tool_image(
+    view: &ChatViewState,
+    call_id: &str,
+    result: &ToolResult,
+    index: usize,
+) -> Option<Arc<Image>> {
+    let key = format!("{call_id}:{index}");
+    let cached = view.tool_images.borrow().get(&key).cloned();
+    if let Some(cached) = cached {
+        return cached;
+    }
+    let decoded = result.images.get(index).and_then(|image| {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .ok()?;
+        let format = ImageFormat::from_mime_type(&image.mime_type).unwrap_or(ImageFormat::Png);
+        Some(Arc::new(Image::from_bytes(format, bytes)))
+    });
+    cache_decoded_image(view, key, decoded.clone());
+    decoded
+}
+
+fn render_tool_images(
+    theme: &Theme,
+    call_id: &str,
+    result: &ToolResult,
+    view: &ChatViewState,
+) -> AnyElement {
+    let mut row = div().flex().flex_wrap().gap(px(6.0));
+    for index in 0..result.images.len() {
+        if let Some(image) = tool_image(view, call_id, result, index) {
+            row = row.child(
+                img(image)
+                    .w(px(420.0))
+                    .h(px(280.0))
+                    .bg(theme.surface)
+                    .object_fit(ObjectFit::Contain)
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(theme.border),
+            );
+        }
+    }
+    row.into_any_element()
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {

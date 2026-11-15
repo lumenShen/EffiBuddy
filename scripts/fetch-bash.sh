@@ -62,9 +62,11 @@ jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)
 if [ "$mode" = linux ]; then
     : "${CC:=musl-gcc}"
     export CC
-    ./configure --enable-static-link --without-bash-malloc CFLAGS="-O2 -static" >/dev/null
+    ./configure --enable-static-link --without-bash-malloc --disable-nls \
+        CFLAGS="-O2 -static" >/dev/null
 else
-    ./configure --without-bash-malloc CFLAGS="-O2" >/dev/null
+    # NLS 只提供翻译，非交互命令用不到；关掉可避免链接宿主机上的 gettext。
+    ./configure --without-bash-malloc --disable-nls CFLAGS="-O2" >/dev/null
 fi
 
 make -j"$jobs" >/dev/null

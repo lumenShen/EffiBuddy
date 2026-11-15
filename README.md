@@ -179,7 +179,7 @@ Wayland 首次截图会触发 xdg-desktop-portal 的屏幕读取授权；输入�
 tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败（单一版本源）：
 
 ```bash
-git tag v0.1.0 && git push origin v0.1.0   # 触发发布
+git tag v0.2.0 && git push origin v0.2.0   # 触发发布
 ```
 
 应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。安装包资产按平台与架构匹配：Windows x64 取 setup/zip，macOS 按 `std::env::consts::ARCH` 取同架构 tar.gz，Linux 读 `/etc/os-release` 判断 rpm/deb 偏好（识别不到时 deb 优先，退而求其次是同架构便携包）。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
@@ -480,7 +480,7 @@ cargo test -p effibuddy-agent-tools --test deepseek_live -- --ignored --nocaptur
 - 子代理在同一进程内运行、共享同一个模型 Provider；暂不支持 fork、worktree 隔离、远程子代理或子代理再派生子代理。
 - 后台子代理的通知只会唤醒创建它的父会话；应用重启后，历史子会话仍可读取，但任务面板不会自动恢复运行状态。
 - 上下文压缩默认让当前会话模型生成摘要，摘要请求失败时回退为本地摘录；极端长会话仍可能丢失细节，可在设置 → 上下文中调整阈值/保留比例/摘要上限。后台预压缩是实验功能，默认关闭；它会提前写摘要，未使用的摘要仍计费。
-- 项目处于早期阶段（0.1.0），接口与数据格式仍可能变化。
+- 项目处于早期阶段（0.2.0），接口与数据格式仍可能变化。
 
 ## 压测实验室
 
@@ -503,4 +503,4 @@ cargo run --release -p effibuddy-app --features stress -- --stress 1000         
 
 MIT
 
-运行时分发的 GNU bash（GPLv3+）与 MSYS2 组件按其各自许可证分发：bash 源码见 <https://ftp.gnu.org/gnu/bash/>，MSYS2 包与源码见 <https://repo.msys2.org/>。安装包内的 `BASH-COPYING` / `BASH-VERSION`（Windows 为 `runtime/msys/BASH-VERSION.txt` 与 `usr/share/licenses/`）记录了对应版本与许可证文本。
+运行时分发的 GNU bash（GPLv3+）与 MSYS2 组件按其各自许可证分发：bash 源码见 <https://ftp.gnu.org/gnu/bash/>，MSYS2 包与源码见 <https://repo.msys2.org/>。安装包内的 `BASH-COPYING` / `BASH-VERSION` 记录了对应版本与许可证文本（Windows 位于 `runtime/msys/`，另有 `usr/share/licenses/`）。

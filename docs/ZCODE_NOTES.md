@@ -352,7 +352,7 @@ EffiBuddy 的落地：
 
 | 概念 | 实现 |
 | --- | --- |
-| 预压缩起点 | `CompactionConfig.background_start_percent`（默认 50%，相对窗口），在设置 → 上下文可改；换算时自动压在触发阈值前 5–40 个百分点 |
+| 预压缩起点 | `CompactionConfig.background_start_percent`（默认 50%，相对窗口），在设置 → 上下文可改；换算时自动压在触发阈值前 5–30 个百分点 |
 | 后台任务 | `harness::start_background_compaction` 用 `tokio::spawn` 持有 `Arc<dyn ModelProvider>` + 快照请求 + 取消令牌；不碰 transcript |
 | 持有摘要 | `SessionState.held_compaction: Option<HeldCompaction>`，`#[serde(skip)]`，彻底内存态 |
 | 到点换入 | `apply_held_compaction` 校验模型/provider、`compacted_upto`、边界消息 id、快照后增长 ≤ 40% 阈值 |

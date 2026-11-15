@@ -479,13 +479,13 @@ impl CompactionConfig {
             .max(1);
         // OpenCode's small-window rule: start at most halfway between the
         // post-compaction baseline and the threshold. Expressed as a percentage
-        // of the window, a start more than 40 points before the trigger makes
-        // the held snapshot too stale to swap in.
+        // of the window, starting more than 30 points before the trigger would
+        // make the snapshot exceed the 40%-of-threshold staleness guard.
         let background_pct = self
             .background_start_percent
             .clamp(5.0, 90.0)
             .min(trigger_pct - 5.0)
-            .max((trigger_pct - 40.0).max(5.0));
+            .max((trigger_pct - 30.0).max(5.0));
         let background_start_tokens = ((window as f32 * background_pct / 100.0) as usize)
             .min(trigger_tokens.saturating_sub(1))
             .max(1);

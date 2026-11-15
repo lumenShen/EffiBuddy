@@ -431,7 +431,7 @@ impl AppView {
         )
         .clamp(5.0, 90.0)
         .min(trigger - 5.0)
-        .max((trigger - 40.0).max(5.0));
+        .max((trigger - 30.0).max(5.0));
 
         self.config.compaction = effibuddy_agent_core::CompactionConfig {
             enabled: self.settings.compact_enabled,
@@ -1262,7 +1262,7 @@ impl AppView {
                                 .unwrap_or(self.config.compaction.background_start_percent)
                                 .clamp(5.0, 90.0)
                                 .min(trigger - 5.0)
-                                .max((trigger - 40.0).max(5.0));
+                                .max((trigger - 30.0).max(5.0));
                             let background_tokens =
                                 ((window as f32 * background / 100.0) as usize)
                                     .min(trigger_tokens.saturating_sub(1));

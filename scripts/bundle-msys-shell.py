@@ -57,6 +57,8 @@ PRUNE_DIRS = [
 PRUNE_FILES = [".BUILDINFO", ".MTREE", ".PKGINFO"]
 
 VERSION_SPEC = re.compile(r"[<>=].*$")
+# 包名来自数据库，下载前只接受 MSYS2 的合法文件名形状。
+PACKAGE_NAME = re.compile(r"[A-Za-z0-9._+~-]+\.pkg\.tar\.zst")
 
 # MSYS2 包只给 gcc-libs/ncurses 带了许可证文件；bash/coreutils 等 GNU 组件
 # 统一附一份 GPLv3 文本，满足随二进制分发许可证的要求。
@@ -117,6 +119,8 @@ def load_database() -> dict[str, dict[str, object]]:
             filename = first(fields, "FILENAME")
             if not name or not filename:
                 continue
+            if not PACKAGE_NAME.fullmatch(filename):
+                raise SystemExit(f"unexpected package filename in database: {filename!r}")
             packages[name] = {
                 "filename": filename,
                 "version": first(fields, "VERSION"),

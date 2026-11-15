@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要发布的 tag（如 v0.1.0）。留空则只构建 artifact，不发布 Release。"
+        description: "要发布的 tag（如 v0.2.0）。留空则只构建 artifact，不发布 Release。"
         required: false
         type: string
 
@@ -211,6 +211,15 @@ jobs:
 
       # 随包 bash：解析 MSYS2 实时仓库数据库取当前最新包，逐个校验 sha256
       # 后抽出 runtime\msys；脚本在 Windows 上还会跑一次 bash 冒烟。
+      # runner 通常自带 zstd；缺失时补装，脚本用它解 .pkg.tar.zst。
+      - name: 准备 zstd
+        shell: pwsh
+        run: |
+          if (-not (Get-Command zstd -ErrorAction SilentlyContinue)) {
+            choco install zstd -y --no-progress
+            if ($LASTEXITCODE -notin 0, 3010) { exit $LASTEXITCODE }
+          }
+
       - name: 打包随包 bash（MSYS2）
         run: python scripts/bundle-msys-shell.py runtime/msys
 

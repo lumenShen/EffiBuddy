@@ -514,6 +514,9 @@ pub struct AppView {
     pub(crate) project_menu: ProjectMenuState,
     /// Conversation-row "more" popover (`None` while closed).
     pub(crate) session_menu: SessionMenuState,
+    /// File/link context menu opened from markdown targets (`None` while
+    /// closed). See `file_menu.rs`.
+    pub(crate) link_menu: crate::file_menu::LinkMenuState,
     /// Rename dialog for one conversation (`None` while closed).
     pub(crate) session_rename: Option<SessionRenameState>,
     session_rename_name: Entity<TextInputState>,
@@ -615,6 +618,8 @@ impl AppView {
                 || argument == "--preview-sidepane-files"
                 || argument == "--preview-sidepane-changes"
                 || argument == "--preview-computer"
+                || argument == "--preview-link-menu"
+                || argument == "--preview-open-with"
         });
         let state = if preview_launch {
             models.new_session_state(config.workspace())
@@ -1018,6 +1023,7 @@ impl AppView {
             model_menu: ModelMenuState::default(),
             project_menu: ProjectMenuState::default(),
             session_menu: SessionMenuState::default(),
+            link_menu: crate::file_menu::LinkMenuState::default(),
             session_rename: None,
             session_rename_name,
             session_rename_name_view,
@@ -1101,6 +1107,8 @@ impl AppView {
         }
         if std::env::args().any(|argument| argument == "--preview")
             || std::env::args().any(|argument| argument == "--preview-graph")
+            || std::env::args().any(|argument| argument == "--preview-link-menu")
+            || std::env::args().any(|argument| argument == "--preview-open-with")
         {
             view.seed_preview(cx);
         }
@@ -1210,6 +1218,19 @@ impl AppView {
                 });
             view.project_menu.target = Some(target);
             view.project_menu.position = Some(point(px(240.0), px(300.0)));
+            cx.notify();
+        }
+        if std::env::args().any(|argument| argument == "--preview-link-menu") {
+            view.preview_mode = true;
+            let workspace = view.active_workspace();
+            let path = workspace.join("docs/screenshots/dark-chat.png");
+            view.link_menu.target = Some(crate::file_menu::LinkMenuTarget::File(
+                crate::file_menu::FileTarget::new(path, &workspace),
+            ));
+            view.link_menu.position = Some(point(px(700.0), px(250.0)));
+            if std::env::args().any(|argument| argument == "--preview-open-with") {
+                view.show_open_with(cx);
+            }
             cx.notify();
         }
         if std::env::args().any(|argument| argument == "--settings-archive") {
@@ -1395,7 +1416,7 @@ impl AppView {
 
         let mut final_message = Message::assistant();
         final_message.set_text(
-            "## 结论\n\n`crates/` 下分为 5 个 crate。Rust 文件数量如下：\n\n| crate | .rs 文件 |\n|---|---|\n| agent-core | 9 |\n| agent-tools | 8 |\n| agent-js | 1 |\n| app | 4 |\n| ui | 6 |\n\n核心测试已通过：\n\n```text\ntest result: ok. 15 passed; 0 failed\n```\n\n**下一步**：需要我把这些数字写进 README 的架构章节吗？",
+            "## 结论\n\n`crates/` 下分为 5 个 crate。Rust 文件数量如下：\n\n| crate | .rs 文件 |\n|---|---|\n| agent-core | 9 |\n| agent-tools | 8 |\n| agent-js | 1 |\n| app | 4 |\n| ui | 6 |\n\n核心测试已通过：\n\n```text\ntest result: ok. 15 passed; 0 failed\n```\n\n![dark chat](docs/screenshots/dark-chat.png)\n\n**下一步**：需要我把这些数字写进 README 的架构章节吗？",
         );
         session.push_message(final_message);
 
@@ -4442,6 +4463,7 @@ impl AppView {
         self.collapsed_turns.clear();
         self.clear_message_editing();
         self.chat.reset_session();
+        self.link_menu = crate::file_menu::LinkMenuState::default();
         self.prompt_rail = PromptRailState::default();
         self.jump_flash = None;
         self.jump_flash_seq = 0;
@@ -4692,6 +4714,7 @@ impl AppView {
         self.collapsed_turns.clear();
         self.clear_message_editing();
         self.chat.reset_session();
+        self.link_menu = crate::file_menu::LinkMenuState::default();
         self.prompt_rail = PromptRailState::default();
         self.jump_flash = None;
         self.jump_flash_seq = 0;
@@ -4858,6 +4881,7 @@ impl AppView {
         self.collapsed_turns.clear();
         self.clear_message_editing();
         self.chat.reset_session();
+        self.link_menu = crate::file_menu::LinkMenuState::default();
         self.prompt_rail = PromptRailState::default();
         self.jump_flash = None;
         self.jump_flash_seq = 0;
@@ -7609,6 +7633,7 @@ impl AppView {
                 .into_any_element()
         } else {
             let agent_cards = self.agent_cards();
+            let chat_entity = cx.entity().downgrade();
             let mut view = self.chat.prepare_frame(
                 self.active_run.is_some(),
                 true,
@@ -7617,11 +7642,12 @@ impl AppView {
                 &self.expanded_turns,
                 &self.collapsed_turns,
                 &agent_cards,
+                &chat_entity,
             );
             view.jump_flash = self.jump_flash.clone();
             let view = Rc::new(view);
             let state = self.chat.list_state.clone();
-            let entity = cx.entity().downgrade();
+            let entity = chat_entity;
             let item_theme = theme.clone();
             let rows = list(state, move |index, _window, _cx| {
                 render_chat_item(index, &view, &item_theme, &entity)
@@ -9549,6 +9575,8 @@ impl Render for AppView {
                     this.close_project_menu(cx);
                 } else if this.session_menu.target.is_some() {
                     this.close_session_menu(cx);
+                } else if this.link_menu.target.is_some() {
+                    this.close_link_menu(cx);
                 } else if this.session_rename.is_some() {
                     this.close_session_rename(window, cx);
                 } else if this.project_editor.is_some() {
@@ -9647,6 +9675,9 @@ impl Render for AppView {
                 element.child(menu)
             })
             .when_some(self.render_session_menu(window, cx), |element, menu| {
+                element.child(menu)
+            })
+            .when_some(self.render_link_menu(window, cx), |element, menu| {
                 element.child(menu)
             })
             .when_some(self.render_project_editor(window, cx), |element, editor| {

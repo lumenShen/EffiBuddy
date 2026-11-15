@@ -2336,6 +2336,7 @@ impl AppView {
 
         let body = if let Some(view) = self.side.agent_views.get_mut(&agent_id) {
             let cards: HashMap<String, AgentCard> = HashMap::new();
+            let entity = cx.entity().downgrade();
             let view_state = Rc::new(view.chat.prepare_frame(
                 running,
                 false,
@@ -2344,9 +2345,9 @@ impl AppView {
                 &self.expanded_turns,
                 &self.collapsed_turns,
                 &cards,
+                &entity,
             ));
             let state = view.chat.list_state.clone();
-            let entity = cx.entity().downgrade();
             let item_theme = theme.clone();
             let rows = gpui::list(state, move |index, _window, _cx| {
                 render_chat_item(index, &view_state, &item_theme, &entity)

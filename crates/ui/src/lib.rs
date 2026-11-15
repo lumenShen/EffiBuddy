@@ -17,8 +17,10 @@ pub mod theme;
 pub use assets::{EffiBuddyAssets, icons, images};
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
 pub use markdown::{
-    chunk_ranges, markdown_cache_hits, markdown_inline, markdown_source_key, render_markdown,
-    render_markdown_chunk, render_markdown_keyed, render_markdown_streaming,
+    MarkdownInteraction, MarkdownTarget, chunk_ranges, markdown_cache_hits, markdown_inline,
+    markdown_source_key, render_markdown, render_markdown_chunk, render_markdown_chunk_with,
+    render_markdown_keyed, render_markdown_keyed_with, render_markdown_streaming,
+    render_markdown_streaming_with,
 };
 pub use motion::{
     CONTROL_MOTION, CubicBezier, Easing, MotionController, MotionFrame, MotionId, MotionItem,

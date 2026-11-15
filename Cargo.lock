@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-agent-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1698,7 +1698,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-agent-js"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "boa_engine",
@@ -1710,7 +1710,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-agent-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -1728,7 +1728,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1752,7 +1752,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-computer"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ashpd 0.12.3",
  "async-trait",
@@ -1770,7 +1770,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-stress"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "effibuddy-agent-core",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "effibuddy-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "gpui",

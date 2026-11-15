@@ -77,7 +77,10 @@ impl ShellSpec {
     }
 
     fn from_override() -> Option<Self> {
-        let raw = std::env::var(SHELL_ENV).ok()?;
+        Self::spec_for_override(&std::env::var(SHELL_ENV).ok()?)
+    }
+
+    fn spec_for_override(raw: &str) -> Option<Self> {
         let raw = raw.trim();
         if raw.is_empty() {
             return None;
@@ -191,6 +194,14 @@ fn windows_bash_spec(program: PathBuf, bundled: bool) -> ShellSpec {
         });
     if !joined.is_empty() {
         env.push(("PATH".to_string(), joined));
+    }
+    // Without /etc/passwd the runtime synthesizes an account entry whose home
+    // directory may not exist; pointing HOME at the real Windows profile keeps
+    // `~` and git's global config working.
+    if std::env::var_os("HOME").is_none() {
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            env.push(("HOME".to_string(), profile.to_string_lossy().into_owned()));
+        }
     }
     ShellSpec {
         program,
@@ -417,6 +428,22 @@ mod tests {
         );
         #[cfg(not(windows))]
         assert_eq!(spec.args, vec!["-lc".to_string()]);
+    }
+
+    #[test]
+    fn override_requires_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let bash = directory.path().join("bash");
+        std::fs::write(&bash, b"").unwrap();
+
+        assert_eq!(ShellSpec::spec_for_override("   "), None);
+        assert_eq!(
+            ShellSpec::spec_for_override("/definitely/missing/bash"),
+            None
+        );
+        let spec = ShellSpec::spec_for_override(&bash.to_string_lossy()).unwrap();
+        assert_eq!(spec.program, bash);
+        assert!(!spec.bundled);
     }
 
     #[cfg(windows)]

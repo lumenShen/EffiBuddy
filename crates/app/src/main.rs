@@ -12,6 +12,7 @@ mod config;
 mod context_meter;
 mod draft_store;
 mod events;
+mod file_menu;
 mod graph;
 mod model_config;
 mod model_picker;
