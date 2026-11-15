@@ -122,23 +122,58 @@ pub async fn fetch_latest(client: &reqwest::Client) -> Result<Option<UpdateInfo>
 
 /// Prefer the installer for the current platform, fall back to the portable
 /// archive. Names come from the release workflow, so the suffixes are stable.
+/// On Linux the installer preference follows the distro family (rpm vs deb).
 fn pick_asset(assets: &[ReleaseAsset]) -> Option<String> {
-    pick_asset_for(cfg!(target_os = "windows"), assets)
+    pick_asset_for(cfg!(target_os = "windows"), linux_prefers_rpm(), assets)
 }
 
-fn pick_asset_for(windows: bool, assets: &[ReleaseAsset]) -> Option<String> {
-    let matchers: &[fn(&str) -> bool] = if windows {
-        &[
-            |name: &str| name.ends_with("-windows-x86_64-setup.exe"),
-            |name: &str| name.ends_with("-windows-x86_64.zip"),
-        ]
-    } else {
-        &[
-            |name: &str| name.ends_with("_amd64.deb"),
-            |name: &str| name.ends_with("-linux-x86_64.tar.gz"),
-        ]
+/// Fedora/RHEL/SUSE 安装 .rpm，Debian/Ubuntu 安装 .deb；识别不到发行版时
+/// 以 deb 优先（桌面 Linux 用户的大多数）。
+fn linux_prefers_rpm() -> bool {
+    let Ok(content) = std::fs::read_to_string("/etc/os-release") else {
+        return false;
     };
-    for matcher in matchers {
+    os_release_prefers_rpm(&content)
+}
+
+fn os_release_prefers_rpm(content: &str) -> bool {
+    const RPM_IDS: [&str; 7] = ["fedora", "rhel", "centos", "rocky", "almalinux", "sles", "opensuse"];
+    content.lines().any(|line| {
+        line.strip_prefix("ID=")
+            .map(|id| id.trim().trim_matches('"'))
+            .is_some_and(|id| RPM_IDS.iter().any(|known| id.starts_with(known)))
+    })
+}
+
+fn is_windows_setup(name: &str) -> bool {
+    name.ends_with("-windows-x86_64-setup.exe")
+}
+
+fn is_windows_zip(name: &str) -> bool {
+    name.ends_with("-windows-x86_64.zip")
+}
+
+fn is_deb(name: &str) -> bool {
+    name.ends_with("_amd64.deb")
+}
+
+fn is_rpm(name: &str) -> bool {
+    name.ends_with(".x86_64.rpm")
+}
+
+fn is_linux_tar(name: &str) -> bool {
+    name.ends_with("-linux-x86_64.tar.gz")
+}
+
+fn pick_asset_for(windows: bool, prefer_rpm: bool, assets: &[ReleaseAsset]) -> Option<String> {
+    let matchers: Vec<fn(&str) -> bool> = if windows {
+        vec![is_windows_setup, is_windows_zip]
+    } else if prefer_rpm {
+        vec![is_rpm, is_deb, is_linux_tar]
+    } else {
+        vec![is_deb, is_rpm, is_linux_tar]
+    };
+    for matcher in &matchers {
         if let Some(asset) = assets.iter().find(|asset| matcher(&asset.name)) {
             return Some(asset.browser_download_url.clone());
         }
@@ -209,27 +244,52 @@ mod tests {
         let assets = vec![
             asset("EffiBuddy-0.2.0-linux-x86_64.tar.gz"),
             asset("effibuddy_0.2.0_amd64.deb"),
+            asset("effibuddy-0.2.0-1.x86_64.rpm"),
             asset("EffiBuddy-0.2.0-windows-x86_64.zip"),
             asset("EffiBuddy-0.2.0-windows-x86_64-setup.exe"),
             asset("source.tar.gz"),
         ];
-        let windows = pick_asset_for(true, &assets);
+        let windows = pick_asset_for(true, false, &assets);
         assert_eq!(
             windows.as_deref(),
             Some("https://example.com/EffiBuddy-0.2.0-windows-x86_64-setup.exe")
         );
-        let linux = pick_asset_for(false, &assets);
+        let deb_first = pick_asset_for(false, false, &assets);
         assert_eq!(
-            linux.as_deref(),
+            deb_first.as_deref(),
             Some("https://example.com/effibuddy_0.2.0_amd64.deb")
+        );
+        let rpm_first = pick_asset_for(false, true, &assets);
+        assert_eq!(
+            rpm_first.as_deref(),
+            Some("https://example.com/effibuddy-0.2.0-1.x86_64.rpm")
         );
     }
 
     #[test]
     fn pick_asset_falls_back_to_archive() {
         let assets = vec![asset("EffiBuddy-0.2.0-windows-x86_64.zip")];
-        assert!(pick_asset_for(true, &assets).is_some());
-        assert!(pick_asset_for(false, &assets).is_none());
+        assert!(pick_asset_for(true, false, &assets).is_some());
+        assert!(pick_asset_for(false, false, &assets).is_none());
+        // 只有 rpm 可用时，deb 优先的发行版也会退而求其次。
+        let rpm_only = vec![asset("effibuddy-0.2.0-1.fc45.x86_64.rpm")];
+        assert!(pick_asset_for(false, false, &rpm_only).is_some());
+    }
+
+    #[test]
+    fn os_release_detects_rpm_family() {
+        assert!(os_release_prefers_rpm(
+            "NAME=\"Fedora Linux\"\nID=fedora\nID_LIKE=\"rhel\"\n"
+        ));
+        assert!(os_release_prefers_rpm(
+            "NAME=\"openSUSE Tumbleweed\"\nID=opensuse-tumbleweed\n"
+        ));
+        assert!(!os_release_prefers_rpm(
+            "PRETTY_NAME=\"Ubuntu 24.04\"\nID=ubuntu\nID_LIKE=debian\n"
+        ));
+        assert!(!os_release_prefers_rpm("ID=debian\n"));
+        // ID_LIKE 不参与判定（发行版以 ID 为准）。
+        assert!(!os_release_prefers_rpm("ID=arch\nID_LIKE=\"rhel fedora\"\n"));
     }
 
     #[test]
