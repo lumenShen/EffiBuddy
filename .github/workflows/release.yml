@@ -121,7 +121,7 @@ jobs:
           Terminal=false
           Categories=Development;
           EOF
-          dpkg-deb --build --root-owner-group "$root"
+          dpkg-deb --build --root-owner-group "$root" "effibuddy_${VERSION}_amd64.deb"
 
       - uses: actions/upload-artifact@v4
         with:
