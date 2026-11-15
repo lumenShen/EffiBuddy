@@ -24,6 +24,13 @@ case "$mode" in
         ;;
 esac
 
+# Resolve the destination before cd'ing into the extracted build tree; CI
+# passes a relative path (`runtime`) and the copy happens much later.
+case "$dest" in
+    /*) ;;
+    *) dest="$(pwd)/$dest" ;;
+esac
+
 download() {
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$1"
