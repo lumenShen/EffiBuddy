@@ -48,11 +48,103 @@ impl RunStatus {
     }
 }
 
+/// Why a compaction ran. Kept in the record so the UI and transcripts can
+/// distinguish proactive threshold compaction from the rescue path used after
+/// a provider rejected an oversized request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    #[default]
+    Auto,
+    Reactive,
+}
+
+/// Where the summary text came from. Model summaries are the normal path;
+/// `Heuristic` marks the offline fallback used when the summary request itself
+/// fails, so a later reader does not mistake it for a full-fidelity summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SummarySource {
+    #[default]
+    Heuristic,
+    Model,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompactionRecord {
     pub summary: String,
+    /// Index in `messages` up to which the summary replaces the transcript.
     pub compacted_messages: usize,
     pub at: DateTime<Utc>,
+    #[serde(default)]
+    pub trigger: CompactionTrigger,
+    #[serde(default)]
+    pub summary_source: SummarySource,
+    /// Estimated request tokens immediately before and after this compaction.
+    #[serde(default)]
+    pub pre_tokens: usize,
+    #[serde(default)]
+    pub post_tokens: usize,
+    /// Messages covered by this summary and messages kept verbatim.
+    #[serde(default)]
+    pub summarized_messages: usize,
+    #[serde(default)]
+    pub kept_messages: usize,
+    /// Token threshold that was in force when this compaction ran.
+    #[serde(default)]
+    pub auto_threshold: usize,
+}
+
+impl CompactionRecord {
+    pub fn source_label(&self) -> &'static str {
+        match self.summary_source {
+            SummarySource::Model => "model",
+            SummarySource::Heuristic => "heuristic",
+        }
+    }
+}
+
+/// State of a summary that is being written ahead of the compaction threshold
+/// (OpenCode's "background compaction").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HeldCompactionStatus {
+    #[default]
+    Writing,
+    Ready,
+    Failed,
+}
+
+/// A summary generated from an earlier transcript snapshot. It is held in
+/// memory without touching the request window until compaction is due, then
+/// swapped in if the snapshot is still valid. Never serialized: it is derived
+/// work, and a restart simply starts a new summary.
+#[derive(Debug, Clone)]
+pub struct HeldCompaction {
+    /// Runtime id used to discard results from a superseded task.
+    pub id: String,
+    pub status: HeldCompactionStatus,
+    pub summary: Option<String>,
+    pub start: usize,
+    pub boundary: usize,
+    pub boundary_id: String,
+    pub summarized_messages: usize,
+    pub kept_messages: usize,
+    /// Request estimate when the snapshot was taken, used to detect a summary
+    /// that has become too stale to swap in.
+    pub pre_tokens: usize,
+    pub model: String,
+    pub provider_id: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
+impl HeldCompaction {
+    pub fn is_ready(&self) -> bool {
+        self.status == HeldCompactionStatus::Ready
+            && self
+                .summary
+                .as_deref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +218,16 @@ pub struct SessionState {
     /// summary instead of being sent to the model.
     #[serde(default)]
     pub compacted_upto: usize,
+    /// Tool call ids whose result body is replaced with a short placeholder on
+    /// the wire. The transcript keeps the original output for the UI; only the
+    /// next request is shrunk. This is ZCode's microcompact stage, run before a
+    /// full model summary when tool output dominates the context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cleared_tool_calls: Vec<String>,
+    /// Background-compaction snapshot. Memory only: a held summary is derived
+    /// work and is silently dropped on restart, matching OpenCode.
+    #[serde(skip)]
+    pub held_compaction: Option<HeldCompaction>,
     #[serde(default)]
     pub status: RunStatus,
     #[serde(default)]
@@ -134,6 +236,10 @@ pub struct SessionState {
     pub steps: usize,
     #[serde(default)]
     pub pinned: bool,
+    /// UI hint set from the sidebar's “标为未读” action and cleared when the
+    /// conversation is opened. Never sent to the model or counted as work.
+    #[serde(default)]
+    pub unread: bool,
     /// Archived conversations leave the sidebar and only appear in
     /// Settings → 归档. Archiving marks the conversation as finished work.
     #[serde(default)]
@@ -144,6 +250,11 @@ pub struct SessionState {
     /// transcripts without the key can be migrated to their `cwd` project.
     #[serde(default)]
     pub project: Option<PathBuf>,
+    /// Stable id of the project (see `projects.json`). New conversations set
+    /// this together with `project`; legacy transcripts only have the path and
+    /// are grouped by resolving it against the project roots.
+    #[serde(default)]
+    pub project_id: Option<String>,
     /// Global permission mode for this conversation (`default`, `accept_edits`,
     /// `plan`, `full_access`). Cycled with Shift+Tab in the UI; the approval
     /// gate reads it on every tool call. Old transcripts default to
@@ -204,12 +315,16 @@ impl SessionState {
             usage: Usage::default(),
             compaction: None,
             compacted_upto: 0,
+            cleared_tool_calls: Vec::new(),
+            held_compaction: None,
             status: RunStatus::Idle,
             last_error: None,
             steps: 0,
             pinned: false,
+            unread: false,
             archived: false,
             project: None,
+            project_id: None,
             permission_mode: PermissionMode::default(),
             parent_id: None,
             agent_name: None,
@@ -233,9 +348,22 @@ impl SessionState {
         model: impl Into<String>,
         reasoning_level: Option<String>,
     ) {
-        self.provider_id = Some(provider_id.into());
-        self.model = model.into();
+        let provider_id = provider_id.into();
+        let model = model.into();
+        let changed =
+            self.provider_id.as_deref() != Some(provider_id.as_str()) || self.model != model;
+        self.provider_id = Some(provider_id);
+        self.model = model;
         self.reasoning_level = reasoning_level;
+        if changed {
+            // The reported footprint belongs to the previous model's context
+            // window; keeping it would make the next compaction decision
+            // compare tokens from one tokenizer against another model's window.
+            self.usage.last_prompt_tokens = 0;
+            // A summary written by the previous model cannot be swapped into a
+            // request served by a different model.
+            self.held_compaction = None;
+        }
         self.touch();
     }
 
@@ -249,7 +377,15 @@ impl SessionState {
 
     pub fn push_message(&mut self, message: Message) {
         if message.role == Role::User {
-            self.maybe_set_title(&message.text());
+            let text = message.text();
+            if text.trim().is_empty() {
+                // An attachment-only first message still deserves a title.
+                if let Some(attachment) = message.attachments.first() {
+                    self.maybe_set_title(&format!("附件 · {}", attachment.name));
+                }
+            } else {
+                self.maybe_set_title(&text);
+            }
         }
         self.message_index
             .insert(message.id.clone(), self.messages.len());
@@ -360,11 +496,20 @@ impl SessionState {
             self.compacted_upto = 0;
             self.compaction = None;
         }
+        // The snapshot a held summary was built from no longer exists.
+        self.held_compaction = None;
         self.steps = 0;
         // The current context footprint no longer describes this transcript.
         // Cumulative billing counters stay untouched; only the context-ring
         // value resets until the next model request reports a fresh one.
         self.usage.last_prompt_tokens = 0;
+        // Cleared ids for messages that no longer exist can never match a
+        // future tool call; drop them instead of letting the list grow.
+        self.cleared_tool_calls.retain(|call_id| {
+            self.messages[..index]
+                .iter()
+                .any(|message| message.tool_result().is_some_and(|r| &r.call_id == call_id))
+        });
         self.rebuild_message_index();
         self.touch();
         removed
@@ -429,8 +574,15 @@ impl SessionState {
     pub fn normalize_after_load(&mut self) {
         self.status = RunStatus::Idle;
         self.updated_at = Utc::now();
+        // Held summaries are in-memory only; a loaded session starts clean.
+        self.held_compaction = None;
         self.repair_dangling_tool_calls();
         self.rebuild_message_index();
+        self.cleared_tool_calls.retain(|call_id| {
+            self.messages
+                .iter()
+                .any(|message| message.tool_result().is_some_and(|r| &r.call_id == call_id))
+        });
     }
 
     fn rebuild_message_index(&mut self) {

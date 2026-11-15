@@ -781,6 +781,94 @@ impl Element for MotionItem {
     }
 }
 
+/// 绘制期把子元素整体平移 `offset`，布局与尺寸完全不动。
+///
+/// 与 [`MotionItem`] 同一套机制（prepaint 时注入 element offset），但偏移量
+/// 由调用方随帧给定，没有内部时钟——适合跑马灯这类由应用状态驱动的循环
+/// 位移：每帧重渲染时换一个 offset 即可，不触发 taffy 重排或文本重排。
+pub struct PaintShift {
+    offset: Point<Pixels>,
+    child: Option<AnyElement>,
+}
+
+impl PaintShift {
+    pub fn new(offset: Point<Pixels>, child: impl IntoElement) -> Self {
+        Self {
+            offset,
+            child: Some(child.into_any_element()),
+        }
+    }
+}
+
+impl IntoElement for PaintShift {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for PaintShift {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let layout_id = self
+            .child
+            .as_mut()
+            .expect("PaintShift must only be used once")
+            .request_layout(window, cx);
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        window.with_element_offset(self.offset, |window| {
+            self.child
+                .as_mut()
+                .expect("PaintShift must only be used once")
+                .prepaint(window, cx);
+        });
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child
+            .as_mut()
+            .expect("PaintShift must only be used once")
+            .paint(window, cx);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

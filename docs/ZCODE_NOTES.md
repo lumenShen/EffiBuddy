@@ -89,7 +89,7 @@ ZCode 的模型配置不是“一个 Base URL + 一个模型”，而是一份�
 | 设置页左侧 Provider 导航 + 右侧详情 | 设置 → 模型：供应商列表 + 连接/模型详情 |
 | Composer Provider/Model 菜单 | 输入框模型 chip → 供应商切换 + 模型列表 + 推理档位 |
 | 每会话模型选择 | `SessionState.provider_id/model/reasoning_level`；子代理继承父选择 |
-| 右侧 Side Pane：tab bar、overview、recent closed、resizable | `app/side_pane.rs`：计划/子代理/子会话/文件/变更页签 + 总览搜索 + 最近关闭 + 宽度拖拽 |
+| 右侧 Side Pane：tab bar、overview、recent closed、resizable | `app/side_pane.rs`：概览（计划 + 用量详情）/子代理/子会话/文件/变更页签 + 总览搜索 + 最近关闭 + 宽度拖拽 |
 
 刻意没做的：OAuth / Coding Plan 账号体系、Provider 模板市场、模型能力自动探测、跨进程 provider 注册表热更新。`providers.json` 是单进程本地文件，写入是原子的；损坏时保留原文件、回退内置配置并在设置页提示。
 
@@ -289,3 +289,75 @@ EffiBuddy v1 的取舍：
 - **wake 预算**（DSH `maxConsecutiveWakes`）：EffiBuddy 的唤醒只来自用户排队消息与后台子代理通知，后者已有「等父 turn 结束」的闸门，自激链条暂无成型路径。
 
 验证：`cargo test --workspace` 全绿（agent-core 88，含新增 steer 三个回归：工具执行中注入、纯文本回合延长、中断回收）；`update.rs` 的 `pick_asset_for` 三参数化属并行改动，未触碰。
+
+## 11. 多文件夹项目（本次模块）
+
+参考：ZCode 的 virtual project 设计（`docs/superpowers/specs/2026-09-09-virtual-project-design.md`、`packages/services/src/project-storage/`、`packages/ui/src/project-sidebar/`）。
+
+ZCode 的核心决策，以及 EffiBuddy 的落地方式：
+
+| ZCode 决策 | EffiBuddy 落地 |
+| --- | --- |
+| 项目是具名容器，含有序 `roots[]`（`isPrimary`），不是单个路径 | `app/project_store.rs`：`Project { id, name, roots: [{ path, is_primary }] }`，持久化到 `<数据根目录>/projects.json`（schema_version + 原子写） |
+| 会话按 `project_id` 分组，分组键绝不使用路径（同一文件夹可属于多个项目） | `SessionState.project_id` 精确归属；旧会话的 `project` 路径保留为迁移种子，按项目根匹配兜底，未匹配时渲染临时 legacy 分组 |
+| 新会话 cwd 固定为该项目的**主**根，创建后不可变 | `new_session_in_project(project_id)` → `cwd = primary`；编辑根的后续变化不改写任何会话 |
+| 其余 roots 作为 `additionalDirectories` 交给 agent | `HarnessConfig.additional_workspaces` → `ToolContext.additional_workspaces` → `SubagentRequest` → `Workspace::with_roots`；系统提示列出附加目录 |
+| 相对路径锚定 cwd；工具可读写全部 roots | `Workspace` 多根：相对路径锚定主根，绝对路径允许落在任一根；展示路径主根内相对、附加根内绝对 |
+| AGENTS.md/config/git 只认会话 cwd，不扫附加目录 | `project_instructions_for(session.cwd)`；文件树、git、项目级 `.effibuddy/agents` 仍跟随 cwd（ZCode 对齐） |
+| 文件树按根打开；多根项目显示 `Folders` 图标与按根菜单 | 侧栏项目行 `+N` 徽标 + 全部根路径 tooltip；项目菜单按根生成「打开：<文件夹>」；完整的合并文件树刻意不做 |
+| 项目编辑：草稿根列表 + 主根 + 多选目录选择器，保存时整体替换 | 项目菜单 →「管理文件夹…」弹窗：改名、多选添加、移除、设为主文件夹；「+」按钮直接多选文件夹新建项目（第一个为主根） |
+| 软删除项目，保留会话归属与历史 | EffiBuddy 只在「无任何会话引用」时允许移除；`projects.json` 丢失时启动对账按会话路径重建项目，历史不消失 |
+
+刻意没做的（后续迭代）：
+
+- 会话拖拽换项目、项目置顶/手动排序、项目重名唯一化之外的命名规则。
+- 多根合并文件树与多仓 git 汇总（ZCode 同样按单根打开）。
+- 项目级 agents 扫描全部根（ZCode 对 skills/commands 扫全部根，对 AGENTS.md 只扫 cwd；EffiBuddy 一期统一只扫 cwd）。
+- 远程主机 / `hostId` / 项目删除恢复（单机桌面应用不需要）。
+
+验证：`cargo test --workspace` 全绿；新增 project_store 迁移/去重/主根提升/会话解析测试与 Workspace 多根读写/越界拒绝测试。
+
+## 12. 上下文压缩：从用户轮次启发式摘要到 ZCode 链路
+
+参考：`apps/zcode-cli/packages/core/src/compact/{policy,manual,microcompact,prompt}.ts` 与 `runtime/methods/{compact,turn-loop}.ts`。
+
+ZCode 的关键做法与 EffiBuddy 的落地：
+
+| ZCode 决策 | EffiBuddy 落地 |
+| --- | --- |
+| 有效窗口 = context window − 输出预留；阈值 = 有效窗口 − buffer | `CompactionConfig::thresholds` 用百分比算出触发/保留/摘要预算，并扣掉 `max_tokens`（上限为窗口 1/4） |
+| 每个模型步都检查，而不只在用户回合开始 | `run_loop` 每步调用 `compact_if_needed`；round 以 user/assistant 消息切分，长工具回合可压缩 |
+| 先 microcompact：清空旧工具结果，保留最近 N 条 | `microcompact_tool_results` 只清 read/grep/list/shell/write/edit/run_js，保护错误、图片与最近结果；`cleared_tool_calls` 只影响 wire，transcript/UI 保留原文 |
+| 摘要由模型生成，带 `<analysis>` / `<summary>` 结构与“禁止调用工具”提示 | `COMPACTION_SYSTEM_PROMPT` + `build_compaction_request`（纯文本 transcript、无工具、无图片）；`format_compaction_summary` 解析 |
+| 保留最近 1 轮、摘要请求失败有重试/熔断 | 保留预算按窗口百分比；失败回退本地摘录并计失败次数，达到上限只走本地摘录 |
+| 用 provider usage 校准估算；overflow 后 reactive compact | `max(本地估算含工具 schema, last_prompt_tokens)`；`ProviderError::is_context_overflow` → 强制压缩并重试一次 |
+| 压缩边界不能让 tool result 失去 assistant | 边界取 round 起点，跳过孤立 tool result，并要求摘要区间至少包含一个 assistant |
+
+设置 → 上下文：自动压缩开关、触发阈值（%）、保留最近（%）、摘要上限（%）、旧工具输出清理与保留条数。全部百分比都相对当前模型窗口，切换模型自动换算。
+
+刻意没做：独立压缩模型、`/compact` 手动命令、按 prompt-too-long 报错逐步丢弃最老 round 的多轮重试、microcompact 的空闲时间触发（ZCode 的 idle trigger）。
+
+## 13. 并行压缩：OpenCode background compaction
+
+参考：<https://opencode.ai/docs/compaction#background-compaction>、`packages/core/src/session/compaction.ts`、`packages/opencode/src/session/compaction.ts`（本地 checkout 2026-08-05，后台开关晚于该快照，按文档实现）。
+
+OpenCode 的规则：
+
+- 阈值前约 60k token（小窗口取“上次压缩后到阈值”的中点之前）开始后台摘要；主会话继续运行，摘要先扣住不生效。
+- 到阈值时换入摘要，快照点之后的对话原样保留；摘要未写完就等待。
+- 快照后新增量超过阈值约 40%，或模型/指令/历史起点变化，则丢弃摘要走正常压缩。
+- 预生成摘要只驻留内存；未使用的摘要仍计费。
+
+EffiBuddy 的落地：
+
+| 概念 | 实现 |
+| --- | --- |
+| 预压缩起点 | `CompactionConfig.background_start_percent`（默认 50%，相对窗口），在设置 → 上下文可改；换算时自动压在触发阈值前 5–40 个百分点 |
+| 后台任务 | `harness::start_background_compaction` 用 `tokio::spawn` 持有 `Arc<dyn ModelProvider>` + 快照请求 + 取消令牌；不碰 transcript |
+| 持有摘要 | `SessionState.held_compaction: Option<HeldCompaction>`，`#[serde(skip)]`，彻底内存态 |
+| 到点换入 | `apply_held_compaction` 校验模型/provider、`compacted_upto`、边界消息 id、快照后增长 ≤ 40% 阈值 |
+| 未写完 | 最多等 15 秒，之后丢弃并走前台压缩；任务完成但 id 已失效则静默丢弃 |
+| 失效 | 换模型、`truncate_from`、加载会话都会清空；超过 5 分钟仍 Writing 视为 stale |
+| 默认 | 关闭（实验开关，避免未使用摘要的 token 成本） |
+
+刻意没做：摘要请求复用主请求 prompt cache（我们的摘要把 transcript 渲染成纯文本请求，命中率不如 OpenCode）、独立 compaction agent/模型、native provider compaction。

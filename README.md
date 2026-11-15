@@ -4,7 +4,7 @@
 
 ![Rust](https://img.shields.io/badge/Rust-1.90%2B-000000?logo=rust)
 ![GPUI](https://img.shields.io/badge/UI-GPUI-18181B)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-0078D4?logo=windows)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0078D4?logo=windows)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Tests](https://img.shields.io/badge/tests-242%20offline-brightgreen)
 
@@ -34,9 +34,11 @@
 ## 亮点
 
 - **原生桌面 UI（GPUI）**：无 WebView。自绘标题栏、可折叠（`Ctrl+B`）为图标栏的会话侧栏、聊天流、紧凑工具行、可关闭/重开/搜索的右侧页签侧栏、设置页、Markdown 渲染、多行输入框与 IME 支持。
+- **自带 bash 运行时**：发布包随附 bash——Linux 是 musl 静态二进制，macOS 由最新 GNU bash 源码构建，Windows 是 MSYS2 bash + coreutils / findutils / grep / sed / awk 等常用工具。`shell` 工具统一用它执行命令，每次 release 构建时自动拉取上游最新版本；开发构建找不到运行时时回退 `sh -lc` / `cmd /C`，也可用 `EFFIBUDDY_SHELL` 指定。
+- **输入框快捷引用**：输入 `/` 打开技能 / 工具 / 子智能体菜单（`$` 只看技能），输入 `@` 搜索工作区文件或子智能体；↑↓ 选择、Enter/Tab 插入、Esc 关闭。把文件直接拖进会话（或点输入框左下角 `+`）会生成附件 chip：文本内联进请求、图片作为原生图片块、其它文件保留路径供工具读取。外部图片还会在工作区 `.effibuddy/attachments/` 留一份内容寻址的副本，后续步骤可以再次查看或用 shell 工具处理。技能按 `<数据目录>/skills/<name>/SKILL.md` 与 `<工作区>/.effibuddy/skills/<name>/SKILL.md` 发现，项目技能覆盖同名用户技能，激活时整份技能说明随消息发送。
 - **ZCode 风格的聊天流**：虚拟列表只布局可视区域；流式回答按帧平滑吐字并带光标；思考与工具调用以紧凑活动行呈现，连续工具调用自动分组；右上状态胶囊与上下文仪表；`Ctrl K` 命令面板；自动吸底，上滚时暂停跟随并浮出「回到底部」按钮。
 - **消息编辑与撤销（无 Git 检查点）**：hover 用户消息可复制、编辑或撤销。编辑会把原文放回输入框，发送时从该消息重开对话并还原本轮文件改动；撤销需要二级确认，逐项列出将还原 / 无法安全还原 / 无法追踪的文件，并明确提示操作不可恢复。检查点在工具写入前按用户轮次捕获，保存在本地数据目录，全程不读取或创建 Git 仓库状态。
-- **完整的 agent loop**：持久 transcript、step = 模型调用 + 工具调用、无步数上限（持续运行直到模型不再请求工具）、可中断、四档权限模式（Shift+Tab 循环：默认询问 / 自动编辑 / 计划模式 / 完全访问）与工具审批、超时/panic 隔离、输出截断、只在可见输出前重试、按用户轮次滚动压缩上下文、reasoning 与正文分离。
+- **完整的 agent loop**：持久 transcript、step = 模型调用 + 工具调用、无步数上限（持续运行直到模型不再请求工具）、可中断、四档权限模式（Shift+Tab 循环：默认询问 / 自动编辑 / 计划模式 / 完全访问）与工具审批、超时/panic 隔离、输出截断、只在可见输出前重试、按上下文窗口百分比滚动压缩（模型摘要 + 旧工具输出清理 + overflow 重试 + 可选后台预压缩）、reasoning 与正文分离。
 - **Computer Use（桌面读图与键鼠）**：主代理可截图、找窗口、模拟鼠标键盘；窗口/全屏画面以 `frame_id` 绑定坐标，动作后重新观察。默认“会话内准许”授权，首次使用弹审批卡；运行时显示顶部悬浮条，可随时“接管操作 / 我帮你点好了 / 停止操作”。X11 支持窗口级读图与专用 EWMH 工作区，Windows 使用 PrintWindow + 后台停车位，Wayland 通过 portal 支持全屏读图与键鼠。
 - **代理网络**：子代理可命名、可自定义提示词/工具、可继续派生孙代理；`agent_send` / `agent_list` 支持代理间文本与结构化数据；每个代理对象可选私有（仅创建者）或公开（会话内可复用），只读父代理不会派生出可写子代理。
 - **智能体组与关系图**：`workflow_run` 用 JSON 或 JavaScript builder 定义带类型化输入/输出契约的 DAG（支持批量输入）；标题栏「智能体关系图」提供可平移缩放的画布、委派/消息/数据连线、组框与节点检查器。
@@ -54,7 +56,7 @@
 
 | 依赖 | 要求 |
 | --- | --- |
-| 系统 | Windows 10/11 x64；Linux（X11 完整能力，Wayland 全屏能力） |
+| 系统 | Windows 10/11 x64；Linux（X11 完整能力，Wayland 全屏能力）；macOS 12+ Apple Silicon（发布包） |
 | Rust | 1.90+（Windows 使用 MSVC 工具链；Linux 使用发行版 Rust） |
 | C++ 构建工具 | Windows 需要 Visual Studio 2022 Build Tools，勾选「使用 C++ 的桌面开发」与 Windows SDK |
 | Linux 依赖 | X11 需要 `libxcb`/`libxkbcommon`；Wayland 需要 xdg-desktop-portal（GNOME/KDE 均可） |
@@ -104,7 +106,7 @@ Key 的解析顺序：
 
 ### 项目指令
 
-工作区根目录下的 `AGENTS.md`、`EFFIBUDDY.md`、`CLAUDE.md` 会被自动读取（每个最多 12,000 字符），作为项目级指令附加到系统提示中。
+会话工作区（项目会话即其主文件夹）下的 `AGENTS.md`、`EFFIBUDDY.md`、`CLAUDE.md` 会被自动读取（每个最多 12,000 字符），作为项目级指令附加到系统提示中。项目的其他文件夹不会参与指令扫描；普通「任务」使用设置页配置的全局工作区。
 
 ### 快捷键
 
@@ -137,6 +139,7 @@ cargo run -p effibuddy-app -- --preview --preview-models    # 模型供应商设
 cargo run -p effibuddy-app -- --preview --preview-sidepane-files    # 右侧「文件」页签
 cargo run -p effibuddy-app -- --preview --preview-sidepane-changes  # 右侧「变更」页签
 cargo run -p effibuddy-app -- --preview-composer            # 输入框塞入超长文本，验证裁剪与滚动
+cargo run -p effibuddy-app -- --preview-composer-menu       # 打开 @ 文件/子智能体菜单，并预置一个文件附件
 cargo run -p effibuddy-app -- --preview-computer             # 电脑操作悬浮条 + 输入框提示（FakeBackend）
 cargo run -p effibuddy-app -- --preview-empty                # 空状态 / 欢迎页
 cargo run -p effibuddy-app -- --settings                     # 直接打开设置页
@@ -157,12 +160,21 @@ Wayland 首次截图会触发 xdg-desktop-portal 的屏幕读取授权；输入�
 
 ## 发布与更新
 
-发布由 GitHub Actions 全自动完成（[.github/workflows/release.yml](.github/workflows/release.yml)）：推送 `v*` tag（或在 Actions 页手动触发并填 tag）即启动 Windows + Linux 双平台构建，全部成功后自动把产物上传到 [Releases](https://github.com/lumenShen/EffiBuddy/releases)：
+发布由 GitHub Actions 全自动完成（[.github/workflows/release.yml](.github/workflows/release.yml)）：推送 `v*` tag（或在 Actions 页手动触发并填 tag）即启动 Windows + Linux + macOS 三平台构建，全部成功后自动把产物上传到 [Releases](https://github.com/lumenShen/EffiBuddy/releases)：
 
 | 平台 | 产物 |
 | --- | --- |
 | Linux x64 | `EffiBuddy-<版本>-linux-x86_64.tar.gz`（便携）+ `effibuddy_<版本>_amd64.deb`（Debian/Ubuntu）+ `effibuddy-<版本>-1*.x86_64.rpm`（Fedora/RHEL/SUSE） |
 | Windows x64 | `EffiBuddy-<版本>-windows-x86_64.zip`（便携）+ `EffiBuddy-<版本>-windows-x86_64-setup.exe`（NSIS 安装包，含开始菜单/桌面快捷方式与卸载器） |
+| macOS arm64 | `EffiBuddy-<版本>-macos-aarch64.tar.gz`（便携；未签名，首次运行需 `xattr -dr com.apple.quarantine`） |
+
+每个包都带一份 `runtime/` bash 运行时，构建时拉取上游最新版本：
+
+- **Linux**：`scripts/fetch-bash.sh` 从 `ftp.gnu.org` 解析最新 GNU bash，用 musl 编成静态二进制（便携包放 `runtime/bash`，deb/rpm 安装到 `/usr/lib/effibuddy/runtime/`）；
+- **macOS**：同一脚本按系统库构建（`runtime/bash`）；
+- **Windows**：`scripts/bundle-msys-shell.py` 读取 MSYS2 实时仓库数据库，下载当前最新的 bash 与常用工具、逐包校验 sha256 后解出 `runtime/msys/`。
+
+`shell` 工具启动时按可执行文件位置发现这份运行时（也支持 `EFFIBUDDY_SHELL=/path/to/bash` 覆盖），找不到才回退系统 `sh -lc` / `cmd /C`。GNU bash 与 MSYS2 组件按各自许可证分发，版本与来源记录在包内的 `runtime/BASH-VERSION`（Windows 为 `runtime/msys/BASH-VERSION.txt`）。
 
 tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败（单一版本源）：
 
@@ -170,7 +182,7 @@ tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败
 git tag v0.1.0 && git push origin v0.1.0   # 触发发布
 ```
 
-应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。安装包资产按平台匹配：Linux 读 `/etc/os-release` 判断 rpm/deb 偏好（识别不到时 deb 优先，退而求其次是便携压缩包）。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
+应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。安装包资产按平台与架构匹配：Windows x64 取 setup/zip，macOS 按 `std::env::consts::ARCH` 取同架构 tar.gz，Linux 读 `/etc/os-release` 判断 rpm/deb 偏好（识别不到时 deb 优先，退而求其次是同架构便携包）。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
 
 ## 工作区结构
 
@@ -381,8 +393,8 @@ return g.spec;
 | `edit_file` | 询问 | 精确字符串替换 |
 | `list_dir` | 自动 | 列目录，支持深度 |
 | `grep` | 自动 | 正则搜索文件内容 |
-| `shell` | 询问 | 执行命令，捕获 stdout/stderr 与退出码 |
-| `todo_write` | 自动 | 更新右侧「计划」面板 |
+| `shell` | 询问 | 执行命令（优先随包 bash），捕获 stdout/stderr 与退出码 |
+| `todo_write` | 自动 | 更新右侧「概览」面板 |
 | `run_js` | 自动* | PTC 沙箱；脚本内的嵌套工具调用仍各自走审批 |
 | `agent` | 自动 | 派生命名子代理；支持私有/公开、自定义工具/提示词、输出契约与孙代理 |
 | `agent_send` | 自动 | 向 name/id 发送文本或 JSON；空闲目标会被唤醒 |
@@ -406,6 +418,7 @@ return g.spec;
 | 内容 | 位置 |
 | --- | --- |
 | 配置 | `<数据根目录>\config.json` |
+| 项目注册表 | `<数据根目录>\projects.json` |
 | 模型注册表 | `<数据根目录>\providers.json` |
 | 会话 | `<数据根目录>\sessions\<uuid>.json` |
 | 子代理会话 | 同一目录，带 `parent_id`，不进入顶层会话列表 |
@@ -415,23 +428,25 @@ return g.spec;
 
 两个目录互不迁移：调试产生的会话/配置不会混入正式数据，正式版数据也不会被调试构建读写。需要把已有历史带进另一个目录时，手动搬文件夹或设置 `EFFIBUDDY_DATA_DIR` 即可。设置 →「关于」页的「数据环境」一行会显示当前构建实际使用的目录。
 
-设置页分为「通用 / 模型 / 外观 / 关于」：通用页修改工作区、是否强制 Demo、是否自动批准工具；模型页管理供应商与模型；外观页切换主题。左侧栏的折叠状态，以及右侧页签侧栏的打开状态、宽度、页签顺序与最近关闭记录，都保存在 `config.json`。预览模式创建的会话不会写入磁盘。
+项目是**具名的多文件夹容器**：`projects.json` 记录项目 id、名称与有序文件夹列表（含一个主文件夹）。会话按项目 id 归属，新任务在该项目的主文件夹中运行；项目其余文件夹作为附加工作目录交给智能体（相对路径仍以主文件夹为基准，附加目录内的文件用绝对路径访问）。侧栏项目行的 `+N` 徽标表示附加文件夹数量，悬停可看到全部路径；「+」按钮支持一次多选文件夹建项目，项目菜单 →「管理文件夹…」可改名、增删文件夹并切换主文件夹。文件树、git 状态与项目指令只跟随主文件夹。旧版单目录工作区与会话路径会在首次启动时自动迁移为单根项目，不修改任何会话文件；`projects.json` 缺失时会按会话路径自动重建。
+
+设置页分为「通用 / 模型 / 上下文 / 子代理 / 归档 / 外观 / 关于」：通用页修改工作区、是否强制 Demo、是否自动批准工具；模型页管理供应商与模型；上下文页按模型窗口百分比调整压缩阈值、保留量、摘要上限与旧工具输出清理；子代理页查看档案与诊断；归档页恢复或删除会话；外观页切换主题。左侧栏的折叠状态，以及右侧页签侧栏的打开状态、宽度、页签顺序与最近关闭记录，都保存在 `config.json`。预览模式创建的会话不会写入磁盘。
 
 ## 测试
 
 ```bash
-cargo test --workspace   # 277 个离线测试
+cargo test --workspace   # 303 个离线测试
 cargo build --workspace  # 构建通过（gpui 自带 future-incompat 提示）
 ```
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 88 | loop、压缩、provider 请求体/SSE、图片附件 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵、回合中插入（steer）、会话截断与检查点元数据 serde |
+| `agent-core` | 93 | loop、压缩、provider 请求体/SSE、图片附件 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵、回合中插入（steer）、会话截断与检查点元数据 serde |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 `run_js` 禁止 |
-| `agent-tools` | 33 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具、文件检查点回调 |
+| `agent-tools` | 36 | 文件读写、多根路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具、文件检查点回调 |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
 | `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
-| `app` | 90 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门、消息编辑/撤销的恢复预检与冲突检测 |
+| `app` | 108 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门、消息编辑/撤销的恢复预检与冲突检测、项目注册表迁移/多根解析 |
 
 真实 DeepSeek 测试默认忽略，需要 Key：
 
@@ -458,13 +473,13 @@ cargo test -p effibuddy-agent-tools --test deepseek_live -- --ignored --nocaptur
 
 ## 已知边界
 
-- 目前以 Windows 与 Linux 为目标平台；Linux 下 X11 具备完整窗口级能力，Wayland 仅全屏读图/输入。Windows 代码在本仓库的 Linux 开发环境中无法实机编译验证，需要 Windows 机器过一遍 `cargo check` 与 probe。
+- 目前以 Windows、Linux 与 macOS（Apple Silicon）为目标平台；Linux 下 X11 具备完整窗口级能力，Wayland 仅全屏读图/输入。macOS 发布包未签名/未公证，Computer Use 在 macOS 上不可用（`UnsupportedBackend`）。Windows 代码在本仓库的 Linux 开发环境中无法实机编译验证，需要 Windows 机器过一遍 `cargo check` 与 probe。
 - Computer Use v1 没有辅助功能树（UIA/AT-SPI），复杂自绘界面依赖视觉坐标；Wayland 不支持窗口枚举/窗口级截图/桌面隔离；悬浮条在 Wayland 无法保证置顶或顶部居中。
 - 默认 DeepSeek 模型没有视觉能力；需要在设置 → 模型中启用支持图片输入的模型，截图才能发给模型。
 - Boa 无抢占式中断，恶意脚本可能耗尽 CPU，直到循环/超时限制触发。
 - 子代理在同一进程内运行、共享同一个模型 Provider；暂不支持 fork、worktree 隔离、远程子代理或子代理再派生子代理。
 - 后台子代理的通知只会唤醒创建它的父会话；应用重启后，历史子会话仍可读取，但任务面板不会自动恢复运行状态。
-- 上下文压缩是启发式摘要，极端长会话仍可能丢失细节。
+- 上下文压缩默认让当前会话模型生成摘要，摘要请求失败时回退为本地摘录；极端长会话仍可能丢失细节，可在设置 → 上下文中调整阈值/保留比例/摘要上限。后台预压缩是实验功能，默认关闭；它会提前写摘要，未使用的摘要仍计费。
 - 项目处于早期阶段（0.1.0），接口与数据格式仍可能变化。
 
 ## 压测实验室
@@ -487,3 +502,5 @@ cargo run --release -p effibuddy-app --features stress -- --stress 1000         
 ## 许可证
 
 MIT
+
+运行时分发的 GNU bash（GPLv3+）与 MSYS2 组件按其各自许可证分发：bash 源码见 <https://ftp.gnu.org/gnu/bash/>，MSYS2 包与源码见 <https://repo.msys2.org/>。安装包内的 `BASH-COPYING` / `BASH-VERSION`（Windows 为 `runtime/msys/BASH-VERSION.txt` 与 `usr/share/licenses/`）记录了对应版本与许可证文本。

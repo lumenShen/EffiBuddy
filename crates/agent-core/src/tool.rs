@@ -306,8 +306,13 @@ pub trait NestedToolInvoker: Send + Sync {
 /// Everything a tool is allowed to touch.
 #[derive(Clone)]
 pub struct ToolContext {
-    /// Sandbox root. Built-in tools reject paths that escape it.
+    /// Sandbox root (the session cwd). Built-in tools reject paths that escape
+    /// it; relative paths resolve against it.
     pub cwd: PathBuf,
+    /// Additional project folders the agent may read and write. Absolute paths
+    /// inside any of these roots are accepted; relative paths still anchor at
+    /// [`ToolContext::cwd`].
+    pub additional_workspaces: Vec<PathBuf>,
     pub session_id: String,
     /// Runtime identity of the calling agent (`main` or `agent_…`). Tools use
     /// this to sign inter-agent messages.

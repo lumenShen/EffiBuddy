@@ -1,13 +1,14 @@
 //! Small building blocks: spinner, badge, avatar, card, divider, keycap.
 
+use std::f32::consts::TAU;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, AnyView, App, BoxShadow, ClickEvent, Div, Element,
+    Animation, AnimationExt, AnyElement, AnyView, App, Bounds, BoxShadow, ClickEvent, Div, Element,
     ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
-    Pixels, Render, RenderOnce, SharedString, Transformation, Window, div, percentage, prelude::*,
-    px, radians, svg,
+    PathBuilder, Pixels, Point, Render, RenderOnce, SharedString, Transformation, Window, canvas,
+    div, percentage, point, prelude::*, px, radians, svg,
 };
 
 use crate::assets::icons;
@@ -40,6 +41,106 @@ impl RenderOnce for Spinner {
                 Animation::new(Duration::from_millis(900)).repeat(),
                 |svg, delta| svg.with_transformation(Transformation::rotate(percentage(delta))),
             )
+    }
+}
+
+/// Circular progress ring. The track is a full circle; the progress stroke
+/// starts at 12 o'clock and sweeps clockwise. Both strokes are painted as
+/// canvas paths so they share exact geometry (no CSS border seam).
+///
+/// Arcs are polylines with a small angular step: at ring sizes used in the UI
+/// the chord error is far below a pixel, and the polyline avoids SVG-arc
+/// large-flag edge cases at 0% and 100%.
+#[derive(IntoElement)]
+pub struct ProgressRing {
+    fraction: f32,
+    size: f32,
+    stroke_width: f32,
+    track: Hsla,
+    progress: Hsla,
+}
+
+impl ProgressRing {
+    /// `fraction` is clamped to `0.0..=1.0`; colors default to invisible, so
+    /// always set `.track(..)` and `.progress(..)`.
+    pub fn new(fraction: f32, size: f32) -> Self {
+        Self {
+            fraction: fraction.clamp(0.0, 1.0),
+            size,
+            stroke_width: 2.0,
+            track: gpui::transparent_black(),
+            progress: gpui::transparent_black(),
+        }
+    }
+
+    pub fn stroke_width(mut self, width: f32) -> Self {
+        self.stroke_width = width;
+        self
+    }
+
+    pub fn track(mut self, color: Hsla) -> Self {
+        self.track = color;
+        self
+    }
+
+    pub fn progress(mut self, color: Hsla) -> Self {
+        self.progress = color;
+        self
+    }
+}
+
+/// One point on the ring; `angle` in radians, 0 at 3 o'clock, growing
+/// clockwise on screen (y-down coordinates).
+fn ring_point(origin: Point<Pixels>, radius: f32, angle: f32) -> gpui::Point<Pixels> {
+    point(
+        origin.x + px(radius * angle.cos()),
+        origin.y + px(radius * angle.sin()),
+    )
+}
+
+impl RenderOnce for ProgressRing {
+    fn render(self, _window: &mut Window, _cx: &mut gpui::App) -> impl IntoElement {
+        div().flex_none().size(px(self.size)).child(
+            canvas(
+                |bounds, _window, _cx| bounds,
+                move |bounds: Bounds<Pixels>, _state, window: &mut Window, _cx| {
+                    let stroke = px(self.stroke_width);
+                    let radius = (f32::from(bounds.size.width).min(f32::from(bounds.size.height))
+                        - f32::from(stroke))
+                        / 2.0;
+                    if radius <= 0.0 {
+                        return;
+                    }
+                    let center = point(
+                        bounds.origin.x + bounds.size.width / 2.0,
+                        bounds.origin.y + bounds.size.height / 2.0,
+                    );
+                    // 4° chords keep the ring visually smooth at any size we use.
+                    const STEP: f32 = TAU / 90.0;
+                    let mut arc = |start: f32, sweep: f32, color: Hsla| {
+                        let mut builder = PathBuilder::stroke(stroke);
+                        builder.move_to(ring_point(center, radius, start));
+                        let mut angle = start + STEP;
+                        while angle < start + sweep {
+                            builder.line_to(ring_point(center, radius, angle));
+                            angle += STEP;
+                        }
+                        builder.line_to(ring_point(center, radius, start + sweep));
+                        if let Ok(path) = builder.build() {
+                            window.paint_path(path, color);
+                        }
+                    };
+                    arc(0.0, TAU, self.track);
+                    // Start at 12 o'clock; avoid the degenerate full-circle
+                    // endpoint by stopping a hair short of a full turn.
+                    let sweep = (self.fraction * TAU).min(TAU - 0.02);
+                    if sweep > 0.0 {
+                        arc(-std::f32::consts::FRAC_PI_2, sweep, self.progress);
+                    }
+                },
+            )
+            .size_full(),
+        )
     }
 }
 

@@ -251,9 +251,7 @@ impl ModelConfig {
     /// its own default. A level the model no longer offers falls back to the
     /// model's default so stale selections keep working.
     pub fn resolved_reasoning_level(&self, requested: Option<&str>) -> Option<String> {
-        let Some(requested) = requested else {
-            return None;
-        };
+        let requested = requested?;
         if self.supports_reasoning_level(requested) {
             return Some(requested.to_string());
         }

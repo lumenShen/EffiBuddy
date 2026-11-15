@@ -30,6 +30,7 @@ use crate::smooth::smooth_overlay;
 pub(crate) enum SettingsSection {
     General,
     Models,
+    Context,
     Agents,
     Archived,
     Appearance,
@@ -41,6 +42,7 @@ impl SettingsSection {
         match self {
             SettingsSection::General => "通用",
             SettingsSection::Models => "模型",
+            SettingsSection::Context => "上下文",
             SettingsSection::Agents => "子代理",
             SettingsSection::Archived => "归档",
             SettingsSection::Appearance => "外观",
@@ -52,6 +54,7 @@ impl SettingsSection {
         match self {
             SettingsSection::General => icons::WRENCH,
             SettingsSection::Models => icons::SPARKLES,
+            SettingsSection::Context => icons::GAUGE,
             SettingsSection::Agents => icons::CODE,
             SettingsSection::Archived => icons::ARCHIVE,
             SettingsSection::Appearance => icons::SUN,
@@ -103,6 +106,21 @@ pub(crate) struct SettingsState {
     pub computer_use_mode: ComputerUseMode,
     pub demo: bool,
     pub status: Option<(bool, String)>,
+    /// Settings → 上下文 drafts. All compaction thresholds are percentages of
+    /// the selected model's context window.
+    pub compact_enabled: bool,
+    pub compact_trigger: Entity<TextInputState>,
+    pub compact_trigger_view: Entity<TextInputView>,
+    pub compact_keep: Entity<TextInputState>,
+    pub compact_keep_view: Entity<TextInputView>,
+    pub compact_summary: Entity<TextInputState>,
+    pub compact_summary_view: Entity<TextInputView>,
+    pub compact_clear_tools: bool,
+    pub compact_keep_results: Entity<TextInputState>,
+    pub compact_keep_results_view: Entity<TextInputView>,
+    pub compact_background: bool,
+    pub compact_background_start: Entity<TextInputState>,
+    pub compact_background_start_view: Entity<TextInputView>,
     /// Armed session id for the two-step delete on the 归档 page.
     pub archived_delete_confirm: Option<String>,
 }
@@ -127,6 +145,31 @@ impl SettingsState {
         let (provider_api_key, provider_api_key_view) = input(cx, "", "留空表示不修改已保存的 Key");
         let (workspace, workspace_view) =
             input(cx, &config.workspace().display().to_string(), "工作区路径");
+        let (compact_trigger, compact_trigger_view) = input(
+            cx,
+            &format!("{:.0}", config.compaction.trigger_percent),
+            "80",
+        );
+        let (compact_keep, compact_keep_view) = input(
+            cx,
+            &format!("{:.0}", config.compaction.keep_recent_percent),
+            "20",
+        );
+        let (compact_summary, compact_summary_view) = input(
+            cx,
+            &format!("{:.0}", config.compaction.summary_percent),
+            "10",
+        );
+        let (compact_keep_results, compact_keep_results_view) = input(
+            cx,
+            &config.compaction.keep_recent_tool_results.to_string(),
+            "5",
+        );
+        let (compact_background_start, compact_background_start_view) = input(
+            cx,
+            &format!("{:.0}", config.compaction.background_start_percent),
+            "50",
+        );
         let (model_id, model_id_view) = input(cx, "", "例如 claude-sonnet-4-5");
         let (model_name, model_name_view) = input(cx, "", "显示名称（可选）");
         let (model_context, model_context_view) = input(cx, "", "例如 200000");
@@ -174,6 +217,19 @@ impl SettingsState {
             computer_use_mode: config.computer_use_mode,
             demo: config.use_demo,
             status: None,
+            compact_enabled: config.compaction.enabled,
+            compact_trigger,
+            compact_trigger_view,
+            compact_keep,
+            compact_keep_view,
+            compact_summary,
+            compact_summary_view,
+            compact_clear_tools: config.compaction.clear_tool_outputs,
+            compact_keep_results,
+            compact_keep_results_view,
+            compact_background: config.compaction.background_precompact,
+            compact_background_start,
+            compact_background_start_view,
             archived_delete_confirm: None,
         };
         state.load_provider_form(models, cx);
@@ -246,6 +302,31 @@ impl AppView {
         self.settings.default_mode = self.config.effective_default_mode();
         self.settings.computer_use_mode = self.config.computer_use_mode;
         self.settings.demo = self.config.use_demo;
+        self.settings.compact_enabled = self.config.compaction.enabled;
+        self.settings.compact_clear_tools = self.config.compaction.clear_tool_outputs;
+        self.settings.compact_background = self.config.compaction.background_precompact;
+        let trigger = format!("{:.0}", self.config.compaction.trigger_percent);
+        let keep = format!("{:.0}", self.config.compaction.keep_recent_percent);
+        let summary = format!("{:.0}", self.config.compaction.summary_percent);
+        let keep_results = self.config.compaction.keep_recent_tool_results.to_string();
+        let background_start = format!("{:.0}", self.config.compaction.background_start_percent);
+        self.settings
+            .compact_trigger
+            .update(cx, move |state, _| state.set_content_silent(trigger));
+        self.settings
+            .compact_keep
+            .update(cx, move |state, _| state.set_content_silent(keep));
+        self.settings
+            .compact_summary
+            .update(cx, move |state, _| state.set_content_silent(summary));
+        self.settings
+            .compact_keep_results
+            .update(cx, move |state, _| state.set_content_silent(keep_results));
+        self.settings
+            .compact_background_start
+            .update(cx, move |state, _| {
+                state.set_content_silent(background_start)
+            });
         self.settings.status = None;
         self.settings.archived_delete_confirm = None;
         self.settings.workspace.update(cx, |state, cx| {
@@ -289,19 +370,116 @@ impl AppView {
             Ok(()) => {
                 self.settings.status = Some((true, "已保存。新任务会使用这些设置。".to_string()));
                 if let Some(active) = &self.active {
-                    let is_empty = {
-                        let session = effibuddy_agent_core::lock_session(&active.shared);
-                        session.messages.is_empty()
-                    };
-                    if is_empty {
-                        effibuddy_agent_core::lock_session(&active.shared).cwd =
-                            self.config.workspace();
+                    let mut session = effibuddy_agent_core::lock_session(&active.shared);
+                    // Only a plain task follows the global workspace. A project
+                    // session keeps its project folder even when it is empty.
+                    if session.messages.is_empty()
+                        && session.project_id.is_none()
+                        && session.project.is_none()
+                    {
+                        session.cwd = self.config.workspace();
                     }
                 }
             }
             Err(error) => self.settings.status = Some((false, error)),
         }
         window.focus(&self.composer_state.read(cx).focus_handle());
+        cx.notify();
+    }
+
+    /// Persist the context-compaction drafts. Percentages are clamped to the
+    /// ranges the policy understands; invalid text falls back to the current
+    /// value instead of silently becoming zero.
+    fn save_compaction_settings(&mut self, cx: &mut Context<Self>) {
+        fn percent(content: &str, fallback: f32) -> f32 {
+            content
+                .trim()
+                .trim_end_matches('%')
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .unwrap_or(fallback)
+        }
+        fn count(content: &str, fallback: usize) -> usize {
+            content.trim().parse::<usize>().unwrap_or(fallback)
+        }
+
+        let current = self.config.compaction.clone();
+        let trigger = percent(
+            self.settings.compact_trigger.read(cx).content(),
+            current.trigger_percent,
+        )
+        .clamp(10.0, 95.0);
+        let keep = percent(
+            self.settings.compact_keep.read(cx).content(),
+            current.keep_recent_percent,
+        )
+        .clamp(5.0, 60.0);
+        let summary = percent(
+            self.settings.compact_summary.read(cx).content(),
+            current.summary_percent,
+        )
+        .clamp(2.0, 30.0);
+        let keep_results = count(
+            self.settings.compact_keep_results.read(cx).content(),
+            current.keep_recent_tool_results,
+        )
+        .clamp(1, 50);
+        let background_start = percent(
+            self.settings.compact_background_start.read(cx).content(),
+            current.background_start_percent,
+        )
+        .clamp(5.0, 90.0)
+        .min(trigger - 5.0)
+        .max((trigger - 40.0).max(5.0));
+
+        self.config.compaction = effibuddy_agent_core::CompactionConfig {
+            enabled: self.settings.compact_enabled,
+            trigger_percent: trigger,
+            keep_recent_percent: keep,
+            summary_percent: summary,
+            clear_tool_outputs: self.settings.compact_clear_tools,
+            keep_recent_tool_results: keep_results,
+            max_consecutive_failures: current.max_consecutive_failures,
+            background_precompact: self.settings.compact_background,
+            background_start_percent: background_start,
+        };
+
+        // Reflect the clamped values so the user sees what was actually saved.
+        let trigger_text = format!("{trigger:.0}");
+        let keep_text = format!("{keep:.0}");
+        let summary_text = format!("{summary:.0}");
+        let keep_results_text = keep_results.to_string();
+        let background_start_text = format!("{background_start:.0}");
+        self.settings
+            .compact_trigger
+            .update(cx, move |state, _| state.set_content_silent(trigger_text));
+        self.settings
+            .compact_keep
+            .update(cx, move |state, _| state.set_content_silent(keep_text));
+        self.settings
+            .compact_summary
+            .update(cx, move |state, _| state.set_content_silent(summary_text));
+        self.settings
+            .compact_keep_results
+            .update(cx, move |state, _| {
+                state.set_content_silent(keep_results_text)
+            });
+        self.settings
+            .compact_background_start
+            .update(cx, move |state, _| {
+                state.set_content_silent(background_start_text)
+            });
+
+        match self.config.save() {
+            Ok(()) => {
+                self.settings.status = Some((
+                    true,
+                    "已保存。正在运行的任务结束后，新任务生效。".to_string(),
+                ))
+            }
+            Err(error) => self.settings.status = Some((false, error)),
+        }
         cx.notify();
     }
 
@@ -771,7 +949,7 @@ impl AppView {
         // on every render (each keystroke notifies the whole view).
         if self.settings.section == SettingsSection::Agents {
             if self.agents_catalog.is_none() {
-                let workspace = self.config.workspace();
+                let workspace = self.active_workspace();
                 let user_agents_dir = crate::config::base_dir().join("agents");
                 self.agents_catalog = Some(Rc::new(merged_subagent_profiles(
                     &user_agents_dir,
@@ -785,6 +963,7 @@ impl AppView {
         let content = match self.settings.section {
             SettingsSection::General => self.render_settings_general(&theme, cx),
             SettingsSection::Models => self.render_settings_models(&theme, cx),
+            SettingsSection::Context => self.render_settings_context(&theme, cx),
             SettingsSection::Agents => self.render_settings_agents(&theme),
             SettingsSection::Archived => self.render_settings_archived(&theme, cx),
             SettingsSection::Appearance => self.render_settings_appearance(&theme, cx),
@@ -866,6 +1045,7 @@ impl AppView {
         let rows: Vec<AnyElement> = [
             SettingsSection::General,
             SettingsSection::Models,
+            SettingsSection::Context,
             SettingsSection::Agents,
             SettingsSection::Archived,
             SettingsSection::Appearance,
@@ -984,10 +1164,193 @@ impl AppView {
         )
     }
 
+    /// 上下文压缩：所有阈值都以当前模型上下文窗口的百分比表示。
+    fn render_settings_context(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let status = self.settings.status.clone();
+        centered_settings_column(
+            div()
+                .child(settings_page_header(
+                    theme,
+                    "上下文压缩",
+                    "按模型上下文窗口的百分比控制；修改后对新任务生效",
+                ))
+                .child(
+                    settings_card(theme, "自动压缩", "长会话超过阈值后生成滚动摘要")
+                        .child(toggle_row(
+                            theme,
+                            "启用自动压缩",
+                            "关闭后仍保留旧摘要，但不会自动生成新的摘要。",
+                            self.settings.compact_enabled,
+                            cx.listener(|this, _, _, cx| {
+                                this.settings.compact_enabled = !this.settings.compact_enabled;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(compact_number_row(
+                            theme,
+                            "触发阈值",
+                            "上下文占用达到窗口的该百分比时压缩。默认 80%。",
+                            self.settings.compact_trigger_view.clone(),
+                            "%",
+                        ))
+                        .child(compact_number_row(
+                            theme,
+                            "保留最近",
+                            "摘要后保留最近多少百分比的上下文原文。默认 20%。",
+                            self.settings.compact_keep_view.clone(),
+                            "%",
+                        ))
+                        .child(compact_number_row(
+                            theme,
+                            "摘要上限",
+                            "生成摘要最多使用窗口的该百分比。默认 10%。",
+                            self.settings.compact_summary_view.clone(),
+                            "%",
+                        ))
+                        .child(toggle_row(
+                            theme,
+                            "后台预压缩（试验）",
+                            "达到起点后后台写摘要，主会话继续运行；到阈值时直接换入。提前生成但未使用的摘要仍计费。",
+                            self.settings.compact_background,
+                            cx.listener(|this, _, _, cx| {
+                                this.settings.compact_background =
+                                    !this.settings.compact_background;
+                                cx.notify();
+                            }),
+                        ))
+                        .when(self.settings.compact_background, |element| {
+                            element.child(compact_number_row(
+                                theme,
+                                "预压缩起点",
+                                "达到窗口的该百分比时开始后台摘要；必须低于触发阈值。默认 50%。",
+                                self.settings.compact_background_start_view.clone(),
+                                "%",
+                            ))
+                        })
+                        .child({
+                            let (window, max_output) = self
+                                .active
+                                .as_ref()
+                                .map(|active| {
+                                    let session =
+                                        effibuddy_agent_core::lock_session(&active.shared);
+                                    let resolved = self.models.resolve_session(&session);
+                                    (resolved.context_window(), resolved.max_output_tokens() as usize)
+                                })
+                                .unwrap_or((128_000, 8_192));
+                            let trigger = self
+                                .settings
+                                .compact_trigger
+                                .read(cx)
+                                .content()
+                                .trim()
+                                .trim_end_matches('%')
+                                .parse::<f32>()
+                                .unwrap_or(self.config.compaction.trigger_percent)
+                                .clamp(10.0, 95.0);
+                            let reserve = max_output.min(window / 4);
+                            let trigger_tokens = ((window as f32 * trigger / 100.0) as usize)
+                                .min(window.saturating_sub(reserve));
+                            let background = self
+                                .settings
+                                .compact_background_start
+                                .read(cx)
+                                .content()
+                                .trim()
+                                .trim_end_matches('%')
+                                .parse::<f32>()
+                                .unwrap_or(self.config.compaction.background_start_percent)
+                                .clamp(5.0, 90.0)
+                                .min(trigger - 5.0)
+                                .max((trigger - 40.0).max(5.0));
+                            let background_tokens =
+                                ((window as f32 * background / 100.0) as usize)
+                                    .min(trigger_tokens.saturating_sub(1));
+                            let background_hint = if self.settings.compact_background {
+                                format!(
+                                    " · 后台约 {} 开始",
+                                    format_context_window(background_tokens)
+                                )
+                            } else {
+                                String::new()
+                            };
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child(format!(
+                                    "当前模型窗口 {} · 约 {} tokens 触发（已扣输出预留）{background_hint}",
+                                    format_context_window(window),
+                                    format_context_window(trigger_tokens)
+                                ))
+                        }),
+                )
+                .child(
+                    settings_card(theme, "旧工具输出", "先清理噪声，再决定是否花一次摘要请求")
+                        .child(toggle_row(
+                            theme,
+                            "清理旧工具结果",
+                            "达到触发阈值的 90% 时，把较早的读取/搜索/命令输出替换为占位符。",
+                            self.settings.compact_clear_tools,
+                            cx.listener(|this, _, _, cx| {
+                                this.settings.compact_clear_tools =
+                                    !this.settings.compact_clear_tools;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(compact_number_row(
+                            theme,
+                            "保留最近结果",
+                            "最近 N 条工具结果永远保留原文；错误与图片结果也会保留。",
+                            self.settings.compact_keep_results_view.clone(),
+                            "条",
+                        )),
+                )
+                .child(
+                    settings_card(theme, "行为说明", "参考 ZCode 的压缩链路")
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.text_muted)
+                                .child("摘要由当前会话模型生成；摘要请求失败时回退为本地摘录，不会中断任务。"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.text_muted)
+                                .child("供应商仍报上下文超限时，会强制压缩并重试一次请求。"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("save-compaction", "保存设置", theme)
+                                .variant(ButtonVariant::Primary)
+                                .size(ButtonSize::Sm)
+                                .icon(icons::CHECK)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.save_compaction_settings(cx)
+                                })),
+                        )
+                        .when_some(status, |element, (ok, message)| {
+                            element.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(if ok { theme.success } else { theme.danger })
+                                    .child(message),
+                            )
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// ZCode-style subagent catalog: built-in / user / project groups, the
     /// Markdown contract and parser diagnostics for invalid files.
     fn render_settings_agents(&self, theme: &Theme) -> AnyElement {
-        let workspace = self.config.workspace();
+        let workspace = self.active_workspace();
         let user_agents_dir = crate::config::base_dir().join("agents");
         let catalog = self.agents_catalog.clone().unwrap_or_else(|| {
             Rc::new(merged_subagent_profiles(&user_agents_dir, Some(&workspace)))
@@ -1146,10 +1509,9 @@ impl AppView {
             let confirm = self.settings.archived_delete_confirm.as_deref() == Some(id.as_str());
             let restore_id = id.clone();
             let delete_id = id.clone();
-            let project_label = summary
-                .project
-                .as_deref()
-                .map(crate::app::project_display_name)
+            let project_label = self
+                .project_group(summary.project_id.as_deref(), summary.project.as_deref())
+                .map(|group| group.name)
                 .unwrap_or_else(|| "任务".to_string());
             rows.push(
                 div()
@@ -2584,6 +2946,55 @@ fn computer_use_row(
                         .text_size(px(11.0))
                         .text_color(theme.warning)
                         .child("需要模型开启视觉能力，截图才能发给模型；Wayland 仅支持全屏。"),
+                ),
+        )
+        .into_any_element()
+}
+
+fn compact_number_row(
+    theme: &Theme,
+    title: &str,
+    description: &str,
+    view: Entity<TextInputView>,
+    suffix: &str,
+) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_3()
+        .py_1()
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child(title.to_string()),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_faint)
+                        .child(description.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().w(px(76.0)).child(view))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_faint)
+                        .child(suffix.to_string()),
                 ),
         )
         .into_any_element()

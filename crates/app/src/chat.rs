@@ -27,18 +27,18 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use effibuddy_agent_core::{
-    AgentMessageMeta, ContentBlock, Message, Role, RunStatus, SessionState, SubagentColor,
-    SubagentStatus, ToolCall, ToolResult,
+    AgentMessageMeta, AttachmentKind, ContentBlock, Message, Role, RunStatus, SessionState,
+    SubagentColor, SubagentStatus, ToolCall, ToolResult, UserAttachment,
 };
 use effibuddy_ui::{
     BadgeTone, GlideTick, IconButton, ScrollGlide, Spinner, Theme, badge, chunk_ranges,
-    disclosure_chevron, icons, markdown_source_key, reduce_motion, render_markdown_chunk,
-    render_markdown_keyed, shadow_float, wheel_capture_overlay,
+    disclosure_chevron, ease_out_cubic, icons, markdown_source_key, radius, reduce_motion,
+    render_markdown_chunk, render_markdown_keyed, shadow_float, wheel_capture_overlay,
 };
 use gpui::prelude::*;
 use gpui::{
     Animation, AnimationExt, AnyElement, Canvas, ClipboardItem, Div, Hsla, IntoElement,
-    ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, WeakEntity, div,
+    ListAlignment, ListOffset, ListState, ScrollHandle, SharedString, WeakEntity, canvas, div,
     pulsating_between, px, svg,
 };
 
@@ -61,6 +61,16 @@ const ENTER_ANIMATION: Duration = Duration::from_millis(260);
 const ENTER_WINDOW: Duration = Duration::from_millis(320);
 /// Assistant bodies larger than this are split into per-chunk virtual items.
 const SPLIT_TEXT_THRESHOLD: usize = 2048;
+/// Turn 展开时，展开内容逐块渐显：第 n 块延迟 n×50ms，再 180ms ease-out。
+/// stagger 封顶 8 块，长 turn 的末块不会让人等动画。
+const TURN_EXPAND_STAGGER: Duration = Duration::from_millis(50);
+const TURN_EXPAND_STAGGER_STEPS: usize = 8;
+const TURN_EXPAND_FADE: Duration = Duration::from_millis(180);
+/// 展开多久之内的挂载仍然播渐显；之外（例如滚动重新挂载）直接全亮。
+const TURN_EXPAND_WINDOW: Duration = Duration::from_millis(700);
+/// 展开高度从 0 长到自然高度的时间：列表逐帧重测可见项，下方内容跟着真实
+/// 布局平滑下移，而不是瞬间被“蹦出来的一截”顶开。
+const TURN_HEIGHT_REVEAL: Duration = Duration::from_millis(280);
 
 /// Measurement escape hatch: `EFFIBUDDY_NO_SPLIT=1` renders every assistant
 /// body as one virtual item, reproducing the pre-chunk-split layout cost.
@@ -114,6 +124,13 @@ pub(crate) struct ChatViewState {
     pub reasoning_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
     /// Per-code-panel scroll handles (shared with the chat list).
     pub code_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
+    /// Set by the rail after a jump: the target user bubble paints a one-shot
+    /// accent border so the destination is obvious in a long transcript.
+    pub jump_flash: Option<JumpFlash>,
+    /// Turn 展开时刻（含自动展开）：窗口内的展开内容按 50ms stagger 渐显。
+    pub turn_expand_at: Rc<HashMap<String, Instant>>,
+    /// Turn 展开内容的自然高度缓存（渲染期由观测副本回填，用于高度渐显）。
+    pub turn_block_heights: Rc<RefCell<HashMap<String, f32>>>,
 }
 
 /// Which piece of an item a virtual row renders. Chunks index into the item's
@@ -140,6 +157,98 @@ pub(crate) struct TextChunk {
     pub start: usize,
     pub end: usize,
     pub key: u64,
+}
+
+// --- prompt rail (left-edge query navigator) -------------------------------
+
+/// One user query in the left-edge navigator. Built once per structural
+/// rebuild; the previews are flattened and truncated at build time so a frame
+/// only clones ref-counted strings. Clicking a mark jumps straight to the
+/// stored slot index — the rail never searches the transcript.
+pub(crate) struct PromptMark {
+    /// User message id; also keys the jump-flash animation.
+    pub id: SharedString,
+    /// Index into [`ChatViewState::items`] for the current rebuild.
+    pub item_ix: usize,
+    pub user_preview: SharedString,
+    pub assistant_preview: SharedString,
+    /// True when the reply has no body text yet (running or empty).
+    pub assistant_placeholder: bool,
+    /// Newest query of a live run.
+    pub running: bool,
+}
+
+/// Row footprint of one mark in the rail, in px. The rail is a compact index,
+/// so rows stay fixed-height and the rail itself scrolls when queries overflow.
+pub(crate) const PROMPT_RAIL_ROW: f32 = 10.0;
+const PROMPT_RAIL_WIDTH: f32 = 36.0;
+pub(crate) const PROMPT_RAIL_INSET: f32 = 24.0;
+/// Minimum conversation width that leaves room for the rail in the left
+/// margin. `CONTENT_MAX_WIDTH` (896) is centered with 24px gutters, so below
+/// ~960 the rail would overlap the message column; ZCode hides its navigator
+/// at the same point.
+const PROMPT_RAIL_MIN_WIDTH: f32 = 960.0;
+const PROMPT_RAIL_POPOVER_WIDTH: f32 = 320.0;
+/// Clamp estimate for the hover card (two user lines + three reply lines).
+const PROMPT_RAIL_POPOVER_ESTIMATE: f32 = 140.0;
+const PROMPT_PREVIEW_CHARS: usize = 220;
+const PROMPT_PREVIEW_PARAGRAPHS: usize = 2;
+const PROMPT_LINE_IDLE: f32 = 12.0;
+const PROMPT_LINE_ACTIVE: f32 = 16.0;
+const PROMPT_LINE_HOVER: f32 = 30.0;
+const PROMPT_LINE_MOTION: Duration = Duration::from_millis(140);
+
+/// Rail geometry for the current frame, derived from the list viewport (O(1)).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PromptRailMetrics {
+    pub body_height: f32,
+    pub view_height: f32,
+    /// Top inset that vertically centers a rail shorter than the viewport.
+    pub pad: f32,
+    pub max_scroll: f32,
+}
+
+/// App-owned rail interaction state.
+#[derive(Default)]
+pub(crate) struct PromptRailState {
+    pub hover: Option<usize>,
+    /// Row that was hovered last frame, so its bar can animate back to idle.
+    pub previous_hover: Option<usize>,
+    /// Bumped on every hover change; keys the width/card animations so an
+    /// interrupted grow/shrink restarts instead of resuming stale state.
+    pub hover_seq: u64,
+    pub card: Option<usize>,
+    /// Rail scroll in px from the top of the full mark list.
+    pub scroll: f32,
+    /// `(active mark, viewport height)` last auto-followed. Wheel input moves
+    /// `scroll` without touching this, so manual browsing is not snapped back.
+    followed: Option<(usize, u32)>,
+}
+
+impl PromptRailState {
+    /// Recenter on the active query whenever the transcript moves to a new
+    /// query or the rail is resized. Returns whether the rail moved, so the
+    /// app can drop a hover card that would otherwise detach from its row.
+    pub fn follow(&mut self, active: usize, metrics: &PromptRailMetrics) -> bool {
+        let before = self.scroll;
+        let key = (active, (metrics.view_height * 64.0).round() as u32);
+        if self.followed != Some(key) {
+            self.followed = Some(key);
+            let target =
+                active as f32 * PROMPT_RAIL_ROW - (metrics.view_height - PROMPT_RAIL_ROW) * 0.5;
+            self.scroll = target.clamp(0.0, metrics.max_scroll);
+        }
+        self.scroll = self.scroll.clamp(0.0, metrics.max_scroll);
+        (self.scroll - before).abs() > 0.5
+    }
+}
+
+/// One-shot highlight of the user bubble the rail just jumped to. Kept until
+/// the next jump; the animation itself fades to zero opacity.
+#[derive(Clone)]
+pub(crate) struct JumpFlash {
+    pub message_id: SharedString,
+    pub seq: u64,
 }
 
 #[derive(Clone)]
@@ -194,6 +303,8 @@ pub(crate) enum ChatItemKind {
         /// and without edit/undo actions (the turn checkpoint belongs to the
         /// message that started the run).
         steered: bool,
+        /// Files / images / skills the user attached in the composer.
+        attachments: Vec<UserAttachment>,
     },
     /// A solo assistant message (single-step turn). Shared as an `Rc` so a
     /// rebuild can reuse unchanged messages without cloning them.
@@ -301,12 +412,24 @@ pub(crate) struct ChatList {
     reasoning_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
     /// Per-code-panel scroll handles, keyed `call-id + title`.
     code_scrolls: Rc<RefCell<HashMap<String, ScrollHandle>>>,
+    /// One mark per user query for the left-edge rail, in transcript order.
+    prompt_marks: Rc<Vec<PromptMark>>,
+    /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
+    /// an O(1) lookup here instead of a scan through the transcript.
+    first_slots: Vec<usize>,
     /// Guards against scheduling more than one reveal frame at a time.
     pub reveal_frame_scheduled: bool,
     /// Smooth-scroll glide state (wheel capture + animated scroll-to-bottom).
     glide: ScrollGlide,
     /// Guards against scheduling more than one glide frame at a time.
     pub glide_frame_scheduled: bool,
+    /// Turn 展开时刻；展开窗口内的新挂载内容做 stagger 渐显。
+    turn_expand_at: HashMap<String, Instant>,
+    /// Turn 展开内容的自然高度（渲染期由屏幕外观测副本回填）：高度渐显按
+    /// 「进度 × 自然高度」逐帧长高，列表重测后下方内容平滑让位。
+    turn_block_heights: Rc<RefCell<HashMap<String, f32>>>,
+    /// 高度渐显期间的逐帧重绘泵标记（进度在渲染期计算）。
+    pub turn_height_frame_scheduled: bool,
 }
 
 /// Exponential glide toward a target pixel offset. Wheel deltas move the
@@ -332,9 +455,14 @@ impl ChatList {
             reveal: StreamReveal::default(),
             reasoning_scrolls: Rc::new(RefCell::new(HashMap::new())),
             code_scrolls: Rc::new(RefCell::new(HashMap::new())),
+            prompt_marks: Rc::new(Vec::new()),
+            first_slots: Vec::new(),
             reveal_frame_scheduled: false,
             glide: ScrollGlide::new(),
             glide_frame_scheduled: false,
+            turn_expand_at: HashMap::new(),
+            turn_block_heights: Rc::new(RefCell::new(HashMap::new())),
+            turn_height_frame_scheduled: false,
         }
     }
 
@@ -380,8 +508,18 @@ impl ChatList {
         self.reveal = StreamReveal::default();
         self.reasoning_scrolls = Rc::new(RefCell::new(HashMap::new()));
         self.code_scrolls = Rc::new(RefCell::new(HashMap::new()));
+        self.prompt_marks = Rc::new(Vec::new());
+        self.first_slots.clear();
         self.glide = ScrollGlide::new();
+        self.turn_expand_at.clear();
+        self.turn_block_heights.borrow_mut().clear();
         self.list_state.reset(0);
+    }
+
+    /// 记录一次 turn 展开（手动或自动）：展开窗口内挂载的内容做 stagger 渐显。
+    pub fn note_turn_expanded(&mut self, turn_id: &str) {
+        self.turn_expand_at
+            .insert(turn_id.to_string(), Instant::now());
     }
 
     /// Rebuild the item snapshot from the session. Only invoked when a
@@ -480,6 +618,7 @@ impl ChatList {
                 Role::User => ChatItemKind::User {
                     text: message.text().into(),
                     steered: message.mid_turn,
+                    attachments: message.attachments.clone(),
                 },
                 Role::System => ChatItemKind::System {
                     text: message.text(),
@@ -572,6 +711,7 @@ impl ChatList {
             next_entered.insert(item.id.clone(), item.entered_at);
         }
 
+        self.prompt_marks = Rc::new(build_prompt_marks(&items, run.running));
         self.items = Rc::new(items);
         self.results = Rc::new(results);
         self.entered = next_entered;
@@ -622,13 +762,56 @@ impl ChatList {
                 .map(|stream| Rc::new(stream_chunk_table(stream)))
         };
 
+        // 展开动画只在窗口内生效；过期的时刻顺手清掉，避免无限增长。
+        self.turn_expand_at
+            .retain(|_, at| at.elapsed() < TURN_EXPAND_WINDOW * 2);
+        // 高度缓存与展开时刻同寿命：key 形如 `turn:… #activity|#tools`。
+        {
+            let heights = self.turn_block_heights.clone();
+            heights.borrow_mut().retain(|key, _| {
+                let turn_id = key.split('#').next().unwrap_or(key.as_str());
+                self.turn_expand_at.contains_key(turn_id)
+            });
+        }
+
         // Build the virtual-row plan. Assistant items with a chunk table
         // expand into lead/chunk/tail rows; the streaming message expands
         // into the per-frame table of its revealed text.
         let mut slots: Vec<ChatSlot> = Vec::with_capacity(self.items.len() + 8);
         let mut keys: Vec<(u64, u64)> = Vec::with_capacity(slots.capacity());
+        self.first_slots.clear();
+        self.first_slots.reserve(self.items.len());
         for (item_ix, item) in self.items.iter().enumerate() {
+            self.first_slots.push(slots.len());
             let signature = item.signature;
+            // 折叠/展开状态是渲染高度的一部分：混进 slot key 后，切换会让
+            // 前缀对齐从该行断开并触发 splice，ListState 便会重新测量这个
+            // 条目（视口外的高度缓存不再失真，滚动边界保持正确）。
+            let presentation = item_presentation(
+                item,
+                expanded_reasoning,
+                expanded_tools,
+                expanded_turns,
+                collapsed_turns,
+                running,
+                streaming_id.as_deref(),
+            );
+            // 自动展开（live turn）也记一次时刻，展开内容做 stagger 渐显。
+            if let ChatItemKind::Turn(turn) = &item.kind {
+                let auto_expanded = !expanded_turns.contains(&turn.id)
+                    && turn_expanded_with(
+                        turn,
+                        collapsed_turns,
+                        expanded_turns,
+                        running,
+                        streaming_id.as_deref(),
+                    );
+                if auto_expanded {
+                    self.turn_expand_at
+                        .entry(turn.id.clone())
+                        .or_insert_with(Instant::now);
+                }
+            }
             // The streaming message is always the newest assistant message:
             // the last member of its turn, or a solo assistant item.
             let streaming = match &item.kind {
@@ -660,26 +843,32 @@ impl ChatList {
                         item_ix,
                         part: SlotPart::Lead,
                     });
-                    keys.push((signature, 0));
+                    keys.push((signature, hash_values(&(0_u64, presentation))));
                     for index in 1..chunks.len() - 1 {
                         slots.push(ChatSlot {
                             item_ix,
                             part: SlotPart::Chunk(index),
                         });
-                        keys.push((signature, chunks[index].key));
+                        keys.push((
+                            signature,
+                            hash_values(&(chunks[index].key, presentation)),
+                        ));
                     }
                     slots.push(ChatSlot {
                         item_ix,
                         part: SlotPart::Tail,
                     });
-                    keys.push((signature, chunks[chunks.len() - 1].key));
+                    keys.push((
+                        signature,
+                        hash_values(&(chunks[chunks.len() - 1].key, presentation)),
+                    ));
                 }
                 _ => {
                     slots.push(ChatSlot {
                         item_ix,
                         part: SlotPart::Whole,
                     });
-                    keys.push((signature, 0));
+                    keys.push((signature, hash_values(&(0_u64, presentation))));
                 }
             }
         }
@@ -723,7 +912,17 @@ impl ChatList {
             stream,
             reasoning_scrolls: Rc::clone(&self.reasoning_scrolls),
             code_scrolls: Rc::clone(&self.code_scrolls),
+            jump_flash: None,
+            turn_expand_at: Rc::new(self.turn_expand_at.clone()),
+            turn_block_heights: Rc::clone(&self.turn_block_heights),
         }
+    }
+
+    /// turn 高度渐显期间需要逐帧重绘（进度在渲染期计算）。
+    pub fn turn_height_animating(&self) -> bool {
+        self.turn_expand_at
+            .values()
+            .any(|at| at.elapsed() < TURN_HEIGHT_REVEAL)
     }
 
     // --- streaming reveal --------------------------------------------------
@@ -968,6 +1167,80 @@ impl ChatList {
         };
         Some((top, thumb_height, viewport))
     }
+
+    // --- prompt rail -------------------------------------------------------
+
+    /// Cheap `Rc` clone of the query marks, in transcript order.
+    pub fn prompt_marks(&self) -> Rc<Vec<PromptMark>> {
+        Rc::clone(&self.prompt_marks)
+    }
+
+    /// Rail geometry for this frame, or `None` while there is nothing to
+    /// navigate (no queries, first layout, or a conversation too narrow for
+    /// the rail to sit beside the message column).
+    pub fn prompt_rail_metrics(&self) -> Option<PromptRailMetrics> {
+        if self.prompt_marks.is_empty() {
+            return None;
+        }
+        let bounds = self.list_state.viewport_bounds();
+        let body_height = f32::from(bounds.size.height);
+        let width = f32::from(bounds.size.width);
+        if width < PROMPT_RAIL_MIN_WIDTH || body_height <= PROMPT_RAIL_INSET * 2.0 + PROMPT_RAIL_ROW
+        {
+            return None;
+        }
+        let rail_height = body_height - PROMPT_RAIL_INSET * 2.0;
+        let total = self.prompt_marks.len() as f32 * PROMPT_RAIL_ROW;
+        let view_height = total.min(rail_height);
+        Some(PromptRailMetrics {
+            body_height,
+            view_height,
+            pad: ((rail_height - view_height) * 0.5).max(0.0),
+            max_scroll: (total - view_height).max(0.0),
+        })
+    }
+
+    /// Mark containing the top of the viewport. The scroll position is already
+    /// a `(slot, offset)` pair, so this is one binary search over the marks —
+    /// O(log n) per scroll frame, with no transcript scan.
+    pub fn active_prompt_index(&self) -> Option<usize> {
+        if self.prompt_marks.is_empty() {
+            return None;
+        }
+        let ListOffset { item_ix, .. } = self.list_state.logical_scroll_top();
+        let position = self.prompt_marks.partition_point(|mark| {
+            self.first_slots
+                .get(mark.item_ix)
+                .is_none_or(|first| *first <= item_ix)
+        });
+        // Above the first query there is no owning mark; like ZCode's
+        // navigator, fall back to the first entry instead of no highlight.
+        Some(position.saturating_sub(1))
+    }
+
+    /// Jump to one query by index. `first_slots` was built with the current
+    /// slot plan, so this is a single `scroll_to` (O(1)); no searching for the
+    /// message, no layout of intermediate rows.
+    pub fn jump_to_prompt(&mut self, mark_ix: usize) -> Option<SharedString> {
+        // Copy the plan out before mutating the list: the mark borrows
+        // `prompt_marks`, and `cancel_glide`/`scroll_to` need `&mut self`.
+        let (slot_ix, id) = {
+            let mark = self.prompt_marks.get(mark_ix)?;
+            (*self.first_slots.get(mark.item_ix)?, mark.id.clone())
+        };
+        self.pinned = false;
+        self.cancel_glide();
+        self.list_state.scroll_to(ListOffset {
+            item_ix: slot_ix,
+            // Small negative offset leaves breathing room above the bubble.
+            offset_in_item: px(-16.0),
+        });
+        // A programmatic scroll does not fire the list's scroll handler, so
+        // clearing this keeps `sync_scroll` from recomputing `pinned` from
+        // pre-jump geometry on the next frame.
+        self.scroll_dirty = false;
+        Some(id)
+    }
 }
 
 impl Default for ChatList {
@@ -995,6 +1268,136 @@ fn same_result(left: &ToolResult, right: &ToolResult) -> bool {
         && left.is_error == right.is_error
         && left.duration_ms == right.duration_ms
         && left.content == right.content
+}
+
+/// One rail mark per real user query, in transcript order. The reply preview
+/// for a query spans every assistant message until the next query, so a
+/// multi-step turn shows the same text the user remembers answering.
+fn build_prompt_marks(items: &[Rc<ChatItem>], running: bool) -> Vec<PromptMark> {
+    let mut marks = Vec::new();
+    let mut index = 0;
+    while index < items.len() {
+        let ChatItemKind::User {
+            text, attachments, ..
+        } = &items[index].kind
+        else {
+            index += 1;
+            continue;
+        };
+        let mut user_source = text.to_string();
+        if user_source.trim().is_empty() && !attachments.is_empty() {
+            user_source = format!(
+                "附件：{}",
+                attachments
+                    .iter()
+                    .map(crate::attachments::chip_title)
+                    .collect::<Vec<_>>()
+                    .join("、")
+            );
+        }
+        let user_preview = preview_text(
+            &[user_source.as_str()],
+            "用户输入",
+            PROMPT_PREVIEW_CHARS,
+            PROMPT_PREVIEW_PARAGRAPHS,
+        );
+
+        // Walk to the next query once; each assistant body is visited by
+        // exactly one mark, so building the entire rail stays O(items).
+        let mut end = index + 1;
+        let mut bodies: Vec<&str> = Vec::new();
+        while end < items.len() {
+            match &items[end].kind {
+                ChatItemKind::User { .. } | ChatItemKind::AgentMessage { .. } => break,
+                ChatItemKind::Assistant(assistant) => bodies.push(assistant.text.as_ref()),
+                ChatItemKind::Turn(turn) => {
+                    bodies.extend(turn.members.iter().map(|member| member.text.as_ref()));
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        let assistant_preview = if bodies.iter().any(|body| !body.trim().is_empty()) {
+            preview_text(&bodies, "", PROMPT_PREVIEW_CHARS, PROMPT_PREVIEW_PARAGRAPHS)
+        } else {
+            String::new()
+        };
+        marks.push(PromptMark {
+            id: items[index].id.clone().into(),
+            item_ix: index,
+            user_preview: user_preview.into(),
+            assistant_placeholder: assistant_preview.is_empty(),
+            assistant_preview: assistant_preview.into(),
+            running: false,
+        });
+        index = end;
+    }
+    if running && let Some(last) = marks.last_mut() {
+        last.running = true;
+    }
+    marks
+}
+
+/// Flatten preview source for the rail's hover card: whitespace runs collapse,
+/// blank lines become paragraph breaks (at most `max_paragraphs`), and the scan
+/// stops one character past the budget. A 300 KB answer therefore costs the
+/// same as a short one, which keeps rebuilds proportional to query count.
+fn preview_text(texts: &[&str], fallback: &str, max_chars: usize, max_paragraphs: usize) -> String {
+    let max_chars = max_chars.max(8);
+    let max_paragraphs = max_paragraphs.max(1);
+    let mut out = String::with_capacity(max_chars + 1);
+    let mut chars = 0usize;
+    let mut paragraphs = 1usize;
+    let mut pending_space = false;
+    let mut newlines = 0usize;
+    let mut overflow = false;
+    'texts: for text in texts {
+        if !out.is_empty() {
+            pending_space = true;
+            newlines = 2;
+        }
+        for ch in text.chars() {
+            if ch.is_whitespace() {
+                pending_space = true;
+                if ch == '\n' {
+                    newlines += 1;
+                }
+                continue;
+            }
+            if pending_space && !out.is_empty() {
+                if newlines >= 2 {
+                    if paragraphs >= max_paragraphs {
+                        overflow = true;
+                        break 'texts;
+                    }
+                    paragraphs += 1;
+                    out.push('\n');
+                } else {
+                    out.push(' ');
+                }
+                chars += 1;
+            }
+            out.push(ch);
+            chars += 1;
+            pending_space = false;
+            newlines = 0;
+            if chars > max_chars {
+                overflow = true;
+                break 'texts;
+            }
+        }
+    }
+    if out.is_empty() {
+        return fallback.to_string();
+    }
+    if overflow {
+        let mut cut: String = out.chars().take(max_chars.saturating_sub(1)).collect();
+        let trimmed = cut.trim_end().len();
+        cut.truncate(trimmed);
+        cut.push('…');
+        return cut;
+    }
+    out
 }
 
 /// Derive the per-message assistant snapshot: joined text/reasoning, the
@@ -1161,6 +1564,26 @@ fn message_signature(
             }
         }
     }
+    for attachment in &message.attachments {
+        4u8.hash(&mut hasher);
+        attachment.name.hash(&mut hasher);
+        attachment.path.hash(&mut hasher);
+        attachment.size.hash(&mut hasher);
+        attachment.truncated.hash(&mut hasher);
+        let kind = match attachment.kind {
+            AttachmentKind::File => 0u8,
+            AttachmentKind::Image => 1u8,
+            AttachmentKind::Skill => 2u8,
+        };
+        kind.hash(&mut hasher);
+        // Bodies are immutable after creation; the length is enough to notice
+        // a reload that replaced them without hashing megabytes per rebuild.
+        attachment
+            .text
+            .as_ref()
+            .map(|text| text.len())
+            .hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -1319,15 +1742,26 @@ pub(crate) fn render_chat_item(
     let Some(item) = view.items.get(slot.item_ix) else {
         return div().into_any_element();
     };
+    let flash_seq = view
+        .jump_flash
+        .as_ref()
+        .filter(|flash| flash.message_id.as_ref() == item.id.as_str())
+        .map(|flash| flash.seq);
     let content = match (&item.kind, slot.part) {
         (_, SlotPart::Whole) => match &item.kind {
-            ChatItemKind::User { text, steered } => render_user(
+            ChatItemKind::User {
+                text,
+                steered,
+                attachments,
+            } => render_user(
                 theme,
                 text,
+                attachments,
                 &item.id,
                 *steered,
                 view.running,
                 view.actions_enabled,
+                flash_seq,
                 entity,
             ),
             ChatItemKind::Assistant(assistant) => render_assistant(assistant, view, theme, entity),
@@ -1442,10 +1876,12 @@ pub(crate) fn render_chat_item(
 fn render_user(
     theme: &Theme,
     text: &SharedString,
+    attachments: &[UserAttachment],
     message_id: &str,
     steered: bool,
     running: bool,
     actions: bool,
+    flash_seq: Option<u64>,
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let group = SharedString::from(format!("user-{message_id}"));
@@ -1487,22 +1923,99 @@ fn render_user(
     }
     // ZCode user bubble: 12px radius with a 2px top-right corner (the "tail"
     // pointing at the sender), 16/12 padding, capped at 576px.
-    container = container.child(
-        div()
-            .max_w(px(576.0))
-            .min_w(px(0.0))
+    let mut bubble = div()
+        .max_w(px(576.0))
+        .min_w(px(0.0))
+        .rounded(px(12.0))
+        .rounded_tr(px(2.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.user_bubble)
+        .px(px(16.0))
+        .py(px(12.0))
+        .text_size(px(14.0))
+        .line_height(px(21.0))
+        .text_color(theme.text);
+    if !attachments.is_empty() {
+        let mut chips = div().flex().flex_wrap().items_center().gap(px(6.0));
+        if !text.is_empty() {
+            chips = chips.mb(px(8.0));
+        }
+        for attachment in attachments {
+            let icon = match attachment.kind {
+                AttachmentKind::Skill => icons::SPARKLES,
+                AttachmentKind::Image | AttachmentKind::File => icons::FILE,
+            };
+            let tint = match attachment.kind {
+                AttachmentKind::Skill => theme.agent_purple,
+                AttachmentKind::Image => theme.agent_green,
+                AttachmentKind::File => theme.text_muted,
+            };
+            chips = chips.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(24.0))
+                    .px(px(7.0))
+                    .rounded(px(6.0))
+                    .bg(theme.surface)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(svg().path(icon).size(px(11.0)).text_color(tint))
+                    .child(
+                        div()
+                            .max_w(px(220.0))
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(crate::attachments::chip_title(attachment)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(9.5))
+                            .text_color(theme.text_faint)
+                            .child(crate::attachments::format_bytes(attachment.size)),
+                    ),
+            );
+        }
+        bubble = bubble.child(chips);
+    }
+    if !text.is_empty() {
+        bubble = bubble.child(text.to_string());
+    }
+    // Rail jump landed here: a one-shot accent ring that holds briefly and
+    // fades. It is an overlay (no layout, no hitbox), so the bubble never
+    // shifts and the animation cannot swallow hover actions.
+    if let Some(seq) = flash_seq {
+        let ring = div()
+            .absolute()
+            .inset_0()
             .rounded(px(12.0))
             .rounded_tr(px(2.0))
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.user_bubble)
-            .px(px(16.0))
-            .py(px(12.0))
-            .text_size(px(14.0))
-            .line_height(px(21.0))
-            .text_color(theme.text)
-            .child(text.to_string()),
-    );
+            .border_color(theme.accent);
+        bubble = bubble.relative().child(if reduce_motion() {
+            // Reduced motion keeps a static ring; it is replaced on the next
+            // jump, so nothing needs to time it out.
+            ring.opacity(0.55).into_any_element()
+        } else {
+            ring.with_animation(
+                SharedString::from(format!("prompt-jump-flash-{seq}")),
+                Animation::new(Duration::from_millis(1100)).with_easing(|delta| {
+                    if delta < 0.55 {
+                        1.0
+                    } else {
+                        (1.0 - delta) / 0.45
+                    }
+                }),
+                |element, delta| element.opacity(delta),
+            )
+            .into_any_element()
+        });
+    }
+    container = container.child(bubble);
     // Steered messages ride inside a turn owned by another user message, so
     // editing/undoing them would rewind checkpoints they never had.
     let actions = actions && !steered;
@@ -1728,7 +2241,7 @@ fn render_assistant(
         column = column.child(markdown);
     }
 
-    let mut column = append_tool_rows(column, assistant, view, theme, entity);
+    let mut column = append_tool_rows(column, assistant, view, theme, entity, None);
     if !texts.active() && has_text {
         column = column.child(render_copy_footer(assistant, &message_group, theme));
     }
@@ -1807,7 +2320,7 @@ fn render_assistant_tail(
         column = column.child(markdown);
     }
 
-    let mut column = append_tool_rows(column, assistant, view, theme, entity);
+    let mut column = append_tool_rows(column, assistant, view, theme, entity, None);
     if !texts.active() && !texts.text().trim().is_empty() {
         column = column.child(render_copy_footer(assistant, &message_group, theme));
     }
@@ -1839,10 +2352,185 @@ fn turn_is_live(turn: &TurnItem, view: &ChatViewState) -> bool {
 /// expand; otherwise a live turn stays expanded and finished ones fold into
 /// their summary line.
 fn turn_expanded(turn: &TurnItem, view: &ChatViewState) -> bool {
-    if view.collapsed_turns.contains(&turn.id) {
+    turn_expanded_with(
+        turn,
+        &view.collapsed_turns,
+        &view.expanded_turns,
+        view.running,
+        view.stream.as_ref().map(|stream| stream.message_id.as_str()),
+    )
+}
+
+/// `turn_expanded` 的参数化版本：`prepare_frame` 在构造 `ChatViewState` 之前
+/// 也要判断展开态（做 slot key 指纹与自动展开计时）。
+fn turn_expanded_with(
+    turn: &TurnItem,
+    collapsed_turns: &HashSet<String>,
+    expanded_turns: &HashSet<String>,
+    running: bool,
+    streaming_id: Option<&str>,
+) -> bool {
+    if collapsed_turns.contains(&turn.id) {
         return false;
     }
-    view.expanded_turns.contains(&turn.id) || (view.running && turn_is_live(turn, view))
+    let live = running
+        && streaming_id.is_some_and(|streaming_id| {
+            turn.members
+                .iter()
+                .any(|member| member.message.id == streaming_id)
+        });
+    expanded_turns.contains(&turn.id) || live
+}
+
+/// 影响条目渲染高度的呈现状态指纹（折叠/展开面板、reasoning/tool 行）。
+/// 混进 slot key：这些状态一改，前缀对齐就断在该条目、触发 splice，让
+/// ListState 重新测量它——否则视口外的高度缓存失真，折叠展开后滚动边界
+/// 会漂移，出现“滚不到上下全部内容”。
+fn item_presentation(
+    item: &ChatItem,
+    expanded_reasoning: &HashSet<String>,
+    expanded_tools: &HashSet<String>,
+    expanded_turns: &HashSet<String>,
+    collapsed_turns: &HashSet<String>,
+    running: bool,
+    streaming_id: Option<&str>,
+) -> u64 {
+    match &item.kind {
+        ChatItemKind::Turn(turn) => {
+            let mut flags = vec![turn_expanded_with(
+                turn,
+                collapsed_turns,
+                expanded_turns,
+                running,
+                streaming_id,
+            )];
+            flags.extend(
+                turn.members
+                    .iter()
+                    .map(|member| expanded_reasoning.contains(&member.message.id)),
+            );
+            hash_values(&flags)
+        }
+        ChatItemKind::Assistant(assistant) => {
+            let mut flags = vec![expanded_reasoning.contains(&assistant.message.id)];
+            flags.extend(
+                assistant
+                    .message
+                    .tool_calls()
+                    .iter()
+                    .map(|call| expanded_tools.contains(&call.id)),
+            );
+            hash_values(&flags)
+        }
+        _ => 0,
+    }
+}
+
+/// 展开内容的渐显上下文：`fresh` 只在展开窗口内为真，窗口外的重新挂载
+/// （例如滚动来回）直接全亮，不重放动画；`height_progress` 驱动高度从 0
+/// 长到自然高度。
+#[derive(Clone, Copy)]
+struct TurnReveal<'a> {
+    turn_id: &'a str,
+    fresh: bool,
+    height_progress: f32,
+}
+
+impl TurnReveal<'_> {
+    /// 用 `with_animations` 两段式实现 stagger：第一段只是静默等待
+    /// `index × 50ms`，第二段 180ms ease-out 渐显。元素挂载期间动画状态
+    /// 由 GPUI 按元素路径持久保存，折叠后重新展开才会重放。
+    fn apply(self, element: impl IntoElement, index: usize) -> AnyElement {
+        let element = element.into_any_element();
+        if !self.fresh || reduce_motion() {
+            return element;
+        }
+        let delay = TURN_EXPAND_STAGGER * index.min(TURN_EXPAND_STAGGER_STEPS) as u32;
+        div()
+            .w_full()
+            .child(element)
+            .with_animations(
+                SharedString::from(format!("turn-reveal-{}-{index}", self.turn_id)),
+                vec![
+                    Animation::new(delay),
+                    Animation::new(TURN_EXPAND_FADE)
+                        .with_easing(|delta| 1.0 - (1.0 - delta).powi(3)),
+                ],
+                |element, animation_ix, delta| {
+                    element.opacity(if animation_ix == 0 { 0.0 } else { delta })
+                },
+            )
+            .into_any_element()
+    }
+}
+
+/// 展开内容的高度渐显容器。
+///
+/// GPUI 没有 height transition，但列表每帧都会重新测量可见项，只要逐帧
+/// 给出高度，下方内容就会跟着真实布局平滑让位。做法：外层裁剪容器高度取
+/// 「进度 × 自然高度」，内层仍按自然高度布局（flex_none 不被压缩，超出的
+/// 部分被裁掉——hitbox 与 content mask 求交，裁掉区域也不会接住点击）。
+/// 内层里填充满块的 canvas 把自然高度写回缓存，下一帧据此计算显示高度。
+/// 窗口结束后直接回到自然布局，不留包装。
+fn reveal_height_block(
+    block: impl IntoElement,
+    reveal: TurnReveal,
+    suffix: &str,
+    heights: &Rc<RefCell<HashMap<String, f32>>>,
+) -> AnyElement {
+    if !reveal.fresh || reduce_motion() {
+        return block.into_any_element();
+    }
+    let key = format!("{}#{suffix}", reveal.turn_id);
+    let visible_height =
+        heights.borrow().get(&key).copied().unwrap_or_default() * reveal.height_progress;
+    let heights = Rc::clone(heights);
+    div()
+        .w_full()
+        .h(px(visible_height))
+        .overflow_hidden()
+        .child(
+            div()
+                .relative()
+                .w_full()
+                .flex_none()
+                .child(block)
+                .child(
+                    canvas(
+                        move |bounds, _window, _cx| {
+                            heights
+                                .borrow_mut()
+                                .insert(key.clone(), f32::from(bounds.size.height));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                ),
+        )
+        .into_any_element()
+}
+
+/// 该 turn 当前是否需要播展开渐显（窗口由 `note_turn_expanded` 打点）。
+fn turn_reveal_context<'a>(turn: &'a TurnItem, view: &ChatViewState) -> TurnReveal<'a> {
+    let Some(at) = view.turn_expand_at.get(&turn.id) else {
+        return TurnReveal {
+            turn_id: &turn.id,
+            fresh: false,
+            height_progress: 1.0,
+        };
+    };
+    let elapsed = at.elapsed();
+    let height_progress = if reduce_motion() {
+        1.0
+    } else {
+        ease_out_cubic((elapsed.as_secs_f32() / TURN_HEIGHT_REVEAL.as_secs_f32()).min(1.0))
+    };
+    TurnReveal {
+        turn_id: &turn.id,
+        fresh: elapsed < TURN_EXPAND_WINDOW,
+        height_progress,
+    }
 }
 
 /// Aggregate status bar of a turn block, ZCode-style: a full-width
@@ -1929,6 +2617,10 @@ fn render_turn_header(
 
     div()
         .w_full()
+        .flex()
+        .flex_col()
+        // 悬停高亮做成内嵌圆角小条（负外边距保持文字与内容栏对齐），和
+        // 下方分隔线分离：高亮不再是盖住细线的整条色块。
         .child(
             div()
                 .id(SharedString::from(format!("turn-head-{}", turn.id)))
@@ -1936,9 +2628,10 @@ fn render_turn_header(
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .pb(px(6.0))
-                .border_b_1()
-                .border_color(theme.border)
+                .mx(px(-6.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .rounded(px(radius::SM))
                 .cursor_pointer()
                 .hover(|style| style.bg(theme.hover))
                 .on_click(move |_, _, cx| {
@@ -1965,20 +2658,24 @@ fn render_turn_header(
                     )
                 })
                 .child(label_element)
-                .child(div().flex_1())
+                // 折叠箭头跟在状态文字右侧（与左栏折叠尖一致），悬停才出现；
+                // 之后才是弹性留白。
                 .child(
                     div()
                         .flex_none()
+                        .flex()
                         .opacity(0.0)
                         .group_hover(row_group, |style| style.opacity(1.0))
                         .child(disclosure_chevron(
                             SharedString::from(format!("turn-chevron-{}", turn.id)),
                             expanded,
-                            theme.text_faint,
+                            theme.text_muted,
                             12.0,
                         )),
-                ),
+                )
+                .child(div().flex_1()),
         )
+        .child(div().h(px(1.0)).w_full().mt(px(3.0)).bg(theme.border))
         .into_any_element()
 }
 
@@ -1990,10 +2687,12 @@ fn render_turn_member(
     view: &ChatViewState,
     theme: &Theme,
     entity: &WeakEntity<AppView>,
+    reveal: TurnReveal,
+    reveal_ix: &mut usize,
 ) -> Div {
     let mut column = column;
     if !member.reasoning.is_empty() {
-        column = column.child(render_reasoning(
+        let reasoning = render_reasoning(
             &member.message.id,
             &member.reasoning,
             member.reasoning_duration,
@@ -2002,16 +2701,27 @@ fn render_turn_member(
             view,
             theme,
             entity,
-        ));
+        );
+        column = column.child(reveal.apply(reasoning, *reveal_ix));
+        *reveal_ix += 1;
     }
     if !member.text.trim().is_empty() {
-        column = column.child(div().opacity(0.72).child(render_markdown_keyed(
+        let text_element = div().opacity(0.72).child(render_markdown_keyed(
             theme,
             &member.text,
             member.text_key,
-        )));
+        ));
+        column = column.child(reveal.apply(text_element, *reveal_ix));
+        *reveal_ix += 1;
     }
-    append_tool_rows(column, member, view, theme, entity)
+    append_tool_rows(
+        column,
+        member,
+        view,
+        theme,
+        entity,
+        Some((reveal, *reveal_ix)),
+    )
 }
 
 /// The body member's reasoning row; only mounted while the activity is
@@ -2022,12 +2732,14 @@ fn render_turn_body_reasoning(
     view: &ChatViewState,
     theme: &Theme,
     entity: &WeakEntity<AppView>,
+    reveal: TurnReveal,
+    reveal_ix: &mut usize,
 ) -> Div {
     let texts = assistant_texts(body, view);
     if texts.reasoning().is_empty() {
         return column;
     }
-    column.child(render_reasoning(
+    let reasoning = render_reasoning(
         &body.message.id,
         texts.reasoning(),
         body.reasoning_duration,
@@ -2036,7 +2748,10 @@ fn render_turn_body_reasoning(
         view,
         theme,
         entity,
-    ))
+    );
+    let child = reveal.apply(reasoning, *reveal_ix);
+    *reveal_ix += 1;
+    column.child(child)
 }
 
 /// Short turn (or a still-tiny streaming body): header, activity, answer
@@ -2052,13 +2767,33 @@ fn render_turn(
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
+    let reveal = turn_reveal_context(turn, view);
+    let mut reveal_ix = 0;
 
     column = column.child(render_turn_header(turn, expanded, view, theme, entity));
     if expanded {
+        // 活动栈整体放进高度渐显容器：展开时高度逐帧长高，答案文字与下方
+        // 内容随真实布局平滑下移，而不是被瞬间撑开的一大截顶飞。
+        let mut activity = div().w_full().flex().flex_col().gap(px(12.0));
         for member in &turn.members[..turn.members.len() - 1] {
-            column = render_turn_member(column, member, view, theme, entity);
+            activity =
+                render_turn_member(activity, member, view, theme, entity, reveal, &mut reveal_ix);
         }
-        column = render_turn_body_reasoning(column, body, view, theme, entity);
+        activity = render_turn_body_reasoning(
+            activity,
+            body,
+            view,
+            theme,
+            entity,
+            reveal,
+            &mut reveal_ix,
+        );
+        column = column.child(reveal_height_block(
+            activity,
+            reveal,
+            "activity",
+            &view.turn_block_heights,
+        ));
     }
 
     let has_text = !texts.text().trim().is_empty();
@@ -2073,7 +2808,14 @@ fn render_turn(
     }
 
     if expanded {
-        column = append_tool_rows(column, body, view, theme, entity);
+        column = append_tool_rows(
+            column,
+            body,
+            view,
+            theme,
+            entity,
+            Some((reveal, reveal_ix)),
+        );
     }
     if !texts.active() && has_text {
         column = column.child(render_copy_footer(body, &message_group, theme));
@@ -2094,13 +2836,31 @@ fn render_turn_lead(
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
+    let reveal = turn_reveal_context(turn, view);
+    let mut reveal_ix = 0;
 
     column = column.child(render_turn_header(turn, expanded, view, theme, entity));
     if expanded {
+        let mut activity = div().w_full().flex().flex_col().gap(px(12.0));
         for member in &turn.members[..turn.members.len() - 1] {
-            column = render_turn_member(column, member, view, theme, entity);
+            activity =
+                render_turn_member(activity, member, view, theme, entity, reveal, &mut reveal_ix);
         }
-        column = render_turn_body_reasoning(column, body, view, theme, entity);
+        activity = render_turn_body_reasoning(
+            activity,
+            body,
+            view,
+            theme,
+            entity,
+            reveal,
+            &mut reveal_ix,
+        );
+        column = column.child(reveal_height_block(
+            activity,
+            reveal,
+            "activity",
+            &view.turn_block_heights,
+        ));
     }
     if let Some(chunk) = slot_chunk(body, view, 0) {
         column = column.child(render_markdown_chunk(
@@ -2125,6 +2885,7 @@ fn render_turn_tail(
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
+    let reveal = turn_reveal_context(turn, view);
 
     let last = slot_chunks(body, view).and_then(|chunks| chunks.last());
     if let Some(chunk) = last {
@@ -2139,7 +2900,7 @@ fn render_turn_tail(
     }
 
     if expanded {
-        column = append_tool_rows(column, body, view, theme, entity);
+        column = append_tool_rows(column, body, view, theme, entity, Some((reveal, 0)));
     }
     if !texts.active() && !texts.text().trim().is_empty() {
         column = column.child(render_copy_footer(body, &message_group, theme));
@@ -2156,6 +2917,7 @@ fn append_tool_rows(
     view: &ChatViewState,
     theme: &Theme,
     entity: &WeakEntity<AppView>,
+    reveal: Option<(TurnReveal, usize)>,
 ) -> Div {
     let message = &assistant.message;
     let calls: Vec<&ToolCall> = message
@@ -2200,7 +2962,19 @@ fn append_tool_rows(
     if rows.is_empty() {
         return column;
     }
-    column.child(div().w_full().flex().flex_col().gap(px(4.0)).children(rows))
+    let group = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .children(rows);
+    match reveal {
+        Some((reveal, index)) => column.child(reveal.apply(
+            reveal_height_block(group, reveal, "tools", &view.turn_block_heights),
+            index,
+        )),
+        None => column.child(group),
+    }
 }
 
 /// Hover-revealed copy button plus the ZCode-style timestamp, shared by
@@ -3084,6 +3858,235 @@ fn render_error(theme: &Theme, text: &str) -> AnyElement {
         .into_any_element()
 }
 
+/// The left-edge query navigator: one short bar per user prompt, a widened
+/// bar plus preview card on hover, and a click that jumps to that query.
+///
+/// Only rows intersecting the rail viewport are built, so a long session
+/// renders O(visible) bars per frame; the scroll position comes from the list's
+/// logical top and the jump target from `first_slots`, both O(1).
+pub(crate) fn render_prompt_rail(
+    theme: &Theme,
+    marks: &[PromptMark],
+    state: &PromptRailState,
+    metrics: &PromptRailMetrics,
+    active: usize,
+    entity: &WeakEntity<AppView>,
+) -> AnyElement {
+    let scroll = state.scroll;
+    let first = (((scroll / PROMPT_RAIL_ROW).floor() as isize) - 1).max(0) as usize;
+    let last =
+        ((((scroll + metrics.view_height) / PROMPT_RAIL_ROW).ceil() as usize) + 2).min(marks.len());
+
+    let leave_entity = entity.clone();
+    let mut rail = div()
+        .id("prompt-rail")
+        .absolute()
+        .left(px(14.0))
+        // The interactive root hugs the visible rows (centered when the
+        // transcript has few queries); its hover hitbox must not cover the
+        // empty space above/below the rail.
+        .top(px(PROMPT_RAIL_INSET + metrics.pad))
+        .w(px(PROMPT_RAIL_WIDTH))
+        .h(px(metrics.view_height))
+        .relative()
+        // Row leave events are intentionally ignored: moving between rows must
+        // not clear the newly entered one (enter/leave order is not ordered by
+        // row). Only leaving the whole rail clears the hover state.
+        .on_hover(move |hovered: &bool, _, cx| {
+            if !*hovered {
+                let _ = leave_entity.update(cx, |this, cx| {
+                    this.prompt_rail_hover(None, cx);
+                });
+            }
+        });
+
+    for (index, mark) in marks.iter().enumerate().take(last).skip(first) {
+        let y = index as f32 * PROMPT_RAIL_ROW - scroll;
+        if y + PROMPT_RAIL_ROW <= 0.0 || y >= metrics.view_height {
+            continue;
+        }
+        let hovered = state.hover == Some(index);
+        let is_active = index == active;
+        let color = if hovered {
+            theme.text
+        } else if is_active || mark.running {
+            theme.text_muted
+        } else {
+            with_alpha(theme.text_faint, 0.55)
+        };
+        let idle = if is_active || mark.running {
+            PROMPT_LINE_ACTIVE
+        } else {
+            PROMPT_LINE_IDLE
+        };
+        let target = if hovered { PROMPT_LINE_HOVER } else { idle };
+        // A row that was hovered last frame starts wide so leaving animates
+        // back down; every other row starts and ends at its resting width.
+        let start = if hovered {
+            idle
+        } else if state.previous_hover == Some(index) {
+            PROMPT_LINE_HOVER
+        } else {
+            target
+        };
+
+        let line = div().h(px(2.0)).rounded(px(999.0)).bg(color).w(px(target));
+        let line = if reduce_motion() {
+            line.into_any_element()
+        } else {
+            line.with_animation(
+                SharedString::from(format!("prompt-rail-line-{}-{}", mark.id, state.hover_seq)),
+                Animation::new(PROMPT_LINE_MOTION).with_easing(ease_out_cubic),
+                move |element, delta| element.w(px(start + (target - start) * delta)),
+            )
+            .into_any_element()
+        };
+        // The newest query of a live run breathes, matching the activity rows
+        // in the transcript.
+        let line = if mark.running && !reduce_motion() {
+            div()
+                .child(line)
+                .with_animation(
+                    SharedString::from(format!("prompt-rail-pulse-{}", mark.id)),
+                    Animation::new(Duration::from_millis(1600)).repeat(),
+                    |element, delta| element.opacity(pulsating_between(0.45, 1.0)(delta)),
+                )
+                .into_any_element()
+        } else {
+            line
+        };
+
+        let hover_entity = entity.clone();
+        let click_entity = entity.clone();
+        rail = rail.child(
+            div()
+                .id(SharedString::from(format!("prompt-rail-row-{}", mark.id)))
+                .absolute()
+                .left(px(0.0))
+                .top(px(y))
+                .w(px(PROMPT_RAIL_WIDTH))
+                .h(px(PROMPT_RAIL_ROW))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_hover(move |hovered: &bool, _, cx| {
+                    if *hovered {
+                        let _ = hover_entity.update(cx, |this, cx| {
+                            this.prompt_rail_hover(Some(index), cx);
+                        });
+                    }
+                })
+                .on_click(move |_, _, cx| {
+                    let _ = click_entity.update(cx, |this, cx| {
+                        this.prompt_rail_click(index, cx);
+                    });
+                })
+                .child(line),
+        );
+    }
+
+    // Painted inside the rail so its capture listener runs before the chat
+    // interceptor (which is painted after the rail); it claims the wheel only
+    // when the rail can actually move.
+    rail = rail.child(
+        prompt_rail_wheel_overlay(entity.clone())
+            .absolute()
+            .inset_0(),
+    );
+
+    let mut wrapper = div().absolute().inset_0().child(rail);
+    if let Some(card_ix) = state.card.filter(|index| *index < marks.len()) {
+        wrapper = wrapper.child(render_prompt_rail_card(
+            theme, marks, state, metrics, card_ix,
+        ));
+    }
+    wrapper.into_any_element()
+}
+
+/// Hover card for one query: the user prompt (two lines) above the flattened
+/// reply preview (three lines), anchored beside the hovered bar.
+fn render_prompt_rail_card(
+    theme: &Theme,
+    marks: &[PromptMark],
+    state: &PromptRailState,
+    metrics: &PromptRailMetrics,
+    card_ix: usize,
+) -> AnyElement {
+    let mark = &marks[card_ix];
+    let row_center = PROMPT_RAIL_INSET + metrics.pad + card_ix as f32 * PROMPT_RAIL_ROW
+        - state.scroll
+        + PROMPT_RAIL_ROW * 0.5;
+    let top = (row_center - PROMPT_RAIL_POPOVER_ESTIMATE * 0.5).clamp(
+        8.0,
+        (metrics.body_height - PROMPT_RAIL_POPOVER_ESTIMATE - 8.0).max(8.0),
+    );
+    let assistant = if mark.assistant_placeholder {
+        if mark.running {
+            "助手仍在工作"
+        } else {
+            "暂无助手正文"
+        }
+    } else {
+        mark.assistant_preview.as_ref()
+    };
+    let card = div()
+        .absolute()
+        .left(px(56.0))
+        .top(px(top))
+        .w(px(PROMPT_RAIL_POPOVER_WIDTH))
+        .p(px(12.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(theme.border_strong)
+        .bg(theme.elevated)
+        .shadow(shadow_float(theme))
+        // The card is informational, but it must not let a click fall through
+        // to a hover action on the message underneath it.
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(
+            div()
+                .w_full()
+                .line_clamp(2)
+                .text_size(px(13.0))
+                .line_height(px(20.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(mark.user_preview.clone()),
+        )
+        .child(
+            div()
+                .w_full()
+                .mt(px(8.0))
+                .line_clamp(3)
+                .text_size(px(13.0))
+                .line_height(px(20.0))
+                .text_color(if mark.assistant_placeholder {
+                    theme.text_faint
+                } else {
+                    theme.text_muted
+                })
+                .child(assistant.to_string()),
+        );
+    if reduce_motion() {
+        card.into_any_element()
+    } else {
+        card.with_animation(
+            SharedString::from(format!("prompt-rail-card-{}-{}", card_ix, state.hover_seq)),
+            Animation::new(PROMPT_LINE_MOTION).with_easing(ease_out_cubic),
+            |element, delta| element.opacity(delta),
+        )
+        .into_any_element()
+    }
+}
+
+fn prompt_rail_wheel_overlay(entity: WeakEntity<AppView>) -> Canvas<&'static str> {
+    wheel_capture_overlay(move |_pixel_x, pixel_y, _window, cx| {
+        entity
+            .update(cx, |this, cx| this.prompt_rail_wheel(pixel_y, cx))
+            .unwrap_or(false)
+    })
+}
+
 pub(crate) fn render_scroll_to_bottom(
     theme: &Theme,
     has_new_content: bool,
@@ -3646,5 +4649,84 @@ mod tests {
         for (old, new) in before.iter().zip(after.iter()) {
             assert_eq!(old, new, "stable chunks must keep their ranges");
         }
+    }
+
+    #[test]
+    fn prompt_rail_follow_centers_and_keeps_manual_scroll() {
+        let metrics = PromptRailMetrics {
+            body_height: 600.0,
+            view_height: 100.0,
+            pad: 0.0,
+            max_scroll: 900.0,
+        };
+        let mut state = PromptRailState::default();
+        assert!(state.follow(50, &metrics));
+        assert!((state.scroll - 455.0).abs() < 0.1);
+        // Same active query: no recenter, so a wheel scroll of the rail is not
+        // snapped back while the user browses it.
+        assert!(!state.follow(50, &metrics));
+        state.scroll = 0.0;
+        assert!(!state.follow(50, &metrics));
+        assert_eq!(state.scroll, 0.0);
+        // Moving to another query recenters...
+        assert!(state.follow(51, &metrics));
+        assert!((state.scroll - 465.0).abs() < 0.1);
+        // ...and both ends clamp instead of scrolling past the list.
+        state.follow(0, &metrics);
+        assert_eq!(state.scroll, 0.0);
+        state.follow(999, &metrics);
+        assert_eq!(state.scroll, 900.0);
+    }
+
+    #[test]
+    fn preview_text_collapses_whitespace_into_bounded_paragraphs() {
+        assert_eq!(preview_text(&["  a   b\n\n c "], "", 220, 2), "a b\nc");
+        // A third paragraph would exceed the two-paragraph budget; the preview
+        // stops and marks the cut, matching ZCode's hover cards.
+        assert_eq!(preview_text(&["a\n\nb\n\nc"], "", 220, 2), "a\nb…");
+        let long = "字".repeat(400);
+        let cut = preview_text(&[&long], "", 20, 2);
+        assert_eq!(cut.chars().count(), 20);
+        assert!(cut.ends_with('…'));
+        assert_eq!(preview_text(&[" \n\t"], "用户输入", 220, 2), "用户输入");
+    }
+
+    #[test]
+    fn prompt_marks_follow_queries_and_reply_segments() {
+        let mut session = SessionState::new(std::env::temp_dir(), "test");
+        session.push_message(Message::user("first question"));
+        let mut first = Message::assistant();
+        first.set_text("first answer");
+        session.push_message(first);
+        session.push_message(Message::user("second question"));
+        let mut second = Message::assistant();
+        second.set_text("second answer");
+        session.push_message(second);
+
+        let mut chat = ChatList::new();
+        chat.rebuild(&session, &RunSnapshot::default());
+        let marks = chat.prompt_marks();
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].user_preview.as_ref(), "first question");
+        assert_eq!(marks[0].assistant_preview.as_ref(), "first answer");
+        assert!(!marks[0].assistant_placeholder);
+        assert_eq!(marks[1].user_preview.as_ref(), "second question");
+        assert_eq!(marks[1].assistant_preview.as_ref(), "second answer");
+        assert!(!marks.iter().any(|mark| mark.running));
+
+        // A live run flags exactly the newest query; an empty reply shows the
+        // running placeholder instead of a stale body.
+        session.push_message(Message::user("third question"));
+        chat.rebuild(
+            &session,
+            &RunSnapshot {
+                running: true,
+                ..RunSnapshot::default()
+            },
+        );
+        let marks = chat.prompt_marks();
+        assert_eq!(marks.len(), 3);
+        assert!(marks[2].running);
+        assert!(marks[2].assistant_placeholder);
     }
 }

@@ -1,7 +1,9 @@
-# 发布流水线：tag push（v*）或手动触发时构建 Windows / Linux 产物，
+# 发布流水线：tag push（v*）或手动触发时构建 Windows / Linux / macOS 产物，
 # 全部成功后自动上传到 GitHub Releases。应用内更新检查读取同一仓库的
 # releases/latest（见 crates/app/src/update.rs），产物命名必须保持下面的
-# 平台后缀（-linux-x86_64 / -windows-x86_64），否则客户端无法匹配下载。
+# 平台-架构后缀（-linux-x86_64 / -windows-x86_64 / -macos-aarch64），否则
+# 客户端无法匹配下载。三个平台都会在构建时拉取上游最新的 bash 放进
+# runtime/（见 scripts/fetch-bash.sh 与 scripts/bundle-msys-shell.py）。
 name: Release
 
 on:
@@ -41,6 +43,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev
+
+      # 随包 bash：musl 静态二进制不绑定构建机的 glibc 版本。脚本每次都从
+      # ftp.gnu.org 解析最新的 bash 版本再构建，因此 release 自动拿到更新。
+      - name: 构建随包 bash
+        run: |
+          sudo apt-get install -y musl-tools
+          bash scripts/fetch-bash.sh runtime linux
 
       - name: 解析版本号
         env:
@@ -88,13 +97,17 @@ jobs:
           if-no-files-found: ignore
 
       - name: 冒烟测试
-        run: ./target/release/effibuddy --version
+        run: |
+          ./target/release/effibuddy --version
+          runtime/bash -lc 'echo bundled-bash-ok; ls --version | head -1'
 
       - name: 打包 tar.gz
         run: |
-          mkdir -p "dist/EffiBuddy-$VERSION-linux-x86_64"
-          cp target/release/effibuddy "dist/EffiBuddy-$VERSION-linux-x86_64/"
-          cp README.md "dist/EffiBuddy-$VERSION-linux-x86_64/"
+          bundle="dist/EffiBuddy-$VERSION-linux-x86_64"
+          mkdir -p "$bundle/runtime"
+          cp target/release/effibuddy "$bundle/"
+          cp README.md "$bundle/"
+          cp runtime/bash runtime/BASH-COPYING runtime/BASH-VERSION "$bundle/runtime/"
           tar -czf "EffiBuddy-$VERSION-linux-x86_64.tar.gz" -C dist "EffiBuddy-$VERSION-linux-x86_64"
 
       # 运行时依赖：x11/wayland 输入与 fontconfig 为 gpui 必需，libvulkan1
@@ -102,8 +115,11 @@ jobs:
       - name: 打包 deb
         run: |
           root="dist/effibuddy_${VERSION}_amd64"
-          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/applications"
+          mkdir -p "$root/DEBIAN" "$root/usr/bin" "$root/usr/share/applications" \
+            "$root/usr/lib/effibuddy/runtime"
           install -m 755 target/release/effibuddy "$root/usr/bin/effibuddy"
+          install -m 755 runtime/bash "$root/usr/lib/effibuddy/runtime/bash"
+          install -m 644 runtime/BASH-COPYING runtime/BASH-VERSION "$root/usr/lib/effibuddy/runtime/"
           cat > "$root/DEBIAN/control" <<EOF
           Package: effibuddy
           Version: $VERSION
@@ -144,11 +160,17 @@ jobs:
 
           %install
           install -Dm755 "$PWD/target/release/effibuddy" "%{buildroot}/usr/bin/effibuddy"
+          install -Dm755 "$PWD/runtime/bash" "%{buildroot}/usr/lib/effibuddy/runtime/bash"
+          install -Dm644 "$PWD/runtime/BASH-COPYING" "%{buildroot}/usr/lib/effibuddy/runtime/BASH-COPYING"
+          install -Dm644 "$PWD/runtime/BASH-VERSION" "%{buildroot}/usr/lib/effibuddy/runtime/BASH-VERSION"
           install -Dm644 "$PWD/dist/effibuddy_${VERSION}_amd64/usr/share/applications/effibuddy.desktop" "%{buildroot}/usr/share/applications/effibuddy.desktop"
 
           %files
           %defattr(-,root,root,-)
           /usr/bin/effibuddy
+          /usr/lib/effibuddy/runtime/bash
+          /usr/lib/effibuddy/runtime/BASH-COPYING
+          /usr/lib/effibuddy/runtime/BASH-VERSION
           /usr/share/applications/effibuddy.desktop
           EOF
           rpmbuild -bb --define "_topdir $PWD/rpmbuild" rpmbuild/SPECS/effibuddy.spec
@@ -187,6 +209,11 @@ jobs:
           }
           "VERSION=$v" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      # 随包 bash：解析 MSYS2 实时仓库数据库取当前最新包，逐个校验 sha256
+      # 后抽出 runtime\msys；脚本在 Windows 上还会跑一次 bash 冒烟。
+      - name: 打包随包 bash（MSYS2）
+        run: python scripts/bundle-msys-shell.py runtime/msys
+
       - name: 构建
         shell: pwsh
         run: |
@@ -211,7 +238,12 @@ jobs:
           if-no-files-found: ignore
 
       - name: 冒烟测试
-        run: target\release\effibuddy.exe --version
+        shell: pwsh
+        run: |
+          target\release\effibuddy.exe --version
+          $env:PATH = "$PWD\runtime\msys\usr\bin;$PWD\runtime\msys\usr\local\bin;$env:PATH"
+          & "$PWD\runtime\msys\usr\bin\bash.exe" --noprofile --norc -c "echo bundled-bash-ok; ls --version | head -1"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: 打包 zip
         shell: pwsh
@@ -219,6 +251,7 @@ jobs:
           New-Item -ItemType Directory -Path "dist/EffiBuddy-$env:VERSION-windows-x86_64" | Out-Null
           Copy-Item target\release\effibuddy.exe "dist/EffiBuddy-$env:VERSION-windows-x86_64/"
           Copy-Item README.md "dist/EffiBuddy-$env:VERSION-windows-x86_64/" -ErrorAction SilentlyContinue
+          Copy-Item runtime "dist/EffiBuddy-$env:VERSION-windows-x86_64/runtime" -Recurse
           Compress-Archive -Path "dist/EffiBuddy-$env:VERSION-windows-x86_64" -DestinationPath "EffiBuddy-$env:VERSION-windows-x86_64.zip"
 
       - name: 安装 NSIS
@@ -244,6 +277,9 @@ jobs:
           Section
             SetOutPath "$INSTDIR"
             File "target\release\effibuddy.exe"
+            SetOutPath "$INSTDIR\runtime\msys"
+            File /r "runtime\msys\*.*"
+            SetOutPath "$INSTDIR"
             WriteUninstaller "$INSTDIR\uninstall.exe"
             CreateDirectory "$SMPROGRAMS\${APPNAME}"
             CreateShortCut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\effibuddy.exe"
@@ -254,6 +290,7 @@ jobs:
           Section "Uninstall"
             Delete "$INSTDIR\effibuddy.exe"
             Delete "$INSTDIR\uninstall.exe"
+            RMDir /r "$INSTDIR\runtime"
             RMDir "$INSTDIR"
             Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"
             RMDir "$SMPROGRAMS\${APPNAME}"
@@ -273,8 +310,103 @@ jobs:
             EffiBuddy-*-windows-x86_64-setup.exe
           if-no-files-found: error
 
+  build-macos:
+    # macos-latest 是 Apple Silicon；产物后缀用 aarch64，与客户端
+    # std::env::consts::ARCH 对齐（更新检查按架构精确匹配）。
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 随包 bash：与 Linux 共用脚本，但 macOS 不能静态链接 libSystem，
+      # 因此按系统库正常构建。每次发布同样拉取 ftp.gnu.org 的最新版本。
+      - name: 构建随包 bash
+        run: bash scripts/fetch-bash.sh runtime macos
+
+      - name: 解析版本号
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$REF_NAME" == v* ]]; then
+            VERSION="${REF_NAME#v}"
+          elif [[ -n "$INPUT_TAG" ]]; then
+            VERSION="${INPUT_TAG#v}"
+          else
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: 校验 tag 与 Cargo.toml 版本一致
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$VERSION" != "$cargo_version" ]; then
+            echo "::error::tag v$VERSION 与 Cargo.toml 版本 $cargo_version 不一致，请对齐后重新打 tag"
+            exit 1
+          fi
+
+      - name: 构建
+        run: |
+          set -o pipefail
+          cargo build --release -p effibuddy-app 2>&1 | tee build.log
+
+      - name: 失败时输出编译错误注解
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            msg="$(tail -c 3500 build.log | sed -e ':a' -e 'N' -e '$!ba' -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':b' -e 'N' -e '$!ba' -e 's/\n/%0A/g')"
+            echo "::error::macOS 构建失败，日志尾部：%0A$msg"
+          fi
+
+      - name: 上传构建日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: 冒烟测试
+        run: |
+          ./target/release/effibuddy --version
+          runtime/bash -lc 'echo bundled-bash-ok; ls --version | head -1'
+
+      - name: 打包 tar.gz
+        run: |
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64) arch="aarch64" ;;
+          esac
+          bundle="dist/EffiBuddy-$VERSION-macos-$arch"
+          mkdir -p "$bundle/runtime"
+          cp target/release/effibuddy "$bundle/"
+          cp README.md "$bundle/"
+          cp runtime/bash runtime/BASH-COPYING runtime/BASH-VERSION "$bundle/runtime/"
+          cat > "$bundle/README-macos.txt" <<'EOF'
+          EffiBuddy for macOS (unsigned build)
+
+          If macOS refuses to run the binaries because the developer cannot be
+          verified, clear the quarantine attribute once after extracting:
+
+            xattr -dr com.apple.quarantine .
+
+          The bundled GNU bash runtime lives in runtime/bash; the app prefers it
+          over the system /bin/bash (3.2) for agent shell commands.
+          EOF
+          tar -czf "EffiBuddy-$VERSION-macos-$arch.tar.gz" -C dist "EffiBuddy-$VERSION-macos-$arch"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: EffiBuddy-*-macos-*.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.tag != '' }}
     steps:
@@ -306,6 +438,7 @@ jobs:
             dist/EffiBuddy-*-linux-x86_64.tar.gz
             dist/effibuddy_*_amd64.deb
             dist/effibuddy-*.x86_64.rpm
+            dist/EffiBuddy-*-macos-*.tar.gz
             dist/EffiBuddy-*-windows-x86_64.zip
             dist/EffiBuddy-*-windows-x86_64-setup.exe
           generate_release_notes: true

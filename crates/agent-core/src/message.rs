@@ -101,6 +101,46 @@ impl ImageAttachment {
     }
 }
 
+/// What a composer attachment represents. Text files and skills carry inline
+/// content; images travel as provider image blocks; other files are referenced
+/// by path and size only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentKind {
+    File,
+    Image,
+    Skill,
+}
+
+/// A file, image or skill the user attached to a user message from the
+/// composer (drag & drop, file picker, or a `$skill` reference).
+///
+/// Text content is inlined so the model does not need an extra tool call just
+/// to see what the user dropped. The transcript keeps the attachment metadata
+/// so the UI can render chips and a reopened session can rebuild the exact
+/// wire request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAttachment {
+    pub name: String,
+    /// Workspace-relative when inside the session workspace, absolute
+    /// otherwise (user-scope skills, files from other folders).
+    pub path: String,
+    pub kind: AttachmentKind,
+    #[serde(default)]
+    pub mime_type: String,
+    #[serde(default)]
+    pub size: u64,
+    /// Inline UTF-8 content (text files and skill bodies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Raster payload for images the model can actually see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ImageAttachment>,
+    /// True when `text` is only a prefix of a larger file.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResult {
     pub call_id: String,
@@ -197,6 +237,11 @@ pub struct Message {
     /// treats it as new input for the running task, not a restart.
     #[serde(default)]
     pub mid_turn: bool,
+    /// Files, images and activated skills the user attached to this message.
+    /// The UI renders them as chips; `context::build_chat_messages` expands
+    /// them into `<file>` / `<skill>` blocks and provider image parts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<UserAttachment>,
 }
 
 /// UI-facing metadata for an inter-agent message. The text itself lives in the
@@ -228,12 +273,24 @@ impl Message {
             synthetic: false,
             agent_message: None,
             mid_turn: false,
+            attachments: Vec::new(),
         }
     }
 
     pub fn user(text: impl Into<String>) -> Self {
         let mut message = Self::new(Role::User);
         message.push_text(text.into());
+        message
+    }
+
+    /// A user message carrying composer attachments (dropped files, picked
+    /// files, images, or activated skills) alongside its text.
+    pub fn user_with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Self {
+        let mut message = Self::user(text);
+        message.attachments = attachments;
         message
     }
 
@@ -251,6 +308,17 @@ impl Message {
     /// `mid_turn` messages so the model keeps them inside the running task.
     pub fn mid_turn_user(text: impl Into<String>) -> Self {
         let mut message = Self::user(text);
+        message.mid_turn = true;
+        message
+    }
+
+    /// A steered message with attachments (a file dropped while the model is
+    /// still working).
+    pub fn mid_turn_user_with_attachments(
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Self {
+        let mut message = Self::user_with_attachments(text, attachments);
         message.mid_turn = true;
         message
     }
@@ -429,6 +497,18 @@ impl Usage {
         self.last_prompt_tokens = other.prompt_tokens;
     }
 
+    /// Add usage for a side request (compaction summary) without replacing the
+    /// transcript's current-footprint value. The summary request is not part of
+    /// the next turn's context, so mirroring its prompt size into
+    /// `last_prompt_tokens` would make the context ring and the compaction
+    /// decision use a number that describes a different request.
+    pub fn add_background(&mut self, other: &Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+        self.cached_tokens += other.cached_tokens;
+    }
+
     pub fn estimated(total_tokens: u64) -> Self {
         Self {
             prompt_tokens: total_tokens,
@@ -513,6 +593,31 @@ mod usage_tests {
         let legacy = r#"{"id":"m1","role":"user","created_at":"2026-01-01T00:00:00Z","blocks":[{"type":"text","text":"old"}]}"#;
         let loaded: Message = serde_json::from_str(legacy).unwrap();
         assert!(!loaded.mid_turn);
+    }
+
+    #[test]
+    fn attachments_round_trip_and_default_empty_for_old_sessions() {
+        let message = Message::user_with_attachments(
+            "see this",
+            vec![UserAttachment {
+                name: "notes.md".to_string(),
+                path: "notes.md".to_string(),
+                kind: AttachmentKind::File,
+                mime_type: "text/markdown".to_string(),
+                size: 4,
+                text: Some("hi".to_string()),
+                image: None,
+                truncated: false,
+            }],
+        );
+        let encoded = serde_json::to_string(&message).unwrap();
+        let loaded: Message = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(loaded.attachments, message.attachments);
+
+        // Older transcripts have no `attachments` key at all.
+        let legacy = r#"{"id":"m1","role":"user","created_at":"2026-01-01T00:00:00Z","blocks":[{"type":"text","text":"old"}]}"#;
+        let loaded: Message = serde_json::from_str(legacy).unwrap();
+        assert!(loaded.attachments.is_empty());
     }
 
     #[test]

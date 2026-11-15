@@ -78,6 +78,7 @@ impl SubagentSpawner for RecordingSpawner {
 fn context(spawner: Arc<RecordingSpawner>) -> ToolContext {
     ToolContext {
         cwd: std::env::temp_dir(),
+        additional_workspaces: Vec::new(),
         session_id: "main-session".to_string(),
         agent_id: "main".to_string(),
         agent_name: None,

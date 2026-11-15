@@ -34,7 +34,7 @@ pub use files::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;
 pub use messaging::{AgentListTool, AgentSendTool};
 pub use ptc::RunJsTool;
-pub use shell::ShellTool;
+pub use shell::{SHELL_ENV, ShellSpec, ShellTool};
 pub use todo::TodoWriteTool;
 pub use workflow::WorkflowTool;
 pub use workspace::Workspace;
@@ -48,7 +48,17 @@ use effibuddy_agent_core::{ToolError, ToolRegistry};
 
 /// Build the default tool set for a workspace.
 pub fn builtin_tools(root: impl Into<PathBuf>) -> Result<ToolRegistry, ToolError> {
-    let workspace = Workspace::new(root)?;
+    builtin_tools_with_roots(root, &[])
+}
+
+/// Build the default tool set for a project with multiple folders: relative
+/// paths resolve against `primary`, and paths inside any of `additional` are
+/// readable and writable too.
+pub fn builtin_tools_with_roots(
+    primary: impl Into<PathBuf>,
+    additional: &[PathBuf],
+) -> Result<ToolRegistry, ToolError> {
+    let workspace = Workspace::with_roots(primary, additional)?;
     let mut registry = ToolRegistry::new();
     registry.register(ReadFileTool::new(workspace.clone()));
     registry.register(WriteFileTool::new(workspace.clone()));
@@ -81,6 +91,7 @@ mod tests {
     fn context(nested: Option<Arc<dyn NestedToolInvoker>>) -> ToolContext {
         ToolContext {
             cwd: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             session_id: "test-session".to_string(),
             agent_id: "main".to_string(),
             agent_name: None,

@@ -36,8 +36,8 @@ pub(crate) fn smooth_overlay(
 pub(crate) struct SmoothScrollers {
     /// Left sidebar session list (`#session-list`).
     pub sessions: SmoothScrollHandle,
-    /// Right side pane: plan tab.
-    pub side_plan: SmoothScrollHandle,
+    /// Right side pane: overview tab.
+    pub side_overview_content: SmoothScrollHandle,
     /// Right side pane: agents tab.
     pub side_agents: SmoothScrollHandle,
     /// Right side pane: changes tab file list.
@@ -45,8 +45,8 @@ pub(crate) struct SmoothScrollers {
     /// Right side pane: changes tab diff body (two-axis; horizontal is
     /// applied immediately by the shared handle).
     pub side_git_diff: SmoothScrollHandle,
-    /// Side pane overview popover.
-    pub side_overview: SmoothScrollHandle,
+    /// Side pane tab overview popover.
+    pub side_tab_overview: SmoothScrollHandle,
     /// Settings content column.
     pub settings: SmoothScrollHandle,
     /// Add/edit model dialog.
@@ -70,11 +70,11 @@ impl SmoothScrollers {
             SmoothScrollHandle::from_handle(file_preview_list.0.borrow().base_handle.clone());
         Self {
             sessions: SmoothScrollHandle::new(),
-            side_plan: SmoothScrollHandle::new(),
+            side_overview_content: SmoothScrollHandle::new(),
             side_agents: SmoothScrollHandle::new(),
             side_git_files: SmoothScrollHandle::new(),
             side_git_diff: SmoothScrollHandle::new(),
-            side_overview: SmoothScrollHandle::new(),
+            side_tab_overview: SmoothScrollHandle::new(),
             settings: SmoothScrollHandle::new(),
             model_editor: SmoothScrollHandle::new(),
             file_tree,
@@ -90,11 +90,11 @@ impl SmoothScrollers {
         let mut needs_frames = false;
         for handle in [
             &self.sessions,
-            &self.side_plan,
+            &self.side_overview_content,
             &self.side_agents,
             &self.side_git_files,
             &self.side_git_diff,
-            &self.side_overview,
+            &self.side_tab_overview,
             &self.settings,
             &self.model_editor,
             &self.file_tree,

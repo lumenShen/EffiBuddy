@@ -394,6 +394,18 @@ pub(crate) fn plan_restore(
     message_id: &str,
     root: &Path,
 ) -> Result<RestorePlan, String> {
+    plan_restore_in(session, message_id, root, &[])
+}
+
+/// [`plan_restore`] with the project's additional folders. Checkpoint paths
+/// for files outside the session cwd are stored as absolute paths (the tools'
+/// display path); they are accepted only inside one of `allowed_roots`.
+pub(crate) fn plan_restore_in(
+    session: &SessionState,
+    message_id: &str,
+    root: &Path,
+    allowed_roots: &[PathBuf],
+) -> Result<RestorePlan, String> {
     let cut_index = session
         .message_position(message_id)
         .ok_or_else(|| "消息已不在当前会话中。".to_string())?;
@@ -491,27 +503,42 @@ pub(crate) fn plan_restore(
 
     for (_, entry) in accumulated {
         let absolute = workspace.join(&entry.path);
+        // Files in a project's additional folders carry an absolute path. A
+        // restore must never write outside the session cwd or one of the
+        // current project roots, even if the transcript was edited by hand.
+        let escaped = absolute.is_absolute()
+            && !absolute.starts_with(&workspace)
+            && !allowed_roots.iter().any(|allowed| {
+                let allowed = fs::canonicalize(allowed).unwrap_or_else(|_| allowed.clone());
+                absolute.starts_with(&allowed)
+            });
         let metadata = fs::symlink_metadata(&absolute);
-        let (current_digest, current_unsupported, unsupported_reason) = match &metadata {
-            Ok(meta) if meta.is_symlink() => {
-                (None, true, Some(RestoreConflictReason::PathUnsupported))
-            }
-            Ok(meta) if meta.is_file() => {
-                if meta.len() > MAX_SNAPSHOT_BYTES {
-                    // Do not pull an unbounded file into memory just to hash
-                    // it; report it as unreadable and leave it untouched.
-                    (None, true, Some(RestoreConflictReason::FileReadFailed))
-                } else {
-                    match fs::read(&absolute) {
-                        Ok(bytes) => (Some(ContentDigest::of(&bytes)), false, None),
-                        Err(_) => (None, true, Some(RestoreConflictReason::FileReadFailed)),
+        let (current_digest, current_unsupported, unsupported_reason) = if escaped {
+            (None, true, Some(RestoreConflictReason::PathUnsupported))
+        } else {
+            match &metadata {
+                Ok(meta) if meta.is_symlink() => {
+                    (None, true, Some(RestoreConflictReason::PathUnsupported))
+                }
+                Ok(meta) if meta.is_file() => {
+                    if meta.len() > MAX_SNAPSHOT_BYTES {
+                        // Do not pull an unbounded file into memory just to hash
+                        // it; report it as unreadable and leave it untouched.
+                        (None, true, Some(RestoreConflictReason::FileReadFailed))
+                    } else {
+                        match fs::read(&absolute) {
+                            Ok(bytes) => (Some(ContentDigest::of(&bytes)), false, None),
+                            Err(_) => (None, true, Some(RestoreConflictReason::FileReadFailed)),
+                        }
                     }
                 }
+                Ok(meta) if meta.is_dir() => {
+                    (None, true, Some(RestoreConflictReason::PathUnsupported))
+                }
+                Ok(_) => (None, true, Some(RestoreConflictReason::PathUnsupported)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false, None),
+                Err(_) => (None, true, Some(RestoreConflictReason::FileReadFailed)),
             }
-            Ok(meta) if meta.is_dir() => (None, true, Some(RestoreConflictReason::PathUnsupported)),
-            Ok(_) => (None, true, Some(RestoreConflictReason::PathUnsupported)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false, None),
-            Err(_) => (None, true, Some(RestoreConflictReason::FileReadFailed)),
         };
 
         let mut conflict = entry.uncertain.then_some(RestoreConflictReason::Uncertain);

@@ -463,6 +463,7 @@ mod tests {
     fn ctx() -> ToolContext {
         ToolContext {
             cwd: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             session_id: "stress".into(),
             agent_id: "main".into(),
             agent_name: None,

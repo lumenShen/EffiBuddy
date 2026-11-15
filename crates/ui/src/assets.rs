@@ -44,6 +44,19 @@ pub mod icons {
     pub const ARCHIVE_RESTORE: &str = "icons/archive-restore.svg";
     pub const UNDO: &str = "icons/undo.svg";
     pub const MOUSE: &str = "icons/mouse.svg";
+    pub const GAUGE: &str = "icons/gauge.svg";
+    pub const DOWNLOAD: &str = "icons/download.svg";
+    pub const MAIL: &str = "icons/mail.svg";
+    pub const HEART: &str = "icons/heart.svg";
+    pub const EXTERNAL_LINK: &str = "icons/external-link.svg";
+    pub const IMAGE: &str = "icons/image.svg";
+}
+
+/// Raster assets served through the same `AssetSource`, so `img()` can load
+/// them by path without a runtime asset directory.
+pub mod images {
+    /// WeChat reward code behind the sidebar donation entry.
+    pub const REWARD_QR: &str = "images/reward-qr.webp";
 }
 
 const PLUS: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>"#;
@@ -82,6 +95,17 @@ const PIN: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
 const ARCHIVE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg>"#;
 const ARCHIVE_RESTORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h2"/><path d="M20 8v11a2 2 0 0 1-2 2h-2"/><path d="m9 15 3-3 3 3"/><path d="M12 12v9"/></svg>"#;
 const UNDO: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></svg>"#;
+const GAUGE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></svg>"#;
+const DOWNLOAD: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/><path d="M12 15V3"/></svg>"#;
+const MAIL: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>"#;
+const HEART: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>"#;
+const EXTERNAL_LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"#;
+const IMAGE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>"#;
+
+/// The reward code is embedded rather than strung inline: it is the only
+/// raster asset and keeps the binary self-contained like the icons. Lossless
+/// WebP keeps every QR module bit-identical at roughly half the PNG size.
+const REWARD_QR: &[u8] = include_bytes!("../assets/reward-qr.webp");
 
 fn svg_for(path: &str) -> Option<&'static str> {
     Some(match path {
@@ -121,6 +145,12 @@ fn svg_for(path: &str) -> Option<&'static str> {
         icons::ARCHIVE_RESTORE => ARCHIVE_RESTORE,
         icons::UNDO => UNDO,
         icons::MOUSE => MOUSE,
+        icons::GAUGE => GAUGE,
+        icons::DOWNLOAD => DOWNLOAD,
+        icons::MAIL => MAIL,
+        icons::HEART => HEART,
+        icons::EXTERNAL_LINK => EXTERNAL_LINK,
+        icons::IMAGE => IMAGE,
         _ => return None,
     })
 }
@@ -129,10 +159,28 @@ pub struct EffiBuddyAssets;
 
 impl AssetSource for EffiBuddyAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        if path == images::REWARD_QR {
+            return Ok(Some(Cow::Borrowed(REWARD_QR)));
+        }
         Ok(svg_for(path).map(|svg| Cow::Borrowed(svg.as_bytes())))
     }
 
     fn list(&self, _path: &str) -> Result<Vec<SharedString>> {
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_reward_qr_is_served_as_webp() {
+        let bytes = EffiBuddyAssets
+            .load(images::REWARD_QR)
+            .unwrap()
+            .expect("reward QR asset is missing");
+        assert_eq!(&bytes[..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WEBP");
     }
 }

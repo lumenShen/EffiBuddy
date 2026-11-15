@@ -561,6 +561,7 @@ mod tests {
     fn context() -> ToolContext {
         ToolContext {
             cwd: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             session_id: "s".to_string(),
             agent_id: "main".to_string(),
             agent_name: None,

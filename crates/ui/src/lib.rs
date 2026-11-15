@@ -14,7 +14,7 @@ pub mod table;
 pub mod text_input;
 pub mod theme;
 
-pub use assets::{EffiBuddyAssets, icons};
+pub use assets::{EffiBuddyAssets, icons, images};
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
 pub use markdown::{
     chunk_ranges, markdown_cache_hits, markdown_inline, markdown_source_key, render_markdown,
@@ -22,13 +22,13 @@ pub use markdown::{
 };
 pub use motion::{
     CONTROL_MOTION, CubicBezier, Easing, MotionController, MotionFrame, MotionId, MotionItem,
-    MotionSpec, OVERLAY_MOTION, SWITCH_MOTION, Spring, ease_out_cubic, mix_color, motion_item,
-    overlay_motion_duration, reduce_motion,
+    MotionSpec, OVERLAY_MOTION, PaintShift, SWITCH_MOTION, Spring, ease_out_cubic, mix_color,
+    motion_item, overlay_motion_duration, reduce_motion,
 };
 pub use primitives::{
-    BadgeTone, Spinner, TooltipView, avatar, badge, card, chip, disclosure_chevron, divider, dot,
-    elevated_card, empty_state, kbd, section_label, shadow_float, small_badge, switch, tooltip,
-    vertical_divider,
+    BadgeTone, ProgressRing, Spinner, TooltipView, avatar, badge, card, chip, disclosure_chevron,
+    divider, dot, elevated_card, empty_state, kbd, section_label, shadow_float, small_badge,
+    switch, tooltip, vertical_divider,
 };
 pub use scroll::{
     GlideTick, SCROLL_GLIDE_CUTOFF, SCROLL_GLIDE_TAU, ScrollGlide, SmoothScrollHandle,

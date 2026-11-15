@@ -55,8 +55,8 @@ pub use contract::{extract_json_value, validate_json};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use harness::{AgentHandle, AgentHarness, HarnessConfig, HarnessEvent};
 pub use message::{
-    AgentMessageMeta, ContentBlock, FinishReason, ImageAttachment, Message, Role, TodoItem,
-    TodoStatus, ToolCall, ToolResult, Usage,
+    AgentMessageMeta, AttachmentKind, ContentBlock, FinishReason, ImageAttachment, Message, Role,
+    TodoItem, TodoStatus, ToolCall, ToolResult, Usage, UserAttachment,
 };
 pub use model_config::{
     ApiFormat, DEFAULT_MODEL_ID, DEFAULT_PROVIDER_ID, MODEL_CONFIG_SCHEMA_VERSION,
@@ -81,9 +81,11 @@ pub use providers::{
 pub use providers::{StressProvider, stress::user_prompt as stress_user_prompt};
 #[cfg(feature = "stress")]
 pub use ramfs::RamDir;
+pub use context::CompactionConfig;
 pub use session::{
-    ChildRunRecord, CompactionRecord, RunOutcome, RunStatus, SessionState, SharedSession,
-    lock_session, new_shared_session,
+    ChildRunRecord, CompactionRecord, CompactionTrigger, HeldCompaction, HeldCompactionStatus,
+    RunOutcome, RunStatus, SessionState, SharedSession, SummarySource, lock_session,
+    new_shared_session,
 };
 pub use subagent::{
     MAX_AGENT_DEPTH, ProfileSource, SubagentColor, SubagentLaunch, SubagentProfile, SubagentReport,

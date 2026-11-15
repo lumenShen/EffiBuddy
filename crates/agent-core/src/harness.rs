@@ -18,10 +18,13 @@
 //! 5. **Interruptions keep the transcript well-formed.** If a run stops
 //!    mid-tool batch, synthetic cancelled results are appended for every call,
 //!    so the next request is still a valid tool-call/result sequence.
-//! 6. **Context is compacted at user-turn boundaries**, never in the middle of
-//!    a tool group, and the rolling summary is sent as a system block.
+//! 6. **Context is compacted at conversation-round boundaries** before every
+//!    model step, so a single long tool turn is covered; the rolling summary is
+//!    sent as a system block and old tool output may be cleared first.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,10 +36,13 @@ use tokio_util::sync::CancellationToken;
 use crate::context;
 use crate::error::{AgentError, ProviderError, ToolError};
 use crate::ids::new_id;
-use crate::message::{Message, TodoItem, ToolCall, ToolResult, Usage};
+use crate::message::{Message, TodoItem, ToolCall, ToolResult, Usage, UserAttachment};
 use crate::prompt::{PromptContext, system_prompt};
 use crate::provider::{ChatRequest, Completion, ModelProvider, ProviderEvent};
-use crate::session::{CompactionRecord, RunOutcome, RunStatus, SharedSession, lock_session};
+use crate::session::{
+    CompactionRecord, HeldCompaction, HeldCompactionStatus, RunOutcome, RunStatus, SharedSession,
+    lock_session,
+};
 use crate::subagent::{SubagentProfile, builtin_subagent_profiles};
 use crate::tool::{
     ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, PermissionMode, ToolContext,
@@ -107,12 +113,9 @@ pub enum HarnessEvent {
 
 #[derive(Clone)]
 pub struct HarnessConfig {
-    /// Fraction of the provider context window that triggers compaction.
-    pub compact_threshold: f32,
-    /// User turns kept verbatim after compaction.
-    pub keep_recent_turns: usize,
-    /// Cap for the rolling summary itself.
-    pub max_summary_chars: usize,
+    /// Percentage-based context compaction policy. Resolved against the
+    /// session model's context window at every step.
+    pub compaction: crate::context::CompactionConfig,
     /// Cap for one tool result before it enters the transcript.
     pub max_tool_output_chars: usize,
     pub tool_timeout: Duration,
@@ -122,7 +125,15 @@ pub struct HarnessConfig {
     pub max_tokens: Option<u32>,
     /// Reasoning effort requested from models that expose levels.
     pub reasoning_effort: Option<String>,
+    /// System prompt fallback text (project instructions, plan-mode rules).
     pub system_prompt_extra: String,
+    /// Additional project folders beyond the session cwd. Built-in tools may
+    /// read and write inside any of them; the prompt lists them so the model
+    /// knows the full footprint.
+    pub additional_workspaces: Vec<PathBuf>,
+    /// Project id of the owning session, inherited by child sessions so they
+    /// can be regrouped correctly if they ever surface outside the agent panel.
+    pub project_id: Option<String>,
     /// Complete system prompt for this harness. Subagents use this instead of
     /// the default EffiBuddy prompt so their role and tool surface stay tight.
     pub system_prompt_override: Option<String>,
@@ -148,9 +159,7 @@ pub struct HarnessConfig {
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
-            compact_threshold: 0.78,
-            keep_recent_turns: 6,
-            max_summary_chars: 12_000,
+            compaction: crate::context::CompactionConfig::default(),
             max_tool_output_chars: 24_000,
             tool_timeout: Duration::from_secs(180),
             max_retries: 2,
@@ -159,6 +168,8 @@ impl Default for HarnessConfig {
             max_tokens: None,
             reasoning_effort: None,
             system_prompt_extra: String::new(),
+            additional_workspaces: Vec::new(),
+            project_id: None,
             system_prompt_override: None,
             agent_catalog: Arc::new(std::sync::RwLock::new(builtin_subagent_profiles())),
             auto_approve_tools: false,
@@ -178,6 +189,7 @@ impl Default for HarnessConfig {
 pub struct SteerInput {
     pub(crate) id: String,
     pub(crate) text: String,
+    pub(crate) attachments: Vec<UserAttachment>,
 }
 
 /// Cloneable control surface for the UI.
@@ -208,9 +220,19 @@ impl AgentHandle {
     /// the transcript at the next step boundary — never mid-stream — and the
     /// turn keeps running to address it. Returns the steer id.
     pub fn steer(&self, text: impl Into<String>) -> String {
+        self.steer_with_attachments(text, Vec::new())
+    }
+
+    /// Steer with composer attachments (a file dropped mid-turn).
+    pub fn steer_with_attachments(
+        &self,
+        text: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> String {
         let steer = SteerInput {
             id: new_id(),
             text: text.into().trim().to_string(),
+            attachments,
         };
         self.steers
             .lock()
@@ -242,6 +264,9 @@ pub struct AgentHarness {
     cancel: Arc<Mutex<CancellationToken>>,
     steers: Arc<Mutex<Vec<SteerInput>>>,
     subagents: Option<Arc<dyn crate::subagent::SubagentSpawner>>,
+    /// Consecutive summary failures. ZCode stops auto compaction after a few
+    /// failures instead of retrying a doomed request at every step.
+    compact_failures: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -270,6 +295,7 @@ impl AgentHarness {
             cancel: Arc::new(Mutex::new(CancellationToken::new())),
             steers: Arc::new(Mutex::new(Vec::new())),
             subagents: None,
+            compact_failures: AtomicUsize::new(0),
         }
     }
 
@@ -336,7 +362,8 @@ impl AgentHarness {
             .drain(..)
             .collect();
         for steer in pending {
-            let message = Message::mid_turn_user(steer.text);
+            let message =
+                Message::mid_turn_user_with_attachments(steer.text, steer.attachments);
             let message_id = message.id.clone();
             {
                 let mut session = lock_session(&self.session);
@@ -366,6 +393,7 @@ impl AgentHarness {
             .unwrap_or_default();
         system_prompt(&PromptContext {
             workspace: &workspace,
+            additional_workspaces: &self.config.additional_workspaces,
             model: &model,
             tools: &tools,
             extra: &self.config.system_prompt_extra,
@@ -379,11 +407,22 @@ impl AgentHarness {
     /// *inside* the loop; `Err` is reserved for caller mistakes (busy session,
     /// empty prompt).
     pub async fn run_turn(&self, input: impl Into<String>) -> Result<RunOutcome, AgentError> {
+        self.run_turn_with_attachments(input, Vec::new()).await
+    }
+
+    /// Start a turn whose user message carries composer attachments (files,
+    /// images or activated skills). An attachment-only message is valid: the
+    /// user can drop a file and send it without typing anything.
+    pub async fn run_turn_with_attachments(
+        &self,
+        input: impl Into<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Result<RunOutcome, AgentError> {
         let input = input.into().trim().to_string();
-        if input.is_empty() {
+        if input.is_empty() && attachments.is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        self.run_turn_inner(Some(input)).await
+        self.run_turn_inner(Some(input), attachments).await
     }
 
     /// Continue the existing transcript without appending a new user message.
@@ -393,10 +432,14 @@ impl AgentHarness {
         if lock_session(&self.session).messages.is_empty() {
             return Err(AgentError::EmptyPrompt);
         }
-        self.run_turn_inner(None).await
+        self.run_turn_inner(None, Vec::new()).await
     }
 
-    async fn run_turn_inner(&self, input: Option<String>) -> Result<RunOutcome, AgentError> {
+    async fn run_turn_inner(
+        &self,
+        input: Option<String>,
+        attachments: Vec<UserAttachment>,
+    ) -> Result<RunOutcome, AgentError> {
         let run_id = new_id();
         let session_id = {
             let mut session = lock_session(&self.session);
@@ -407,7 +450,7 @@ impl AgentHarness {
             session.steps = 0;
             session.last_error = None;
             if let Some(input) = input {
-                session.push_message(Message::user(input));
+                session.push_message(Message::user_with_attachments(input, attachments));
             }
             session.id.clone()
         };
@@ -440,9 +483,12 @@ impl AgentHarness {
     async fn run_loop(&self, run_id: &str, cancel: &CancellationToken) -> RunOutcome {
         let approved = Arc::new(Mutex::new(HashSet::new()));
         let executor = ToolExecutor::new(self, approved, 0);
-        let context_window = self.context_window();
 
         let mut step = 0usize;
+        // One reactive compaction per run: if the provider still reports an
+        // oversized request after a forced summary, retrying forever would
+        // just burn tokens.
+        let mut reactive_attempted = false;
         loop {
             step += 1;
             if cancel.is_cancelled() {
@@ -465,21 +511,25 @@ impl AgentHarness {
             });
 
             let system_prompt = self.system_prompt();
+            let tool_tokens = context::estimate_tool_specs_tokens(&self.tools.specs());
 
             // Compact before building the request so the estimate is current.
-            let compacted = {
-                let mut session = lock_session(&self.session);
-                context::maybe_compact(
-                    &mut session,
-                    context_window,
-                    self.config.compact_threshold,
-                    self.config.keep_recent_turns,
+            // This runs at every model step, including steps inside one long
+            // tool turn (the case the old user-turn-boundary rule missed).
+            if let Some(record) = self
+                .compact_if_needed(
                     &system_prompt,
-                    self.config.max_summary_chars,
+                    tool_tokens,
+                    crate::session::CompactionTrigger::Auto,
+                    false,
+                    cancel,
                 )
-            };
-            if let Some(record) = compacted {
+                .await
+            {
                 self.emit(HarnessEvent::ContextCompacted { record });
+            }
+            if cancel.is_cancelled() {
+                return RunOutcome::Interrupted;
             }
 
             let request = {
@@ -500,6 +550,32 @@ impl AgentHarness {
                 Ok(None) => {
                     self.finish_stream(&mut stream, true);
                     return RunOutcome::Interrupted;
+                }
+                Err(error)
+                    if !reactive_attempted
+                        && stream.message_id.is_none()
+                        && error.is_context_overflow()
+                        && self.config.compaction.enabled =>
+                {
+                    // The estimate undershot (new tokenizer, ignored tool
+                    // schema, provider-side framing). Compact unconditionally
+                    // and retry the request once, like ZCode's reactive path.
+                    reactive_attempted = true;
+                    self.finish_stream(&mut stream, true);
+                    let compacted = self
+                        .compact_if_needed(
+                            &system_prompt,
+                            tool_tokens,
+                            crate::session::CompactionTrigger::Reactive,
+                            true,
+                            cancel,
+                        )
+                        .await;
+                    if let Some(record) = compacted {
+                        self.emit(HarnessEvent::ContextCompacted { record });
+                        continue;
+                    }
+                    return RunOutcome::Failed(error.to_string());
                 }
                 Err(error) => {
                     self.finish_stream(&mut stream, true);
@@ -564,6 +640,498 @@ impl AgentHarness {
 
             if interrupted {
                 return RunOutcome::Interrupted;
+            }
+        }
+    }
+
+    /// Decide and run one compaction pass.
+    ///
+    /// The decision uses the same ingredients as ZCode: a percentage-derived
+    /// token threshold over the model window, a provider-reported prompt size
+    /// when available, a cheap tool-result clearing stage first, and a
+    /// model-written summary for everything older than the verbatim tail.
+    /// Failures degrade to the extractive fallback instead of killing the turn,
+    /// and after `max_consecutive_failures` the harness stops paying for a
+    /// summary request that keeps failing.
+    async fn compact_if_needed(
+        &self,
+        system_prompt: &str,
+        tool_tokens: usize,
+        trigger: crate::session::CompactionTrigger,
+        force: bool,
+        cancel: &CancellationToken,
+    ) -> Option<CompactionRecord> {
+        let config = self.config.compaction.clone();
+        if !config.enabled {
+            return None;
+        }
+        let thresholds = config.thresholds(
+            self.context_window(),
+            self.config.max_tokens.map(|tokens| tokens as usize),
+        );
+
+        let (current, held) = {
+            let mut session = lock_session(&self.session);
+            let mut current =
+                context::estimate_request_tokens(&session, system_prompt, tool_tokens)
+                    .max(session.usage.last_prompt_tokens as usize);
+
+            if config.clear_tool_outputs && (force || current >= thresholds.microcompact_tokens) {
+                let outcome = context::microcompact_tool_results(
+                    &mut session,
+                    config.keep_recent_tool_results,
+                );
+                if outcome.cleared > 0 {
+                    // The provider-reported footprint describes the request
+                    // before clearing; recompute from the transcript so the
+                    // ring and the next decision see the drop immediately.
+                    current =
+                        context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+                    session.usage.last_prompt_tokens = current as u64;
+                    session.touch();
+                }
+            }
+            (current, session.held_compaction.clone())
+        };
+
+        let due = force || current >= thresholds.trigger_tokens;
+        if due {
+            if let Some(held) = held {
+                match held.status {
+                    crate::session::HeldCompactionStatus::Ready => {
+                        if let Some(record) = self.apply_held_compaction(
+                            held,
+                            trigger,
+                            current,
+                            system_prompt,
+                            tool_tokens,
+                            &thresholds,
+                        ) {
+                            return Some(record);
+                        }
+                    }
+                    crate::session::HeldCompactionStatus::Writing => {
+                        // OpenCode waits for an in-flight summary when the
+                        // threshold arrives. Bound the wait so a stalled
+                        // provider cannot freeze the turn; after that we fall
+                        // back to a normal foreground compaction.
+                        if let Some(held) = self
+                            .wait_for_held_compaction(Duration::from_secs(15), cancel)
+                            .await
+                        {
+                            if held.is_ready()
+                                && let Some(record) = self.apply_held_compaction(
+                                    held,
+                                    trigger,
+                                    current,
+                                    system_prompt,
+                                    tool_tokens,
+                                    &thresholds,
+                                )
+                            {
+                                return Some(record);
+                            }
+                        }
+                        if cancel.is_cancelled() {
+                            return None;
+                        }
+                        self.clear_held_compaction();
+                    }
+                    crate::session::HeldCompactionStatus::Failed => {
+                        self.clear_held_compaction();
+                    }
+                }
+            }
+        } else {
+            // Below the trigger: start (or keep) a background summary and let
+            // the main request proceed immediately.
+            self.start_background_compaction(current, &thresholds, cancel);
+            return None;
+        }
+
+        let (pre_tokens, plan, previous_summary, request, use_model, boundary_id) = {
+            let session = lock_session(&self.session);
+            let plan = context::plan_compaction(&session, thresholds.keep_tokens)?;
+            let previous = session
+                .compaction
+                .as_ref()
+                .map(|record| record.summary.clone());
+            let input_budget = thresholds
+                .context_window
+                .saturating_sub(thresholds.summary_tokens)
+                .saturating_sub(1_024);
+            let request = context::build_compaction_request(
+                &session,
+                &plan,
+                previous.as_deref(),
+                input_budget,
+                thresholds.summary_tokens,
+            );
+            let use_model = self.compact_failures.load(Ordering::Relaxed)
+                < config.max_consecutive_failures.max(1);
+            // A summary request runs without the session lock. Remember the
+            // first kept message so an edit/undo that lands meanwhile wins over
+            // a stale boundary instead of corrupting `compacted_upto`.
+            let boundary_id = session.messages[plan.boundary].id.clone();
+            (current, plan, previous, request, use_model, boundary_id)
+        };
+
+        let mut model_summary = None;
+        if use_model {
+            match self.request_compaction_summary(request, cancel).await {
+                Ok(completion) => {
+                    {
+                        let mut session = lock_session(&self.session);
+                        session.usage.add_background(&completion.usage);
+                    }
+                    let formatted = context::format_compaction_summary(&completion.text);
+                    if !formatted.trim().is_empty() {
+                        model_summary = Some(formatted);
+                    }
+                }
+                Err(error) if error.is_cancelled() => return None,
+                Err(_) => {
+                    self.compact_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        {
+            let session = lock_session(&self.session);
+            if session.messages.get(plan.boundary).map(|m| m.id.as_str())
+                != Some(boundary_id.as_str())
+            {
+                return None;
+            }
+        }
+
+        let (summary, source) = match model_summary {
+            Some(summary) => {
+                self.compact_failures.store(0, Ordering::Relaxed);
+                (summary, crate::session::SummarySource::Model)
+            }
+            None => {
+                let session = lock_session(&self.session);
+                let summary = context::build_heuristic_summary(
+                    &session,
+                    &plan,
+                    previous_summary.as_deref(),
+                    thresholds.summary_tokens,
+                );
+                (summary, crate::session::SummarySource::Heuristic)
+            }
+        };
+        if summary.trim().is_empty() {
+            return None;
+        }
+
+        let record = {
+            let mut session = lock_session(&self.session);
+            if session.messages.get(plan.boundary).map(|m| m.id.as_str())
+                != Some(boundary_id.as_str())
+            {
+                return None;
+            }
+            session.held_compaction = None;
+            session.compacted_upto = plan.boundary;
+            // Cleared ids covered by the summary can never appear again; keep
+            // only ids that still live in the verbatim tail.
+            let surviving: HashSet<String> = session.messages[plan.boundary..]
+                .iter()
+                .filter_map(|message| message.tool_result().map(|r| r.call_id.clone()))
+                .collect();
+            session
+                .cleared_tool_calls
+                .retain(|call_id| surviving.contains(call_id));
+            let record = context::compose_compaction_record(
+                summary,
+                source,
+                trigger,
+                &plan,
+                pre_tokens,
+                0,
+                thresholds.trigger_tokens,
+            );
+            session.compaction = Some(record.clone());
+            let post_tokens =
+                context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+            let mut record = record;
+            record.post_tokens = post_tokens;
+            session.compaction = Some(record.clone());
+            session.usage.last_prompt_tokens = post_tokens as u64;
+            session.touch();
+            record
+        };
+        Some(record)
+    }
+
+    /// Swap a pre-generated summary into the session if its snapshot is still
+    /// valid. Invalid held summaries are dropped; the caller falls back to a
+    /// normal foreground compaction.
+    fn apply_held_compaction(
+        &self,
+        held: HeldCompaction,
+        trigger: crate::session::CompactionTrigger,
+        current_tokens: usize,
+        system_prompt: &str,
+        tool_tokens: usize,
+        thresholds: &context::CompactionThresholds,
+    ) -> Option<CompactionRecord> {
+        let mut session = lock_session(&self.session);
+        if session
+            .held_compaction
+            .as_ref()
+            .map(|current| current.id.as_str())
+            != Some(held.id.as_str())
+        {
+            return None;
+        }
+        let growth_limit = thresholds.trigger_tokens * 2 / 5;
+        let valid = held.is_ready()
+            && session.compacted_upto == held.start
+            && session
+                .messages
+                .get(held.boundary)
+                .is_some_and(|message| message.id == held.boundary_id)
+            && session.model == held.model
+            && session.provider_id.as_ref() == held.provider_id.as_ref()
+            && current_tokens.saturating_sub(held.pre_tokens) <= growth_limit;
+        let Some(summary) = held.summary.clone().filter(|_| valid) else {
+            session.held_compaction = None;
+            return None;
+        };
+
+        let end = session.messages.len();
+        let plan = context::CompactionPlan {
+            start: held.start,
+            boundary: held.boundary,
+            end,
+            summarized_messages: held.summarized_messages,
+            kept_messages: end.saturating_sub(held.boundary),
+            summarized_tokens: 0,
+            kept_tokens: 0,
+        };
+        session.held_compaction = None;
+        session.compacted_upto = held.boundary;
+        let surviving: HashSet<String> = session.messages[held.boundary..]
+            .iter()
+            .filter_map(|message| message.tool_result().map(|result| result.call_id.clone()))
+            .collect();
+        session
+            .cleared_tool_calls
+            .retain(|call_id| surviving.contains(call_id));
+        let mut record = context::compose_compaction_record(
+            summary,
+            crate::session::SummarySource::Model,
+            trigger,
+            &plan,
+            current_tokens,
+            0,
+            thresholds.trigger_tokens,
+        );
+        session.compaction = Some(record.clone());
+        let post_tokens = context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+        record.post_tokens = post_tokens;
+        session.compaction = Some(record.clone());
+        session.usage.last_prompt_tokens = post_tokens as u64;
+        session.touch();
+        Some(record)
+    }
+
+    /// Wait for an in-flight background summary to finish. Bounded so a stalled
+    /// provider cannot stall the main request forever.
+    async fn wait_for_held_compaction(
+        &self,
+        timeout: Duration,
+        cancel: &CancellationToken,
+    ) -> Option<HeldCompaction> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let held = lock_session(&self.session).held_compaction.clone();
+            if held.as_ref().is_some_and(Self::held_is_stale) {
+                return None;
+            }
+            match held {
+                Some(held) if held.status != HeldCompactionStatus::Writing => return Some(held),
+                None => return None,
+                Some(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return None,
+                _ = sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    }
+
+    /// A writing entry whose task died without clearing itself (process pause,
+    /// provider ignoring cancellation) must not block background compaction
+    /// forever.
+    fn held_is_stale(held: &HeldCompaction) -> bool {
+        held.status == HeldCompactionStatus::Writing
+            && chrono::Utc::now()
+                .signed_duration_since(held.started_at)
+                .num_minutes()
+                >= 5
+    }
+
+    fn clear_held_compaction(&self) {
+        lock_session(&self.session).held_compaction = None;
+    }
+
+    /// Start writing the next summary ahead of the threshold. The task owns a
+    /// snapshot of the conversation and a clone of the provider; it never
+    /// mutates the visible transcript, only the held-summary slot.
+    fn start_background_compaction(
+        &self,
+        current_tokens: usize,
+        thresholds: &context::CompactionThresholds,
+        cancel: &CancellationToken,
+    ) {
+        let config = &self.config.compaction;
+        if !config.background_precompact || current_tokens < thresholds.background_start_tokens {
+            return;
+        }
+        if self.compact_failures.load(Ordering::Relaxed) >= config.max_consecutive_failures.max(1) {
+            return;
+        }
+
+        let (held, request) = {
+            let mut session = lock_session(&self.session);
+            let status = session.held_compaction.as_ref().map(|held| held.status);
+            let stale = session
+                .held_compaction
+                .as_ref()
+                .is_some_and(Self::held_is_stale);
+            match status {
+                Some(HeldCompactionStatus::Writing) if !stale => return,
+                Some(HeldCompactionStatus::Ready) => return,
+                // Failed or stale writing: retry from a fresh snapshot.
+                _ => session.held_compaction = None,
+            }
+            let Some(plan) = context::plan_compaction(&session, thresholds.keep_tokens) else {
+                return;
+            };
+            let previous = session
+                .compaction
+                .as_ref()
+                .map(|record| record.summary.clone());
+            let input_budget = thresholds
+                .context_window
+                .saturating_sub(thresholds.summary_tokens)
+                .saturating_sub(1_024);
+            let request = context::build_compaction_request(
+                &session,
+                &plan,
+                previous.as_deref(),
+                input_budget,
+                thresholds.summary_tokens,
+            );
+            let held = HeldCompaction {
+                id: new_id(),
+                status: HeldCompactionStatus::Writing,
+                summary: None,
+                start: plan.start,
+                boundary: plan.boundary,
+                boundary_id: session.messages[plan.boundary].id.clone(),
+                summarized_messages: plan.summarized_messages,
+                kept_messages: plan.kept_messages,
+                pre_tokens: current_tokens,
+                model: session.model.clone(),
+                provider_id: session.provider_id.clone(),
+                started_at: chrono::Utc::now(),
+            };
+            (held, request)
+        };
+
+        let id = held.id.clone();
+        {
+            let mut session = lock_session(&self.session);
+            if session.held_compaction.is_some() {
+                return;
+            }
+            session.held_compaction = Some(held);
+        }
+
+        let provider = self.provider.clone();
+        let shared = self.session.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            let result = AgentHarness::request_summary(provider, request, cancel).await;
+            let mut session = lock_session(&shared);
+            if session
+                .held_compaction
+                .as_ref()
+                .map(|held| held.id.as_str())
+                != Some(id.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(completion) => {
+                    session.usage.add_background(&completion.usage);
+                    let summary = context::format_compaction_summary(&completion.text);
+                    if let Some(held) = session.held_compaction.as_mut() {
+                        if summary.trim().is_empty() {
+                            held.status = HeldCompactionStatus::Failed;
+                        } else {
+                            held.status = HeldCompactionStatus::Ready;
+                            held.summary = Some(summary);
+                        }
+                    }
+                }
+                Err(error) if error.is_cancelled() => {
+                    // The turn was interrupted; do not leave a dead snapshot
+                    // blocking the next turn's background pass.
+                    session.held_compaction = None;
+                }
+                Err(_) => {
+                    if let Some(held) = session.held_compaction.as_mut() {
+                        held.status = HeldCompactionStatus::Failed;
+                    }
+                }
+            }
+            session.touch();
+        });
+    }
+
+    /// Ask the session model for a text-only summary. Deltas are ignored: the
+    /// summary is written to the session only after the provider returns a
+    /// complete response, so a cancelled compaction never leaves half a
+    /// summary in the transcript.
+    async fn request_compaction_summary(
+        &self,
+        request: ChatRequest,
+        cancel: &CancellationToken,
+    ) -> Result<Completion, ProviderError> {
+        Self::request_summary(self.provider.clone(), request, cancel.clone()).await
+    }
+
+    /// Provider half of the summary request, detached from `&self` so it can
+    /// run in a background task after the harness is dropped.
+    async fn request_summary(
+        provider: Arc<dyn ModelProvider>,
+        request: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<Completion, ProviderError> {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let future = provider.stream(request, cancel.clone(), sender);
+        tokio::pin!(future);
+        let mut receiver_open = true;
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+                event = receiver.recv(), if receiver_open => {
+                    if event.is_none() {
+                        receiver_open = false;
+                    }
+                }
+                result = &mut future => {
+                    return result;
+                }
             }
         }
     }
@@ -954,6 +1522,7 @@ impl ToolExecutor {
         };
         let ctx = ToolContext {
             cwd,
+            additional_workspaces: self.config.additional_workspaces.clone(),
             session_id,
             agent_id: self.config.agent_id.clone(),
             agent_name: self.config.agent_name.clone(),
@@ -1167,6 +1736,34 @@ mod tests {
         }
     }
 
+    /// Produces enough output to cross the trigger in one step, and yields so a
+    /// background summary can finish while the tool is running.
+    struct SizedOutputTool {
+        name: &'static str,
+        bytes: usize,
+    }
+
+    #[async_trait]
+    impl Tool for SizedOutputTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn description(&self) -> &str {
+            "Return a large observation"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _ctx: ToolContext,
+            _arguments: Value,
+        ) -> Result<ToolOutput, ToolError> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(ToolOutput::text("B".repeat(self.bytes)))
+        }
+    }
+
     fn harness_with(
         script: Vec<Completion>,
         tools: ToolRegistry,
@@ -1201,6 +1798,435 @@ mod tests {
         tools
     }
 
+    /// Simulate an in-progress turn: one user message followed by many
+    /// assistant/tool rounds, exactly the shape that used to defeat the
+    /// user-turn-boundary compaction rule.
+    fn seed_long_turn(harness: &AgentHarness, rounds: usize, body: &str) {
+        let shared = harness.session();
+        let mut session = lock_session(&shared);
+        session.push_message(Message::user("inspect everything"));
+        for index in 0..rounds {
+            let mut assistant = Message::assistant();
+            let call = ToolCall::new("read_file", json!({"path": format!("src/{index}.rs")}));
+            assistant.push_tool_call(call.clone());
+            session.push_message(assistant);
+            session.push_message(Message::from_tool_result(ToolResult::success(&call, body)));
+        }
+    }
+
+    fn compacting_config() -> HarnessConfig {
+        HarnessConfig {
+            context_window_override: Some(4_000),
+            compaction: crate::context::CompactionConfig {
+                trigger_percent: 60.0,
+                keep_recent_percent: 10.0,
+                summary_percent: 10.0,
+                clear_tool_outputs: false,
+                ..crate::context::CompactionConfig::default()
+            },
+            ..HarnessConfig::default()
+        }
+    }
+
+    /// First main request overflows, then the summary request succeeds, then
+    /// the retried main request succeeds.
+    struct OverflowThenTextProvider {
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for OverflowThenTextProvider {
+        fn name(&self) -> &str {
+            "overflow-then-text"
+        }
+
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _cancel: CancellationToken,
+            _events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(ProviderError::Http {
+                    status: 400,
+                    body: "This model's maximum context length is 4096 tokens".to_string(),
+                }),
+                1 => Ok(Completion::text(
+                    "<analysis>x</analysis><summary>reactive summary</summary>",
+                )),
+                _ => Ok(Completion::text("recovered")),
+            }
+        }
+    }
+
+    struct FailSummaryProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for FailSummaryProvider {
+        fn name(&self) -> &str {
+            "fail-summary"
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _cancel: CancellationToken,
+            _events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(ProviderError::Other("summary endpoint down".to_string())),
+                _ => Ok(Completion::text("continued")),
+            }
+        }
+    }
+
+    /// Separates summary requests from main requests and records whether the
+    /// two overlapped. The first main request stays open long enough for the
+    /// background summary to finish while it is still streaming.
+    struct BackgroundCompactionProvider {
+        tool_name: &'static str,
+        summary_calls: AtomicUsize,
+        main_calls: AtomicUsize,
+        main_in_flight: AtomicUsize,
+        overlapped: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for BackgroundCompactionProvider {
+        fn name(&self) -> &str {
+            "background-compaction"
+        }
+
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _cancel: CancellationToken,
+            _events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            let is_summary = request.tools.is_empty()
+                && request
+                    .messages
+                    .first()
+                    .is_some_and(|message| message.content.contains("TEXT ONLY"));
+            if is_summary {
+                self.summary_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if self.main_in_flight.load(Ordering::SeqCst) > 0 {
+                    self.overlapped.store(1, Ordering::SeqCst);
+                }
+                return Ok(Completion::text(
+                    "<analysis>x</analysis><summary>held summary</summary>",
+                ));
+            }
+
+            let call = self.main_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.main_in_flight.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            self.main_in_flight.fetch_sub(1, Ordering::SeqCst);
+            if call == 1 {
+                Ok(Completion::default().with_tool_call(ToolCall::new(self.tool_name, json!({}))))
+            } else {
+                Ok(Completion::text("done"))
+            }
+        }
+    }
+
+    fn seed_until_tokens(harness: &AgentHarness, target: usize, body: &str) {
+        let system_prompt = harness.system_prompt();
+        let tool_tokens = context::estimate_tool_specs_tokens(&harness.tools.specs());
+        let shared = harness.session();
+        let mut session = lock_session(&shared);
+        session.push_message(Message::user("inspect everything"));
+        for index in 0..40 {
+            let mut assistant = Message::assistant();
+            let call = ToolCall::new(
+                "read_file",
+                json!({"path": format!("src/{index}.rs")}),
+            );
+            assistant.push_tool_call(call.clone());
+            session.push_message(assistant);
+            session.push_message(Message::from_tool_result(ToolResult::success(&call, body)));
+            if context::estimate_request_tokens(&session, &system_prompt, tool_tokens) >= target {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn background_summary_overlaps_the_main_request_and_is_swapped_in() {
+        let provider = Arc::new(BackgroundCompactionProvider {
+            tool_name: "big_output",
+            summary_calls: AtomicUsize::new(0),
+            main_calls: AtomicUsize::new(0),
+            main_in_flight: AtomicUsize::new(0),
+            overlapped: AtomicUsize::new(0),
+        });
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let mut tools = ToolRegistry::new();
+        tools.register(SizedOutputTool {
+            name: "big_output",
+            bytes: 6_000,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session.clone(),
+            provider.clone(),
+            Arc::new(tools),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                context_window_override: Some(10_000),
+                compaction: crate::context::CompactionConfig {
+                    trigger_percent: 60.0,
+                    keep_recent_percent: 10.0,
+                    summary_percent: 10.0,
+                    clear_tool_outputs: false,
+                    background_precompact: true,
+                    background_start_percent: 40.0,
+                    ..crate::context::CompactionConfig::default()
+                },
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+        // Start below the trigger but above the background line.
+        seed_until_tokens(&harness, 4_500, &"s".repeat(1_200));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(provider.summary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.overlapped.load(Ordering::SeqCst),
+            1,
+            "summary must run while the main request is still in flight"
+        );
+
+        let session = lock_session(&session);
+        let record = session.compaction.as_ref().expect("held summary applied");
+        assert_eq!(record.summary_source, crate::session::SummarySource::Model);
+        assert!(record.summary.contains("held summary"));
+        assert!(session.held_compaction.is_none());
+        assert!(session.compacted_upto > 0);
+    }
+
+    #[tokio::test]
+    async fn stale_background_summary_is_discarded_and_recomputed() {
+        let provider = Arc::new(BackgroundCompactionProvider {
+            tool_name: "huge_output",
+            summary_calls: AtomicUsize::new(0),
+            main_calls: AtomicUsize::new(0),
+            main_in_flight: AtomicUsize::new(0),
+            overlapped: AtomicUsize::new(0),
+        });
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let mut tools = ToolRegistry::new();
+        tools.register(SizedOutputTool {
+            name: "huge_output",
+            bytes: 20_000,
+        });
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session.clone(),
+            provider.clone(),
+            Arc::new(tools),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                context_window_override: Some(10_000),
+                compaction: crate::context::CompactionConfig {
+                    trigger_percent: 60.0,
+                    keep_recent_percent: 10.0,
+                    summary_percent: 10.0,
+                    clear_tool_outputs: false,
+                    background_precompact: true,
+                    background_start_percent: 40.0,
+                    ..crate::context::CompactionConfig::default()
+                },
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+        seed_until_tokens(&harness, 4_500, &"s".repeat(1_200));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            provider.summary_calls.load(Ordering::SeqCst),
+            2,
+            "the held summary must be discarded and regenerated"
+        );
+        let session = lock_session(&session);
+        let record = session.compaction.as_ref().expect("foreground compaction");
+        assert_eq!(record.summary_source, crate::session::SummarySource::Model);
+        assert!(session.held_compaction.is_none());
+    }
+
+    #[tokio::test]
+    async fn auto_compaction_runs_inside_one_long_turn() {
+        let (harness, handle, mut events, provider) = harness_with(
+            vec![
+                Completion::text("<analysis>x</analysis><summary>model summary</summary>"),
+                Completion::text("finished"),
+            ],
+            default_tools(),
+            compacting_config(),
+        );
+        seed_long_turn(&harness, 6, &"y".repeat(2_000));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1,
+            "the seeded transcript must still be a single turn"
+        );
+        let record = session.compaction.as_ref().expect("compaction record");
+        assert_eq!(record.summary_source, crate::session::SummarySource::Model);
+        assert!(record.summary.contains("model summary"));
+        assert!(record.trigger == crate::session::CompactionTrigger::Auto);
+        assert!(record.compacted_messages > 0);
+        assert!(record.post_tokens < record.pre_tokens);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].tools.is_empty());
+        assert!(requests[0].messages[0].content.contains("TEXT ONLY"));
+        assert!(
+            requests[1]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("model summary"))
+        );
+
+        let mut saw_compaction = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, HarnessEvent::ContextCompacted { .. }) {
+                saw_compaction = true;
+            }
+        }
+        assert!(saw_compaction);
+    }
+
+    #[tokio::test]
+    async fn microcompact_avoids_a_model_summary_when_clearing_is_enough() {
+        let (harness, handle, _, provider) = harness_with(
+            vec![Completion::text("done")],
+            default_tools(),
+            HarnessConfig {
+                context_window_override: Some(4_000),
+                compaction: crate::context::CompactionConfig {
+                    trigger_percent: 60.0,
+                    keep_recent_percent: 10.0,
+                    summary_percent: 10.0,
+                    clear_tool_outputs: true,
+                    keep_recent_tool_results: 1,
+                    ..crate::context::CompactionConfig::default()
+                },
+                ..HarnessConfig::default()
+            },
+        );
+        seed_long_turn(&harness, 6, &"q".repeat(2_000));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        assert!(session.compaction.is_none());
+        assert!(session.cleared_tool_calls.len() >= 4);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 1, "no summary request should be sent");
+        assert_eq!(
+            requests[0]
+                .messages
+                .iter()
+                .filter(|message| message.content == context::CLEARED_TOOL_RESULT_PLACEHOLDER)
+                .count(),
+            session.cleared_tool_calls.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_failure_falls_back_to_an_extractive_summary() {
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session.clone(),
+            Arc::new(FailSummaryProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            compacting_config(),
+            tx,
+        );
+        seed_long_turn(&harness, 6, &"z".repeat(2_000));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        let session = lock_session(&session);
+        let record = session.compaction.as_ref().expect("fallback compaction");
+        assert_eq!(
+            record.summary_source,
+            crate::session::SummarySource::Heuristic
+        );
+        assert!(record.summary.contains("extractive"));
+    }
+
+    #[tokio::test]
+    async fn provider_overflow_triggers_one_reactive_compaction() {
+        let provider = Arc::new(OverflowThenTextProvider {
+            calls: AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+        });
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session.clone(),
+            provider.clone(),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                context_window_override: Some(20_000),
+                compaction: crate::context::CompactionConfig {
+                    // High enough that the estimate does not compact on its own.
+                    trigger_percent: 95.0,
+                    keep_recent_percent: 10.0,
+                    summary_percent: 10.0,
+                    clear_tool_outputs: false,
+                    ..crate::context::CompactionConfig::default()
+                },
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+        seed_long_turn(&harness, 4, &"w".repeat(1_000));
+
+        let outcome = harness.run_pending().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        let session = lock_session(&session);
+        let record = session.compaction.as_ref().expect("reactive compaction");
+        assert_eq!(record.trigger, crate::session::CompactionTrigger::Reactive);
+        assert!(record.summary.contains("reactive summary"));
+        assert_eq!(session.messages.last().unwrap().text(), "recovered");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
+
     #[tokio::test]
     async fn simple_turn_completes_and_records_messages() {
         let (harness, handle, mut events, _) = harness_with(
@@ -1226,6 +2252,45 @@ mod tests {
             }
         }
         assert!(saw_finished);
+    }
+
+    #[tokio::test]
+    async fn attachment_only_turn_reaches_the_wire_and_titles_the_session() {
+        let (harness, handle, _, provider) = harness_with(
+            vec![Completion::text("got it")],
+            default_tools(),
+            HarnessConfig::default(),
+        );
+        let attachment = UserAttachment {
+            name: "notes.md".to_string(),
+            path: "notes.md".to_string(),
+            kind: crate::message::AttachmentKind::File,
+            mime_type: "text/markdown".to_string(),
+            size: 5,
+            text: Some("hello".to_string()),
+            image: None,
+            truncated: false,
+        };
+        let outcome = harness
+            .run_turn_with_attachments("", vec![attachment])
+            .await
+            .unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        {
+            let shared = handle.session();
+            let session = lock_session(&shared);
+            assert_eq!(session.messages.len(), 2);
+            assert_eq!(session.messages[0].attachments.len(), 1);
+            assert_eq!(session.title, "附件 · notes.md");
+        }
+        let requests = provider.requests();
+        let user = requests[0]
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("user message");
+        assert!(user.content.contains("<file name=\"notes.md\""));
+        assert!(user.content.contains("hello"));
     }
 
     #[tokio::test]
@@ -1615,7 +2680,19 @@ mod tests {
         let run = tokio::spawn(async move { harness.run_turn("start").await });
 
         entered_rx.recv().await.expect("tool reported entry");
-        let steer_id = handle.steer("mid-run");
+        let steer_id = handle.steer_with_attachments(
+            "mid-run",
+            vec![UserAttachment {
+                name: "shot.txt".to_string(),
+                path: "shot.txt".to_string(),
+                kind: crate::message::AttachmentKind::File,
+                mime_type: "text/plain".to_string(),
+                size: 3,
+                text: Some("abc".to_string()),
+                image: None,
+                truncated: false,
+            }],
+        );
         release.notify_one();
         let outcome = run.await.unwrap().unwrap();
         assert_eq!(outcome, RunOutcome::Completed);
@@ -1626,6 +2703,7 @@ mod tests {
             assert_eq!(session.messages.len(), 5);
             assert!(session.messages[3].mid_turn, "steer is flagged mid_turn");
             assert_eq!(session.messages[3].text(), "mid-run");
+            assert_eq!(session.messages[3].attachments.len(), 1);
         }
         let requests = requests_provider.requests();
         assert_eq!(requests.len(), 2);
@@ -1640,6 +2718,7 @@ mod tests {
             "wire frame missing: {second}"
         );
         assert!(second.contains("mid-run"));
+        assert!(second.contains("<file name=\"shot.txt\""));
 
         let mut saw_drained = false;
         while let Ok(event) = events.try_recv() {

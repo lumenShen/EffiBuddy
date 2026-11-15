@@ -61,6 +61,41 @@ impl ProviderError {
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ProviderError::Cancelled)
     }
+
+    /// True when the provider rejected the request because the prompt no
+    /// longer fits its context window. The harness uses this to run one
+    /// reactive compaction and retry instead of surfacing a dead turn.
+    pub fn is_context_overflow(&self) -> bool {
+        let text = match self {
+            ProviderError::Http { status, body } => {
+                if !matches!(*status, 400 | 413 | 422) {
+                    return false;
+                }
+                body.as_str()
+            }
+            ProviderError::Api(message) | ProviderError::Other(message) => message.as_str(),
+            ProviderError::Cancelled | ProviderError::Network(_) | ProviderError::Parse(_) => {
+                return false;
+            }
+        };
+        let lower = text.to_ascii_lowercase();
+        [
+            "context length",
+            "context_length",
+            "context window",
+            "maximum context",
+            "max context",
+            "prompt is too long",
+            "input is too long",
+            "conversation is too long",
+            "too many tokens",
+            "token limit",
+            "maximum number of tokens",
+            "request too large",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    }
 }
 
 /// A tool execution failure. Tool failures are *data*, not harness failures:

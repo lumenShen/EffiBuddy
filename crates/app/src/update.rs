@@ -120,11 +120,36 @@ pub async fn fetch_latest(client: &reqwest::Client) -> Result<Option<UpdateInfo>
     }))
 }
 
+/// Platform families the release workflow publishes assets for. Kept explicit
+/// (instead of booleans) so the macOS archive cannot be mistaken for a Linux
+/// one when a new platform is added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Platform {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+fn current_platform() -> Platform {
+    if cfg!(target_os = "windows") {
+        Platform::Windows
+    } else if cfg!(target_os = "macos") {
+        Platform::MacOs
+    } else {
+        Platform::Linux
+    }
+}
+
 /// Prefer the installer for the current platform, fall back to the portable
 /// archive. Names come from the release workflow, so the suffixes are stable.
 /// On Linux the installer preference follows the distro family (rpm vs deb).
 fn pick_asset(assets: &[ReleaseAsset]) -> Option<String> {
-    pick_asset_for(cfg!(target_os = "windows"), linux_prefers_rpm(), assets)
+    pick_asset_for(
+        current_platform(),
+        std::env::consts::ARCH,
+        linux_prefers_rpm(),
+        assets,
+    )
 }
 
 /// Fedora/RHEL/SUSE 安装 .rpm，Debian/Ubuntu 安装 .deb；识别不到发行版时
@@ -153,40 +178,51 @@ fn os_release_prefers_rpm(content: &str) -> bool {
     })
 }
 
-fn is_windows_setup(name: &str) -> bool {
-    name.ends_with("-windows-x86_64-setup.exe")
+fn is_windows_setup(name: &str, arch: &str) -> bool {
+    name.ends_with(&format!("-windows-{arch}-setup.exe"))
 }
 
-fn is_windows_zip(name: &str) -> bool {
-    name.ends_with("-windows-x86_64.zip")
+fn is_windows_zip(name: &str, arch: &str) -> bool {
+    name.ends_with(&format!("-windows-{arch}.zip"))
 }
 
-fn is_deb(name: &str) -> bool {
-    name.ends_with("_amd64.deb")
+fn is_macos_archive(name: &str, arch: &str) -> bool {
+    name.ends_with(&format!("-macos-{arch}.tar.gz"))
+        || name.ends_with(&format!("-macos-{arch}.zip"))
 }
 
-fn is_rpm(name: &str) -> bool {
-    name.ends_with(".x86_64.rpm")
+fn is_deb(name: &str, arch: &str) -> bool {
+    // The workflow only publishes amd64 packages; other Linux arches must fall
+    // through to the portable tarball.
+    arch == "x86_64" && name.ends_with("_amd64.deb")
 }
 
-fn is_linux_tar(name: &str) -> bool {
-    name.ends_with("-linux-x86_64.tar.gz")
+fn is_rpm(name: &str, arch: &str) -> bool {
+    arch == "x86_64" && name.ends_with(".x86_64.rpm")
 }
 
-fn pick_asset_for(windows: bool, prefer_rpm: bool, assets: &[ReleaseAsset]) -> Option<String> {
-    let matchers: Vec<fn(&str) -> bool> = if windows {
-        vec![is_windows_setup, is_windows_zip]
-    } else if prefer_rpm {
-        vec![is_rpm, is_deb, is_linux_tar]
-    } else {
-        vec![is_deb, is_rpm, is_linux_tar]
+fn is_linux_tar(name: &str, arch: &str) -> bool {
+    name.ends_with(&format!("-linux-{arch}.tar.gz"))
+}
+
+fn pick_asset_for(
+    platform: Platform,
+    arch: &str,
+    prefer_rpm: bool,
+    assets: &[ReleaseAsset],
+) -> Option<String> {
+    let matchers: Vec<fn(&str, &str) -> bool> = match platform {
+        Platform::Windows => vec![is_windows_setup, is_windows_zip],
+        Platform::MacOs => vec![is_macos_archive],
+        Platform::Linux if prefer_rpm => vec![is_rpm, is_deb, is_linux_tar],
+        Platform::Linux => vec![is_deb, is_rpm, is_linux_tar],
     };
-    for matcher in &matchers {
-        if let Some(asset) = assets.iter().find(|asset| matcher(&asset.name)) {
-            return Some(asset.browser_download_url.clone());
-        }
-    }
-    None
+    matchers.iter().find_map(|matcher| {
+        assets
+            .iter()
+            .find(|asset| matcher(&asset.name, arch))
+            .map(|asset| asset.browser_download_url.clone())
+    })
 }
 
 /// `v0.2.0`, `0.2.0`, `0.2.0-rc.1` and `0.2.0+build` all parse; anything else
@@ -253,35 +289,58 @@ mod tests {
             asset("EffiBuddy-0.2.0-linux-x86_64.tar.gz"),
             asset("effibuddy_0.2.0_amd64.deb"),
             asset("effibuddy-0.2.0-1.x86_64.rpm"),
+            asset("EffiBuddy-0.2.0-macos-aarch64.tar.gz"),
             asset("EffiBuddy-0.2.0-windows-x86_64.zip"),
             asset("EffiBuddy-0.2.0-windows-x86_64-setup.exe"),
             asset("source.tar.gz"),
         ];
-        let windows = pick_asset_for(true, false, &assets);
+        let windows = pick_asset_for(Platform::Windows, "x86_64", false, &assets);
         assert_eq!(
             windows.as_deref(),
             Some("https://example.com/EffiBuddy-0.2.0-windows-x86_64-setup.exe")
         );
-        let deb_first = pick_asset_for(false, false, &assets);
+        let deb_first = pick_asset_for(Platform::Linux, "x86_64", false, &assets);
         assert_eq!(
             deb_first.as_deref(),
             Some("https://example.com/effibuddy_0.2.0_amd64.deb")
         );
-        let rpm_first = pick_asset_for(false, true, &assets);
+        let rpm_first = pick_asset_for(Platform::Linux, "x86_64", true, &assets);
         assert_eq!(
             rpm_first.as_deref(),
             Some("https://example.com/effibuddy-0.2.0-1.x86_64.rpm")
+        );
+        let macos = pick_asset_for(Platform::MacOs, "aarch64", false, &assets);
+        assert_eq!(
+            macos.as_deref(),
+            Some("https://example.com/EffiBuddy-0.2.0-macos-aarch64.tar.gz")
         );
     }
 
     #[test]
     fn pick_asset_falls_back_to_archive() {
         let assets = vec![asset("EffiBuddy-0.2.0-windows-x86_64.zip")];
-        assert!(pick_asset_for(true, false, &assets).is_some());
-        assert!(pick_asset_for(false, false, &assets).is_none());
+        assert!(pick_asset_for(Platform::Windows, "x86_64", false, &assets).is_some());
+        assert!(pick_asset_for(Platform::Linux, "x86_64", false, &assets).is_none());
         // 只有 rpm 可用时，deb 优先的发行版也会退而求其次。
         let rpm_only = vec![asset("effibuddy-0.2.0-1.fc45.x86_64.rpm")];
-        assert!(pick_asset_for(false, false, &rpm_only).is_some());
+        assert!(pick_asset_for(Platform::Linux, "x86_64", false, &rpm_only).is_some());
+    }
+
+    #[test]
+    fn pick_asset_respects_the_running_architecture() {
+        let assets = vec![
+            asset("EffiBuddy-0.2.0-linux-x86_64.tar.gz"),
+            asset("EffiBuddy-0.2.0-linux-aarch64.tar.gz"),
+            asset("effibuddy_0.2.0_amd64.deb"),
+        ];
+        // amd64 安装包不能下给 arm64 用户，只能退回同架构的 tar.gz。
+        assert_eq!(
+            pick_asset_for(Platform::Linux, "aarch64", false, &assets).as_deref(),
+            Some("https://example.com/EffiBuddy-0.2.0-linux-aarch64.tar.gz")
+        );
+        // macOS 同理：没有 aarch64 资源时不跨架构猜测。
+        let mac_only_x64 = vec![asset("EffiBuddy-0.2.0-macos-x86_64.tar.gz")];
+        assert!(pick_asset_for(Platform::MacOs, "aarch64", false, &mac_only_x64).is_none());
     }
 
     #[test]

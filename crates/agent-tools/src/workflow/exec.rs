@@ -249,6 +249,7 @@ data, return valid JSON without prose or Markdown fences so it can be routed aut
         parent_session_id: ctx.session_id.clone(),
         parent_call_id: ctx.call_id.clone(),
         workspace: ctx.cwd.clone(),
+        additional_workspaces: ctx.additional_workspaces.clone(),
         agent_name: Some(name),
         parent_agent_id: Some(ctx.agent_id.clone()),
         parent_agent_name: ctx.agent_name.clone(),

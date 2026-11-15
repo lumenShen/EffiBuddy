@@ -2,18 +2,25 @@
 
 mod agents;
 mod app;
+mod attachments;
 mod chat;
 mod chat_agent;
 mod checkpoint;
+mod composer_menu;
 mod computer;
 mod config;
+mod context_meter;
+mod draft_store;
 mod events;
 mod graph;
 mod model_config;
 mod model_picker;
 mod perf;
+mod project_store;
+mod session_export;
 mod settings;
 mod side_pane;
+mod skills;
 mod smooth;
 // Stress lab — opt-in only (`--features stress`); compiled out of default builds.
 mod store;
@@ -98,6 +105,9 @@ fn main() {
                 }
                 if std::env::args().any(|argument| argument == "--preview-composer") {
                     view.seed_composer_preview(window, cx);
+                }
+                if std::env::args().any(|argument| argument == "--preview-composer-menu") {
+                    view.seed_composer_menu_preview(window, cx);
                 }
                 if std::env::args().any(|argument| argument == "--preview-computer") {
                     view.seed_computer_preview(window, cx);

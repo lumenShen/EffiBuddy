@@ -13,16 +13,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
 
-use effibuddy_agent_core::{AgentVisibility, SubagentStatus, TodoStatus, Usage, lock_session};
+use effibuddy_agent_core::{AgentVisibility, SubagentStatus, TodoStatus, lock_session};
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, Spinner, TextInputOptions,
     TextInputState, TextInputView, Theme, badge, disclosure_chevron, divider, ease_out_cubic,
     empty_state, icons, overlay_motion_duration, radius, section_label, shadow_float, small_badge,
 };
 use gpui::{
-    Animation, AnimationExt, AnyElement, Context, Entity, HighlightStyle, IntoElement, MouseButton,
-    Point, SharedString, StyledText, Window, anchored, div, point, prelude::*, px, svg,
-    transparent_black, uniform_list,
+    Animation, AnimationExt, AnyElement, Context, Entity, HighlightStyle, Hsla, IntoElement,
+    MouseButton, Point, SharedString, StyledText, Window, anchored, div, point, prelude::*, px,
+    relative, svg, transparent_black, uniform_list,
 };
 use similar::{ChangeTag, TextDiff};
 
@@ -31,6 +31,7 @@ use crate::chat::{
     AgentCard, ChatList, RunSnapshot, agent_color, format_elapsed, render_chat_item,
 };
 use crate::config::AppConfig;
+use crate::context_meter::ContextUsage;
 use crate::smooth::smooth_overlay;
 
 pub(crate) const MIN_SIDE_PANE_WIDTH: f32 = 260.0;
@@ -44,7 +45,7 @@ const FOLD_CONTEXT_LINES: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SidePaneTabKind {
-    Plan,
+    Overview,
     Agents,
     Files,
     Changes,
@@ -61,12 +62,12 @@ pub(crate) struct SidePaneTab {
 }
 
 impl SidePaneTab {
-    pub fn plan() -> Self {
+    pub fn overview() -> Self {
         Self {
-            id: "plan".to_string(),
-            kind: SidePaneTabKind::Plan,
-            title: "计划".to_string(),
-            icon: icons::CLOCK,
+            id: "overview".to_string(),
+            kind: SidePaneTabKind::Overview,
+            title: "概览".to_string(),
+            icon: icons::GAUGE,
             closable: true,
         }
     }
@@ -120,7 +121,7 @@ impl SidePaneTab {
     /// to a running harness and are intentionally not restored.
     pub fn persist_key(&self) -> Option<&'static str> {
         match self.kind {
-            SidePaneTabKind::Plan => Some("plan"),
+            SidePaneTabKind::Overview => Some("overview"),
             SidePaneTabKind::Agents => Some("agents"),
             SidePaneTabKind::Files => Some("files"),
             SidePaneTabKind::Changes => Some("changes"),
@@ -131,7 +132,8 @@ impl SidePaneTab {
 
 pub(crate) fn tab_from_key(key: &str) -> Option<SidePaneTab> {
     match key {
-        "plan" => Some(SidePaneTab::plan()),
+        // `plan` 是重命名前的持久化键，继续识别以免老配置丢页签。
+        "overview" | "plan" => Some(SidePaneTab::overview()),
         "agents" => Some(SidePaneTab::agents()),
         "files" => Some(SidePaneTab::files()),
         "changes" => Some(SidePaneTab::changes()),
@@ -418,10 +420,15 @@ impl SidePaneState {
             }
         }
         if tabs.is_empty() {
-            tabs.push(SidePaneTab::plan());
+            tabs.push(SidePaneTab::overview());
         }
-        let active_id = if tabs.iter().any(|tab| tab.id == config.side_bar_active) {
-            config.side_bar_active.clone()
+        // 老配置把概览页签记作 `plan`；激活项也做同样的迁移。
+        let desired_active = match config.side_bar_active.as_str() {
+            "plan" => "overview",
+            other => other,
+        };
+        let active_id = if tabs.iter().any(|tab| tab.id == desired_active) {
+            desired_active.to_string()
         } else {
             tabs[0].id.clone()
         };
@@ -1234,12 +1241,12 @@ impl AppView {
                         .child("没有打开的页签"),
                 )
                 .child(
-                    Button::new("side-open-plan", "打开计划", &theme)
+                    Button::new("side-open-overview", "打开概览", &theme)
                         .variant(ButtonVariant::Secondary)
                         .size(ButtonSize::Sm)
-                        .icon(icons::CLOCK)
+                        .icon(icons::GAUGE)
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.side.open_tab(SidePaneTab::plan());
+                            this.side.open_tab(SidePaneTab::overview());
                             this.persist_side_pane();
                             cx.notify();
                         })),
@@ -1445,7 +1452,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let content = match &tab.kind {
-            SidePaneTabKind::Plan => self.render_plan_pane(cx),
+            SidePaneTabKind::Overview => self.render_overview_pane(cx),
             SidePaneTabKind::Agents => self.render_agents_pane(cx),
             SidePaneTabKind::Files => self.render_files_pane(cx),
             SidePaneTabKind::Changes => self.render_changes_pane(cx),
@@ -1477,40 +1484,68 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_plan_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// 概览页：计划进度 + 本会话用量。每个图形只承担一个含义——进度条＝
+    /// 完成度，分段条＝上下文构成，数字块＝累计消耗；颜色只用来标记状态
+    /// 与构成（完成 / 进行中 / 占用偏高 / 消息与摘要）。
+    fn render_overview_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let scroll_entity = cx.entity().downgrade();
         let shared = self.active_shared();
-        let (todos, usage, message_count, steps, model, provider, context_window, compacted) =
+        // 计划与用量来自同一次会话读取：避免两次加锁之间数据被更新。
+        let (todos, steps, model, provider, compacted, context) =
             if let Some(shared) = &shared {
                 let session = lock_session(shared);
                 let resolved = self.models.resolve_session(&session);
+                // 与输入框占用环保持一致：演示模型按 64k 窗口计算。
+                let context_window = if self.models.demo_mode(self.config.use_demo, &resolved) {
+                    64_000
+                } else {
+                    resolved.context_window()
+                };
                 (
                     session.todos.clone(),
-                    session.usage.clone(),
-                    session.messages.len(),
                     session.steps,
                     resolved.model_label().to_string(),
                     resolved.provider_label().to_string(),
-                    resolved.context_window(),
                     session
                         .compaction
                         .as_ref()
                         .map(|record| record.compacted_messages)
                         .unwrap_or(0),
+                    crate::context_meter::collect_from_session(&session, context_window),
                 )
             } else {
                 (
                     Vec::new(),
-                    Usage::default(),
-                    0,
                     0,
                     String::new(),
                     String::new(),
-                    128_000,
                     0,
+                    ContextUsage::empty(128_000),
                 )
             };
+
+        let total = todos.len();
+        let completed = todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Completed)
+            .count();
+        let all_done = total > 0 && completed == total;
+        let progress = if total == 0 {
+            0.0
+        } else {
+            completed as f32 / total as f32
+        };
+        let progress_color = if all_done {
+            theme.success
+        } else {
+            theme.accent
+        };
+        let count_tone = if all_done {
+            BadgeTone::Success
+        } else {
+            BadgeTone::Neutral
+        };
 
         let todo_rows: Vec<AnyElement> = todos
             .iter()
@@ -1521,13 +1556,13 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .size(px(18.0))
+                        .size(px(16.0))
                         .rounded(px(radius::FULL))
                         .bg(theme.success_soft)
                         .child(
                             svg()
                                 .path(icons::CHECK)
-                                .size(px(10.0))
+                                .size(px(9.0))
                                 .text_color(theme.success),
                         )
                         .into_any_element(),
@@ -1536,34 +1571,41 @@ impl AppView {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .size(px(18.0))
+                        .size(px(16.0))
                         .rounded(px(radius::FULL))
-                        .bg(theme.accent_soft)
-                        .child(Spinner::new(theme.accent, 10.0))
+                        .child(Spinner::new(theme.accent, 12.0))
                         .into_any_element(),
                     TodoStatus::Pending => div()
                         .flex_none()
-                        .size(px(18.0))
+                        .size(px(16.0))
                         .rounded(px(radius::FULL))
                         .border_1()
                         .border_color(theme.border_strong)
                         .into_any_element(),
                 };
+                let in_progress = todo.status == TodoStatus::InProgress;
                 div()
                     .flex()
                     .items_start()
-                    .gap_2()
-                    .py(px(4.0))
+                    .gap(px(8.0))
+                    .rounded(px(radius::XS))
+                    .px(px(6.0))
+                    .py(px(5.0))
+                    .when(in_progress, |row| row.bg(theme.accent_soft))
                     .child(marker)
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(12.0))
-                            .line_height(px(18.0))
-                            .text_color(if todo.status == TodoStatus::Completed {
-                                theme.text_faint
-                            } else {
-                                theme.text_muted
+                            .min_w(px(0.0))
+                            .text_size(px(if in_progress { 12.0 } else { 11.5 }))
+                            .line_height(px(17.0))
+                            .when(in_progress, |text| {
+                                text.font_weight(gpui::FontWeight::MEDIUM)
+                            })
+                            .text_color(match todo.status {
+                                TodoStatus::Completed => theme.text_faint,
+                                TodoStatus::InProgress => theme.text,
+                                TodoStatus::Pending => theme.text_muted,
                             })
                             .child(todo.content.clone()),
                     )
@@ -1571,113 +1613,358 @@ impl AppView {
             })
             .collect();
 
+        let plan_card = overview_card(theme)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(overview_card_title(theme, icons::CLOCK, "计划"))
+                    .when(total > 0, |header| {
+                        header.child(small_badge(
+                            theme,
+                            format!("{completed}/{total}"),
+                            count_tone,
+                        ))
+                    }),
+            )
+            .when(total > 0, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .w_full()
+                        .h(px(4.0))
+                        .rounded(px(radius::FULL))
+                        .bg(theme.surface_alt)
+                        .overflow_hidden()
+                        .when(progress > 0.0, |bar| {
+                            bar.child(
+                                div()
+                                    .h_full()
+                                    .w(relative(progress))
+                                    .rounded(px(radius::FULL))
+                                    .bg(progress_color),
+                            )
+                        }),
+                )
+            })
+            .when(todo_rows.is_empty(), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap(px(4.0))
+                        .py(px(14.0))
+                        .child(
+                            svg()
+                                .path(icons::CLOCK)
+                                .size(px(16.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .text_color(theme.text_muted)
+                                .child("暂无任务"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(theme.text_faint)
+                                .text_center()
+                                .child("让 EffiBuddy 制定计划后会显示在这里"),
+                        ),
+                )
+            })
+            .when(!todo_rows.is_empty(), |card| {
+                card.child(div().flex().flex_col().gap(px(1.0)).children(todo_rows))
+            });
+
+        let has_context = context.last_prompt_tokens > 0;
+        let percent = context.percent();
+        let percent_color = if percent >= 90.0 {
+            theme.danger
+        } else if percent >= 75.0 {
+            theme.warning
+        } else {
+            theme.text_muted
+        };
+        let percent_label = if percent > 0.0 && percent < 10.0 {
+            format!("{percent:.1}%")
+        } else {
+            format!("{percent:.0}%")
+        };
+
+        // 分段条按上报的当前占用归一：本地估算之和偶尔会略高于上报值。
+        let window = context.context_window.max(1) as f32;
+        let reported = context.last_prompt_tokens as f32;
+        let system_tokens = context.system_tool_tokens().unwrap_or(0) as f32;
+        let message_tokens = context.message_tokens as f32;
+        let summary_tokens = context.summary_tokens as f32;
+        let estimated = system_tokens + message_tokens + summary_tokens;
+        let scale = if reported > 0.0 && estimated > reported {
+            reported / estimated
+        } else {
+            1.0
+        };
+        let segment = |tokens: f32| ((tokens * scale) / window).clamp(0.0, 1.0);
+        let system_color = theme.text_faint.opacity(0.55);
+
+        let mut context_bar = div()
+            .flex()
+            .w_full()
+            .h(px(6.0))
+            .rounded(px(radius::FULL))
+            .bg(theme.surface_alt)
+            .overflow_hidden();
+        if has_context {
+            for (tokens, color) in [
+                (system_tokens, system_color),
+                (message_tokens, theme.accent),
+                (summary_tokens, theme.agent_purple),
+            ] {
+                if tokens > 0.0 {
+                    context_bar =
+                        context_bar.child(div().h_full().w(relative(segment(tokens))).bg(color));
+                }
+            }
+        }
+
+        let mut context_legend = div().flex().flex_col().gap(px(3.0));
+        if has_context {
+            if system_tokens > 0.0 {
+                context_legend = context_legend.child(usage_legend_row(
+                    theme,
+                    system_color,
+                    "系统与工具",
+                    format!("~{}", format_tokens(system_tokens as u64)),
+                ));
+            }
+            if message_tokens > 0.0 {
+                context_legend = context_legend.child(usage_legend_row(
+                    theme,
+                    theme.accent,
+                    "消息历史",
+                    format!(
+                        "~{} · {} 条",
+                        format_tokens(message_tokens as u64),
+                        context.message_count
+                    ),
+                ));
+            }
+            if summary_tokens > 0.0 {
+                context_legend = context_legend.child(usage_legend_row(
+                    theme,
+                    theme.agent_purple,
+                    "压缩摘要",
+                    format!("~{}", format_tokens(summary_tokens as u64)),
+                ));
+            }
+        }
+
+        let context_block = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child("上下文占用"),
+                    )
+                    .child(
+                        div()
+                            .font_family(theme.mono_font())
+                            .text_size(px(11.0))
+                            .text_color(percent_color)
+                            .child(percent_label),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(px(5.0))
+                    .child(
+                        div()
+                            .font_family(theme.mono_font())
+                            .text_size(px(18.0))
+                            .line_height(px(22.0))
+                            .text_color(if has_context {
+                                theme.text
+                            } else {
+                                theme.text_faint
+                            })
+                            .child(format_tokens(context.last_prompt_tokens)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(format!(
+                                "/ {}",
+                                format_context_window(context.context_window)
+                            )),
+                    ),
+            )
+            .child(context_bar)
+            .when(!has_context, |block| {
+                block.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child("发起对话后会显示上下文构成"),
+                )
+            })
+            .when(has_context, |block| block.child(context_legend));
+
+        let cache_hint = if context.prompt_total == 0 {
+            "尚无请求".to_string()
+        } else if context.cached_total > 0 {
+            format!(
+                "{:.0}% 输入命中",
+                context.cached_total as f64 / context.prompt_total as f64 * 100.0
+            )
+        } else {
+            "无命中".to_string()
+        };
+
+        let usage_block = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(overview_subhead(theme, "累计消耗"))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(usage_tile(
+                        theme,
+                        "输入",
+                        format_tokens(context.prompt_total),
+                        None,
+                        false,
+                    ))
+                    .child(usage_tile(
+                        theme,
+                        "输出",
+                        format_tokens(context.completion_total),
+                        None,
+                        false,
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(usage_tile(
+                        theme,
+                        "缓存命中",
+                        format_tokens(context.cached_total),
+                        Some(cache_hint),
+                        false,
+                    ))
+                    .child(usage_tile(
+                        theme,
+                        "合计",
+                        format_tokens(context.total),
+                        Some("输入 + 输出".to_string()),
+                        true,
+                    )),
+            );
+
+        let mut meta = vec![
+            format!("{} 条消息", context.message_count),
+            format!("{steps} 步"),
+        ];
+        if compacted > 0 {
+            meta.push(format!("压缩 {compacted} 条"));
+        }
+
+        let usage_card = overview_card(theme)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(overview_card_title(theme, icons::GAUGE, "用量详情"))
+                    .child(small_badge(theme, "本会话", BadgeTone::Neutral)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when(!provider.is_empty(), |row| {
+                        row.child(small_badge(theme, provider.clone(), BadgeTone::Neutral))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(if model.is_empty() {
+                                "未选择模型".to_string()
+                            } else {
+                                model.clone()
+                            }),
+                    ),
+            )
+            .child(context_block)
+            .child(divider(theme))
+            .child(usage_block)
+            .child(divider(theme))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .line_height(px(16.0))
+                    .text_color(theme.text_faint)
+                    .child(meta.join(" · ")),
+            );
+
         div()
             .relative()
             .flex_1()
             .min_h(px(0.0))
             .child(
                 div()
-                    .id("side-plan-scroll")
+                    .id("side-overview-scroll")
                     .size_full()
                     .overflow_y_scroll()
-                    .track_scroll(self.scrolls.side_plan.handle())
-                    .px_4()
-                    .py_4()
+                    .track_scroll(self.scrolls.side_overview_content.handle())
+                    .px(px(12.0))
+                    .py(px(12.0))
                     .flex()
                     .flex_col()
-                    .gap(px(20.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(section_label(theme, "计划"))
-                    .when(todo_rows.is_empty(), |element| {
-                        element.child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(theme.text_faint)
-                                .py_2()
-                                .child("暂无任务。让 EffiBuddy 制定计划后会显示在这里"),
+                    .gap(px(12.0))
+                    .child(plan_card)
+                    .child(usage_card),
+            )
+            .when(
+                !self.modal_blocks_scroll() && self.side.overlay.is_none(),
+                |element| {
+                    element.child(
+                        smooth_overlay(
+                            self.scrolls.side_overview_content.clone(),
+                            scroll_entity.clone(),
                         )
-                    })
-                    .children(todo_rows),
-            )
-            .child(divider(theme))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(section_label(theme, "上下文"))
-                    .child(stat_row(theme, "供应商", &provider))
-                    .child(stat_row(theme, "模型", &model))
-                    .child(stat_row(
-                        theme,
-                        "上下文窗口",
-                        &format_context_window(context_window),
-                    ))
-                    .child(stat_row(theme, "消息", &message_count.to_string()))
-                    .child(stat_row(theme, "当前步数", &steps.to_string()))
-                    .child(stat_row(
-                        theme,
-                        "当前占用",
-                        &format_tokens(usage.last_prompt_tokens),
-                    ))
-                    .child(stat_row(
-                        theme,
-                        "累计 tokens",
-                        &format_tokens(usage.total_tokens),
-                    ))
-                    .child(stat_row(theme, "已压缩消息", &compacted.to_string())),
-            )
-            .child(divider(theme))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(section_label(theme, "能力"))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_1()
-                            .children(
-                                [
-                                    "read_file",
-                                    "write_file",
-                                    "edit_file",
-                                    "list_dir",
-                                    "grep",
-                                    "shell",
-                                    "todo_write",
-                                    "run_js",
-                                    "agent",
-                                ]
-                                .iter()
-                                .map(|name| badge(theme, *name, BadgeTone::Neutral)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .line_height(px(16.0))
-                            .text_color(theme.text_faint)
-                            .child("run_js 使用 Boa 引擎，在同步 JS 中调用 tools.*，每次嵌套调用仍会经过审批。agent 工具可启动只读 explore / reviewer 或通用子代理。"),
-                    ),
-            )
-            )
-            .when(!self.modal_blocks_scroll() && self.side.overlay.is_none(), |element| {
-                element.child(
-                    smooth_overlay(
-                        self.scrolls.side_plan.clone(),
-                        scroll_entity.clone(),
-                    )
                         .absolute()
                         .inset_0(),
-                )
-            })
+                    )
+                },
+            )
             .into_any_element()
     }
 
@@ -2942,7 +3229,7 @@ impl AppView {
     fn render_side_add_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let mut rows: Vec<AnyElement> = Vec::new();
         for tab in [
-            SidePaneTab::plan(),
+            SidePaneTab::overview(),
             SidePaneTab::agents(),
             SidePaneTab::files(),
             SidePaneTab::changes(),
@@ -3183,7 +3470,7 @@ impl AppView {
                             .id("side-overview-scroll")
                             .max_h(px(340.0))
                             .overflow_y_scroll()
-                            .track_scroll(self.scrolls.side_overview.handle())
+                            .track_scroll(self.scrolls.side_tab_overview.handle())
                             .flex()
                             .flex_col()
                             .gap_2()
@@ -3192,7 +3479,7 @@ impl AppView {
                     .when(!self.modal_blocks_scroll(), |element| {
                         element.child(
                             smooth_overlay(
-                                self.scrolls.side_overview.clone(),
+                                self.scrolls.side_tab_overview.clone(),
                                 scroll_entity.clone(),
                             )
                             .absolute()
@@ -3275,27 +3562,138 @@ impl ClassifiedRows {
     }
 }
 
-fn stat_row(theme: &Theme, label: &str, value: &str) -> AnyElement {
+/// 概览页卡片：抬升面 + 一层细边框，只做分组，不和内容抢注意力。
+fn overview_card(theme: &Theme) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .p(px(12.0))
+        .rounded(px(radius::MD))
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.surface)
+}
+
+/// 卡片标题：小图标 + 12px 中等字重，与正文拉开一层。
+fn overview_card_title(theme: &Theme, icon: &'static str, title: &str) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(svg().path(icon).size(px(12.0)).text_color(theme.text_faint))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(title.to_string()),
+        )
+        .into_any_element()
+}
+
+fn overview_subhead(theme: &Theme, label: &str) -> AnyElement {
+    div()
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(theme.text_faint)
+        .child(label.to_string())
+        .into_any_element()
+}
+
+/// 上下文构成图例：色点对应分段条的颜色，右侧数值用等宽字。
+fn usage_legend_row(theme: &Theme, color: Hsla, label: &str, value: String) -> AnyElement {
     div()
         .flex()
         .items_center()
         .justify_between()
-        .gap_2()
+        .gap(px(8.0))
         .child(
             div()
-                .text_size(px(11.5))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .size(px(6.0))
+                        .rounded(px(radius::FULL))
+                        .bg(color),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(label.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .font_family(theme.mono_font())
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(value),
+        )
+        .into_any_element()
+}
+
+/// 累计消耗的小数字块：标签、主数值、可选脚注三层，合计块用强调底色。
+fn usage_tile(
+    theme: &Theme,
+    label: &str,
+    value: String,
+    hint: Option<String>,
+    emphasized: bool,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(52.0))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(2.0))
+        .px(px(10.0))
+        .rounded(px(radius::SM))
+        .bg(if emphasized {
+            theme.accent_soft
+        } else {
+            theme.surface_alt
+        })
+        .child(
+            div()
+                .text_size(px(10.5))
                 .text_color(theme.text_faint)
                 .child(label.to_string()),
         )
         .child(
             div()
-                .max_w(px(170.0))
                 .truncate()
                 .font_family(theme.mono_font())
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(value.to_string()),
+                .text_size(px(15.0))
+                .line_height(px(18.0))
+                .font_weight(if emphasized {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(if emphasized {
+                    theme.text
+                } else {
+                    theme.text_muted
+                })
+                .child(value),
         )
+        .when_some(hint, |tile, hint| {
+            tile.child(
+                div()
+                    .truncate()
+                    .text_size(px(10.0))
+                    .line_height(px(13.0))
+                    .text_color(theme.text_faint)
+                    .child(hint),
+            )
+        })
         .into_any_element()
 }
 
@@ -3338,7 +3736,7 @@ mod tests {
     #[test]
     fn closing_tab_selects_neighbor_and_tracks_recent() {
         let mut tabs = vec![
-            SidePaneTab::plan(),
+            SidePaneTab::overview(),
             SidePaneTab::agents(),
             SidePaneTab::files(),
         ];
@@ -3353,11 +3751,19 @@ mod tests {
 
     #[test]
     fn persisted_keys_skip_agent_tabs() {
-        assert_eq!(SidePaneTab::plan().persist_key(), Some("plan"));
+        assert_eq!(SidePaneTab::overview().persist_key(), Some("overview"));
         assert_eq!(
             SidePaneTab::agent("a1", "explore", "search").persist_key(),
             None
         );
+    }
+
+    #[test]
+    fn legacy_plan_key_restores_overview_tab() {
+        let tab = tab_from_key("plan").expect("legacy key still restores the tab");
+        assert_eq!(tab.id, "overview");
+        assert_eq!(tab.title, "概览");
+        assert_eq!(tab.kind, SidePaneTabKind::Overview);
     }
 
     #[test]

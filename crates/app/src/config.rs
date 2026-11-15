@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use effibuddy_agent_core::CompactionConfig;
 use effibuddy_agent_core::tool::PermissionMode;
 use effibuddy_computer::ComputerUseMode;
 use serde::{Deserialize, Serialize};
@@ -83,6 +84,11 @@ pub struct AppConfig {
     /// ctrl-= / ctrl-- / ctrl-0 shortcuts; see `Window::set_ui_zoom`.
     #[serde(default = "default_ui_zoom")]
     pub ui_zoom: f32,
+    /// Context compaction policy. All thresholds are percentages of the
+    /// selected model's context window, so one configuration works across
+    /// small local models and large hosted ones.
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 fn default_true() -> bool {
@@ -107,11 +113,11 @@ fn default_side_bar_width() -> f32 {
 }
 
 fn default_side_bar_tabs() -> Vec<String> {
-    vec!["plan".to_string(), "agents".to_string()]
+    vec!["overview".to_string(), "agents".to_string()]
 }
 
 fn default_side_bar_active() -> String {
-    "plan".to_string()
+    "overview".to_string()
 }
 
 fn default_base_url() -> String {
@@ -151,6 +157,7 @@ impl Default for AppConfig {
             update_check_enabled: true,
             update_skip_version: None,
             ui_zoom: default_ui_zoom(),
+            compaction: CompactionConfig::default(),
         }
     }
 }
@@ -184,6 +191,16 @@ impl AppConfig {
         }
         config.side_bar_width = config.side_bar_width.clamp(260.0, 620.0);
         config.ui_zoom = config.ui_zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+        config.compaction.trigger_percent = config.compaction.trigger_percent.clamp(10.0, 95.0);
+        config.compaction.keep_recent_percent =
+            config.compaction.keep_recent_percent.clamp(5.0, 60.0);
+        config.compaction.summary_percent = config.compaction.summary_percent.clamp(2.0, 30.0);
+        config.compaction.keep_recent_tool_results =
+            config.compaction.keep_recent_tool_results.clamp(1, 50);
+        config.compaction.max_consecutive_failures =
+            config.compaction.max_consecutive_failures.clamp(1, 10);
+        config.compaction.background_start_percent =
+            config.compaction.background_start_percent.clamp(5.0, 90.0);
         config
     }
 
@@ -226,23 +243,31 @@ impl AppConfig {
         self.palette_recent.truncate(PALETTE_RECENT_LIMIT);
     }
 
-    /// Instructions from `AGENTS.md` / `EFFIBUDDY.md` in the workspace.
+    /// Instructions from `AGENTS.md` / `EFFIBUDDY.md` / `CLAUDE.md` in the
+    /// configured workspace. Project sessions call
+    /// [`project_instructions_for`] with their own cwd instead.
     pub fn project_instructions(&self) -> String {
-        let workspace = self.workspace();
-        let mut parts = Vec::new();
-        for name in ["AGENTS.md", "EFFIBUDDY.md", "CLAUDE.md"] {
-            let path = workspace.join(name);
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                let contents = contents.trim();
-                if contents.is_empty() {
-                    continue;
-                }
-                let contents: String = contents.chars().take(12_000).collect();
-                parts.push(format!("## {name}\n{contents}"));
-            }
-        }
-        parts.join("\n\n")
+        project_instructions_for(&self.workspace())
     }
+}
+
+/// Instructions from `AGENTS.md` / `EFFIBUDDY.md` / `CLAUDE.md` at `root`.
+/// Only the session cwd is scanned: a project's additional folders never
+/// contribute instructions (ZCode parity), so the prompt stays predictable.
+pub fn project_instructions_for(root: &Path) -> String {
+    let mut parts = Vec::new();
+    for name in ["AGENTS.md", "EFFIBUDDY.md", "CLAUDE.md"] {
+        let path = root.join(name);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            let contents = contents.trim();
+            if contents.is_empty() {
+                continue;
+            }
+            let contents: String = contents.chars().take(12_000).collect();
+            parts.push(format!("## {name}\n{contents}"));
+        }
+    }
+    parts.join("\n\n")
 }
 
 /// 应用数据目录名：debug 构建（`cargo run` / `cargo test` 默认配置）使用
@@ -377,6 +402,32 @@ mod tests {
         // Skipped version stays out of the file while unset.
         let plain = serde_json::to_string(&AppConfig::default()).unwrap();
         assert!(!plain.contains("update_skip_version"));
+    }
+
+    #[test]
+    fn compaction_defaults_and_roundtrips() {
+        // Old config files have no `compaction` key; defaults must be sane.
+        let legacy: AppConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark"})).unwrap();
+        assert_eq!(legacy.compaction, CompactionConfig::default());
+        assert!(legacy.compaction.enabled);
+        assert_eq!(legacy.compaction.trigger_percent, 80.0);
+        assert_eq!(legacy.compaction.keep_recent_percent, 20.0);
+        assert_eq!(legacy.compaction.summary_percent, 10.0);
+        assert!(!legacy.compaction.background_precompact);
+        assert_eq!(legacy.compaction.background_start_percent, 50.0);
+
+        let mut config = AppConfig::default();
+        config.compaction.trigger_percent = 66.0;
+        config.compaction.keep_recent_percent = 12.0;
+        config.compaction.summary_percent = 6.0;
+        config.compaction.clear_tool_outputs = false;
+        config.compaction.keep_recent_tool_results = 9;
+        config.compaction.background_precompact = true;
+        config.compaction.background_start_percent = 40.0;
+        let text = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored.compaction, config.compaction);
     }
 
     #[test]

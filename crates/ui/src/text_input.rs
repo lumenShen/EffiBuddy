@@ -335,8 +335,28 @@ impl TextInputState {
         }
     }
 
+    /// True while an IME composition (marked text) is in progress. Autocomplete
+    /// menus must not react to or intercept keys during composition.
+    pub fn is_composing(&self) -> bool {
+        self.marked_range.is_some()
+    }
+
     pub fn selected_range(&self) -> Range<usize> {
         self.selected_range.clone()
+    }
+
+    /// Replace a byte range with `text` and put the caret after it. Composer
+    /// autocomplete menus (slash/mention) know the token's byte range from the
+    /// content, so they do not need the UTF-16 conversion performed by
+    /// [`EntityInputHandler::replace_text_in_range`].
+    pub fn replace_byte_range(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.replace_range(range, text, window, cx);
     }
 
     pub fn set_content(

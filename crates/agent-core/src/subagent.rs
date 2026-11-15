@@ -243,6 +243,9 @@ pub struct SubagentRequest {
     pub parent_session_id: String,
     pub parent_call_id: String,
     pub workspace: PathBuf,
+    /// Additional project folders inherited from the launching session. Child
+    /// tools may read and write inside any of them.
+    pub additional_workspaces: Vec<PathBuf>,
     /// Model-facing handle. Assigned by the host when absent; duplicates get a
     /// short numeric suffix instead of failing the spawn.
     pub agent_name: Option<String>,

@@ -19,7 +19,7 @@ use effibuddy_agent_core::{
     SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry, extract_json_value,
     lock_session, new_shared_session, validate_json,
 };
-use effibuddy_agent_tools::builtin_tools;
+use effibuddy_agent_tools::builtin_tools_with_roots;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
@@ -251,6 +251,12 @@ impl SubagentService {
         session.parent_id = Some(request.parent_session_id.clone());
         session.agent_name = Some(name.clone());
         session.agent_description = Some(request.description.clone());
+        // Children inherit the parent's project so they can be regrouped if
+        // they ever surface outside the agent panel.
+        session.project_id = self.base_config.project_id.clone();
+        if session.project_id.is_some() {
+            session.project = Some(request.workspace.clone());
+        }
         let shared = new_shared_session(session.clone());
         // Persist before announcing so the child always exists on disk.
         let _ = self.store.save(&session);
@@ -259,6 +265,7 @@ impl SubagentService {
 
         let mut config = self.base_config.clone();
         config.system_prompt_extra.clear();
+        config.additional_workspaces = request.additional_workspaces.clone();
         config.system_prompt_override = Some(child_prompt(
             &profile,
             request,
@@ -291,7 +298,8 @@ impl SubagentService {
         allow_spawn: bool,
         read_only: bool,
     ) -> Result<ToolRegistry, ToolError> {
-        let mut registry = builtin_tools(&request.workspace)?;
+        let mut registry =
+            builtin_tools_with_roots(&request.workspace, &request.additional_workspaces)?;
         let explicit: Option<HashSet<String>> = request
             .tools
             .clone()

@@ -206,6 +206,7 @@ impl Tool for AgentTool {
             parent_session_id: ctx.session_id.clone(),
             parent_call_id: ctx.call_id.clone(),
             workspace: ctx.cwd.clone(),
+            additional_workspaces: ctx.additional_workspaces.clone(),
             agent_name: name,
             parent_agent_id: Some(ctx.agent_id.clone()),
             parent_agent_name: ctx.agent_name.clone(),
@@ -544,6 +545,7 @@ mod tests {
     fn context(spawner: Arc<MockSpawner>) -> ToolContext {
         ToolContext {
             cwd: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             session_id: "parent".to_string(),
             agent_id: "main".to_string(),
             agent_name: None,

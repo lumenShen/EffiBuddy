@@ -156,6 +156,10 @@ pub struct ListPrepaintState {
 enum ListItem {
     Unmeasured {
         focus_handle: Option<FocusHandle>,
+        /// Height the item had when it was last measured, preserved across a
+        /// splice so scroll geometry does not collapse to zero while the
+        /// replacement item waits to be re-rendered.
+        estimated_height: Pixels,
     },
     Measured {
         size: Size<Pixels>,
@@ -174,19 +178,26 @@ impl ListItem {
 
     fn focus_handle(&self) -> Option<FocusHandle> {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
-                focus_handle.clone()
-            }
+            ListItem::Unmeasured { focus_handle, .. }
+            | ListItem::Measured { focus_handle, .. } => focus_handle.clone(),
+        }
+    }
+
+    /// The height this item currently accounts for in the summary: the real
+    /// measured size when available, otherwise the preserved estimate.
+    fn estimated_height(&self) -> Pixels {
+        match self {
+            ListItem::Unmeasured { estimated_height, .. } => *estimated_height,
+            ListItem::Measured { size, .. } => size.height,
         }
     }
 
     fn contains_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
-            ListItem::Unmeasured { focus_handle } | ListItem::Measured { focus_handle, .. } => {
-                focus_handle
-                    .as_ref()
-                    .is_some_and(|handle| handle.contains_focused(window, cx))
-            }
+            ListItem::Unmeasured { focus_handle, .. }
+            | ListItem::Measured { focus_handle, .. } => focus_handle
+                .as_ref()
+                .is_some_and(|handle| handle.contains_focused(window, cx)),
         }
     }
 }
@@ -278,13 +289,38 @@ impl ListState {
 
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
+
+        // Preserve each replaced item's measured height: the replacement only
+        // re-measures once it is painted, and without this the summary height
+        // (and therefore the scroll range) would collapse in the meantime.
+        let mut replaced_heights = VecDeque::new();
+        let mut position = old_items.start().0;
+        while position < old_range.end {
+            let height = old_items
+                .item()
+                .and_then(|item| item.size())
+                .map(|size| size.height)
+                .unwrap_or_default();
+            replaced_heights.push_back(height);
+            old_items.next();
+            let advanced = old_items.start().0;
+            if advanced == position {
+                break;
+            }
+            position = advanced;
+        }
         old_items.seek_forward(&Count(old_range.end), Bias::Right);
 
         let mut spliced_count = 0;
         new_items.extend(
             focus_handles.into_iter().map(|focus_handle| {
                 spliced_count += 1;
-                ListItem::Unmeasured { focus_handle }
+                ListItem::Unmeasured {
+                    focus_handle,
+                    estimated_height: replaced_heights
+                        .pop_front()
+                        .unwrap_or_default(),
+                }
             }),
             (),
         );
@@ -1030,6 +1066,7 @@ impl Element for List {
             let new_items = SumTree::from_iter(
                 state.items.iter().map(|item| ListItem::Unmeasured {
                     focus_handle: item.focus_handle(),
+                    estimated_height: item.estimated_height(),
                 }),
                 (),
             );
@@ -1114,11 +1151,14 @@ impl sum_tree::Item for ListItem {
 
     fn summary(&self, _: ()) -> Self::Summary {
         match self {
-            ListItem::Unmeasured { focus_handle } => ListItemSummary {
+            ListItem::Unmeasured {
+                focus_handle,
+                estimated_height,
+            } => ListItemSummary {
                 count: 1,
                 rendered_count: 0,
                 unrendered_count: 1,
-                height: px(0.),
+                height: *estimated_height,
                 has_focus_handles: focus_handle.is_some(),
             },
             ListItem::Measured {

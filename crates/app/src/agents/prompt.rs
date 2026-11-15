@@ -15,6 +15,19 @@ pub(crate) fn child_prompt(
     let date = chrono::Utc::now().format("%Y-%m-%d");
     let parent_name = request.parent_agent_name.as_deref().unwrap_or("main");
     let parent_id = request.parent_agent_id.as_deref().unwrap_or("main");
+    let additional = if request.additional_workspaces.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n- Additional working directories: {}",
+            request
+                .additional_workspaces
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     let mut prompt = format!(
         r#"You are EffiBuddy agent `{name}` — {description}.
 Profile: {profile}
@@ -23,7 +36,7 @@ Profile: {profile}
 
 # Launcher context
 - You were launched by `{parent_name}` (agent id `{parent_id}`), not by the user.
-- Workspace root: {workspace}
+- Workspace root: {workspace}{additional}
 - Platform: {os}
 - Date: {date}
 - Tree depth: {depth} / {max_depth}
@@ -37,7 +50,8 @@ Profile: {profile}
 - {spawn_rule}
 - Only your final message is returned to your launcher. Write it as a compact report.
 - Do not create report, summary, or findings Markdown files.
-- Refer to files relative to the workspace root."#,
+- Refer to files relative to the workspace root; absolute paths inside additional working
+  directories are allowed."#,
         name = name,
         description = request.description,
         profile = profile.name,
@@ -89,6 +103,7 @@ mod tests {
             parent_session_id: "parent".to_string(),
             parent_call_id: "call".to_string(),
             workspace: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             agent_name: Some("scout".to_string()),
             parent_agent_id: Some("agent_owner".to_string()),
             parent_agent_name: Some("researcher".to_string()),

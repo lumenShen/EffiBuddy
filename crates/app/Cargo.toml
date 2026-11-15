@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+base64 = "0.22"
 chrono.workspace = true
 dirs.workspace = true
 effibuddy-agent-core.workspace = true
@@ -27,6 +28,9 @@ serde_json.workspace = true
 similar = { version = "2", features = ["inline"] }
 tokio.workspace = true
 tokio-util.workspace = true
+# Session export. Stored (uncompressed) entries are enough: images are already
+# compressed and JSON benefits little; this keeps the dependency set minimal.
+zip = { version = "2.4", default-features = false }
 
 [features]
 # Stress lab: in-app 1000-session/subagent concurrency mode. Opt-in only —

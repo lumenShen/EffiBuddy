@@ -32,6 +32,9 @@ deepseekAPIKey.env
 *.temp
 /tmp/
 /dist/
+# 发布流水线在仓库根目录生成的随包 bash（scripts/fetch-bash.sh 的输出）
+/runtime/
+__pycache__/
 
 # ---------- 编辑器 / IDE ----------
 .vscode/

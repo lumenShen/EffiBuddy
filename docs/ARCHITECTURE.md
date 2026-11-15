@@ -67,6 +67,7 @@ enum ContentBlock {
 | `todos` | `todo_write` 产生的计划 |
 | `usage` | 累计 token（含缓存命中） |
 | `compaction` / `compacted_upto` | 滚动摘要及其覆盖的消息前缀 |
+| `cleared_tool_calls` | 仅对模型隐藏正文的旧工具结果（UI 仍显示原文） |
 | `status` | Idle / Running / WaitingApproval |
 | `steps` | 最近一次 turn 的模型调用数 |
 | `last_error` | 最近一次失败原因 |
@@ -117,7 +118,7 @@ stateDiagram-v2
 | `TextDelta` / `ReasoningDelta` | 只推进 reveal 缓冲，不重建列表 |
 | `AssistantFinished` / `ToolCallFinished` | 持久化、刷新列表与活动行 |
 | `ApprovalRequested` / `ApprovalResolved` | 入队/移除审批卡片、刷新状态行 |
-| `TodosUpdated` | 刷新右侧计划 |
+| `TodosUpdated` | 刷新右侧概览 |
 | `ContextCompacted` | 持久化压缩记录 |
 | `UsageUpdated` | 刷新 token 统计 |
 | `RunFinished` | 复位状态、持久化、错误/提示；成功结束后自动续跑（排队消息 → 后台通知） |
@@ -222,16 +223,18 @@ sequenceDiagram
 
 ## 7. 上下文压缩
 
-`context.rs`：
+`context.rs` + `harness.rs`，按 ZCode 的链路实现：
 
-- 用字符数估算 token（中英混排按 1.6 字符/token 左右）；
-- 请求前检查：估算值超过 `context_window * 0.78` 时触发压缩；
-- 压缩只发生在**用户轮次边界**，不会把 assistant/tool 对拆开；
-- 保留最近 `keep_recent_turns = 6` 轮原文；
-- 旧内容生成滚动摘要（最多 12k 字符），存进 `CompactionRecord`；
-- 请求时以 system message 形式附加摘要，而不是修改 transcript 原文。
+- **百分比策略**：触发阈值、保留原文比例、摘要上限都是上下文窗口的百分比（默认 80% / 20% / 10%），在设置 → 上下文中可改；模型窗口换算为 token 预算时还会扣掉输出预留。
+- **每个模型步都检查**：按 user/assistant 消息切分 round，长工具回合（只有 1 条用户消息、几十轮工具调用）也能压缩；边界永不落在孤立的 tool result 上。
+- **先微压缩**：达到阈值的 90% 时，把较早的读取/搜索/命令输出替换为占位符（transcript 与 UI 保留原文），避免为噪声付摘要成本。
+- **模型摘要**：让当前会话模型生成结构化摘要（`<analysis>` + `<summary>`），请求只带文本、不带工具；失败时回退到本地摘录取并标记 `SummarySource::Heuristic`。
+- **用量校准**：决策取“本地估算（含工具 schema）”与 provider 上报的 `last_prompt_tokens` 的较大值；压缩后把当前足迹改写成压缩后的估算值。
+- **反应式兜底**：provider 报 context overflow 时强制压缩并重试一次；连续摘要失败达到上限后只走本地摘录。
+- **后台预压缩（试验，默认关）**：达到“预压缩起点”百分比时，用当前历史快照在后台写摘要，主会话的模型请求/工具调用继续跑；到达触发阈值时校验模型、`compacted_upto`、边界消息和快照后增长量（不超过阈值 40%），通过就直接换入，否则丢弃并正常重压。摘要未写完时最多等 15 秒；`HeldCompaction` 只在内存里，重启即丢。
+- 摘要以 system message 附加，`compacted_upto` 只移动模型可见窗口，transcript 始终完整可追溯。
 
-这样原始会话始终完整可追溯，压缩只影响发送给模型的内容。
+`CompactionRecord` 额外记录触发器（auto/reactive）、摘要来源、压缩前后 token 与消息数，概览页和诊断可以直接读取。
 
 ## 8. 工具执行管线
 
@@ -274,14 +277,29 @@ sequenceDiagram
 - 快照 blob 在会话锁外写入（锁内只登记元数据），64 turn 上限使元数据 JSON 稳定在 ~0.5–2.5MiB；编辑/撤销的持久化走单次序列化（stage → write → 入队同一份 payload），比旧的「save + stage 双序列化」省约 45%（1.27ms → 0.71ms tmpfs，4.71ms → 3.94ms 挂载盘）。
 - 用户消息文本在 `ChatItemKind::User` 里是 `SharedString`，hover 动作条不再每帧克隆全文。
 
+### 随包 shell 运行时（bash）
+
+`agent-tools/shell.rs` 的 `ShellSpec` 在构造 `ShellTool` 时解析一次，顺序为：
+
+1. `EFFIBUDDY_SHELL`（必须是存在的文件；开发/预览时覆盖用）；
+2. 可执行文件旁边的随包运行时：
+   - Linux/macOS：`<exe>/runtime/bash`、`<exe>/runtime/bin/bash`、`<exe>/../lib/effibuddy/runtime/bash`（deb/rpm）、`<exe>/../Resources/runtime/bash`（macOS .app）；
+   - Windows：`<exe>\runtime\msys\usr\bin\bash.exe`、`<exe>\runtime\bash.exe`；
+3. 平台默认：Unix `sh -lc`，Windows `cmd /C`。
+
+Unix 上沿用登录 shell（`-lc`），保留 `/etc/profile` 与 `~/.bash_profile` 的 PATH 约定；Windows 的 MSYS2 运行时改用 `--noprofile --norc -c`，避免 profile `cd` 到 HOME 破坏工作区 cwd，并由宿主把 `runtime\msys\usr\bin` 前置到 PATH（Cygwin 在启动时把 Windows 路径列表转成 POSIX 形式）。命令仍在 workspace 主根下执行，stdin 为空、stdout/stderr 捕获后按 24k 截断。
+
+发布侧：`scripts/fetch-bash.sh` 在 Linux 用 musl-gcc 构建最新 GNU bash 静态二进制，在 macOS 按系统库构建；`scripts/bundle-msys-shell.py` 从 MSYS2 实时仓库数据库解析 bash + coreutils/findutils/grep/sed/gawk/diffutils/tar/gzip/which 的依赖闭包，校验 sha256 后裁剪文档/翻译解出 `runtime/msys`。构建脚本只在 release 流水线运行，仓库不保存二进制。
+
 ### 路径沙箱
 
 `agent-tools/workspace.rs`：
 
-- 读取时 `canonicalize` 后必须位于 workspace 根之内；
-- 写入时先规范化父目录，拒绝 `..` 越界与绝对路径逃逸；
-- 符号链接按规范化后的真实路径判断；
-- 展示路径统一为相对 workspace 的形式。
+- 项目可含多个文件夹：主文件夹锚定相对路径、shell cwd 与文件树，其余文件夹作为附加工作目录；
+- 读取时 `canonicalize` 后必须位于任一已授权根之内；
+- 写入时先规范化父目录，拒绝 `..` 越界与任何根之外的绝对路径；
+- 符号链接按规范化后的真实路径判断；不可访问的附加根会被跳过（主根缺失则启动失败）；
+- 展示路径：主根内为相对路径（形状不变），附加根内为绝对路径；checkpoint 恢复按同一根集合校验，绝不会写到项目之外。
 
 ## 9. PTC 沙箱
 
@@ -496,7 +514,8 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 ### 左侧会话栏
 
-- 展开态 272px：按「今天 / 昨天 / 最近 7 天 / 更早」分组列出会话，标题栏品牌块与侧栏同宽同色，形成一条连续列；
+- 展开态 272px，按「置顶 → 全部项目 → 任务」分组；项目是具名容器（`projects.json`），行内 `+N` 徽标表示附加文件夹数量，悬停显示全部路径，菜单可管理文件夹、按根打开、折叠与移除；
+- 会话按项目 id 归属（旧会话按路径解析到项目根），折叠键为 `project:<id>`；「+」支持一次多选文件夹新建项目，第一个为主动文件夹；
 - `Ctrl+B`（标题栏按钮或命令面板）折叠为 52px 图标栏：保留新建会话、搜索、工作区提示、主题与设置入口，会话列表不再构建；
 - 折叠状态写入 `config.json`，重启后按上次的布局恢复。
 
@@ -554,22 +573,25 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 数据根目录下的内容：
 
 - 会话：`<数据根目录>\sessions\<uuid>.json`，每次结构变化后落盘；子代理会话也在同一目录，但带 `parent_id`，不进入顶层列表；
-- 配置：`<数据根目录>\config.json`（工作区、审批、默认权限模式、命令面板最近使用、主题、左侧栏折叠状态、右侧栏页签/宽度）；
+- 项目注册表：`<数据根目录>\projects.json`（项目 id、名称、有序文件夹与唯一主文件夹；旧 `config.json` 的 `projects` 列表与会话 `project` 路径在首次启动时迁移为单根项目，`projects.json` 缺失时按会话路径自动重建）；
+- 配置：`<数据根目录>\config.json`（工作区、审批、默认权限模式、命令面板最近使用、主题、左侧栏折叠状态、右侧栏页签/宽度、上下文压缩百分比策略）；
 - 模型注册表：`<数据根目录>\providers.json`（供应商、模型、默认选择；损坏时保留原文件并回退内置配置）；
 - 用户级代理档案：`<数据根目录>\agents\*.md`（项目级 `<workspace>/.effibuddy/agents/*.md` 不受构建类型影响，随仓库分发）；
 - 预览模式创建的会话不会写入磁盘；
 - 目录创建失败时回退到 `.effibuddy/sessions`，不会 panic。
 
+多文件夹项目的数据流：`SessionState.project_id` 是归属键；新会话 `cwd` 固定为项目主文件夹，其余文件夹通过 `HarnessConfig.additional_workspaces` → `ToolContext.additional_workspaces` → `SubagentRequest.additional_workspaces` 逐层传给工具与子代理，系统提示列出附加目录。文件树、git 状态与项目指令只认会话 cwd（ZCode 对齐），附加目录的文件以绝对路径访问与展示。旧 `SessionState.project` 路径保留为迁移种子与降级标签，分组时 `project_id` 优先、路径匹配兜底，未匹配的路径渲染为临时 legacy 分组，历史不会因注册表丢失而消失。
+
 ## 12. 测试策略
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 88 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返、steer 注入/回合延长/中断回收、mid_turn wire 框架与 serde 默认值 |
+| `agent-core` | 93 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返、steer 注入/回合延长/中断回收、mid_turn wire 框架与 serde 默认值 |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 run_js 禁止 |
-| `agent-tools` | 33 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `agent-tools` | 36 | 文件读写、多根路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
 | `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
-| `app` | 89 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、电脑授权门 |
+| `app` | 108 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、项目注册表迁移与多根解析、电脑授权门 |
 | `deepseek_live` | 4（ignored） | 1-token 探针、单次聊天、工具 loop、PTC loop |
 
 真实 API 测试默认不跑，避免 CI 依赖外部服务；探针用例只断言通路与返回结构，不使用 `max_tokens = 1` 的输出去评估模型质量。

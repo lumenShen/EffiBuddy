@@ -17,9 +17,12 @@ pub struct SessionSummary {
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
     /// Project the conversation belongs to; `None` puts it in the sidebar's
-    /// 任务 section.
+    /// 任务 section. Legacy transcripts only carry this path; `project_id`
+    /// (when present) is authoritative.
     pub project: Option<PathBuf>,
+    pub project_id: Option<String>,
     pub pinned: bool,
+    pub unread: bool,
 }
 
 /// One cached sidebar summary, keyed by file `(mtime, len)`.
@@ -138,6 +141,12 @@ impl SessionStore {
         session_from_json(&contents)
     }
 
+    /// Raw transcript read for export: no status/`updated_at` rewrite and no
+    /// dangling-tool-call repair. The archive mirrors what was saved.
+    pub fn load_raw(&self, id: &str) -> Option<SessionState> {
+        self.load_for_update(id)
+    }
+
     pub fn save(&self, session: &SessionState) -> Result<(), String> {
         let path = self.path_for(&session.id);
         let json = serde_json::to_string_pretty(session)
@@ -168,6 +177,17 @@ impl SessionStore {
     /// Subagent sessions whose `parent_id` matches. Used to restore the
     /// agent catalog of a reopened parent session.
     pub fn child_sessions(&self, parent_id: &str) -> Vec<SessionState> {
+        self.collect_child_sessions(parent_id, true)
+    }
+
+    /// Child transcripts exactly as saved, without the reopen-time
+    /// normalization that rewrites `updated_at` and repairs tool calls.
+    /// Session export uses this so the archive mirrors the transcript.
+    pub fn child_sessions_raw(&self, parent_id: &str) -> Vec<SessionState> {
+        self.collect_child_sessions(parent_id, false)
+    }
+
+    fn collect_child_sessions(&self, parent_id: &str, normalize: bool) -> Vec<SessionState> {
         let mut children = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
             return children;
@@ -186,7 +206,9 @@ impl SessionStore {
             if session.parent_id.as_deref() != Some(parent_id) {
                 continue;
             }
-            session.normalize_after_load();
+            if normalize {
+                session.normalize_after_load();
+            }
             children.push(session);
         }
         children.sort_by(|left, right| left.created_at.cmp(&right.created_at));
@@ -254,7 +276,9 @@ impl SessionStore {
                                 updated_at: session.updated_at,
                                 message_count: session.messages.len(),
                                 project: session.project.clone(),
+                                project_id: session.project_id.clone(),
                                 pinned: session.pinned,
+                                unread: session.unread,
                             };
                             CachedSummary {
                                 mtime,
@@ -282,6 +306,13 @@ impl SessionStore {
                 continue;
             }
             if let Some(summary) = cached.summary {
+                // A conversation that has not sent its first user message is a
+                // composer draft (see `draft_store`), not history. Keeping it
+                // out of every sidebar/archive scan is what makes repeated
+                // “新建任务” clicks reuse one invisible session.
+                if summary.message_count == 0 {
+                    continue;
+                }
                 summaries.push(summary);
             }
         }
@@ -317,8 +348,21 @@ mod tests {
 
     fn session(title: &str, cwd: &str) -> SessionState {
         let mut session = SessionState::new(PathBuf::from(cwd), "test-model");
+        session.push_message(effibuddy_agent_core::Message::user(title.to_string()));
         session.title = title.to_string();
         session
+    }
+
+    #[test]
+    fn unsent_drafts_stay_out_of_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        store
+            .save(&SessionState::new(PathBuf::from("/tmp/workspace"), "test-model"))
+            .unwrap();
+
+        assert!(store.summaries().is_empty());
+        assert!(store.archived_summaries().is_empty());
     }
 
     #[test]
@@ -377,6 +421,34 @@ mod tests {
         let archived_summaries = store.archived_summaries();
         assert_eq!(archived_summaries.len(), 1);
         assert_eq!(archived_summaries[0].title, "done");
+    }
+
+    #[test]
+    fn raw_load_preserves_the_saved_timestamp() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let mut session = session("export", "/tmp/project");
+        let stamp = "2026-11-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        session.updated_at = stamp;
+        store.save(&session).unwrap();
+
+        let raw = store.load_raw(&session.id).unwrap();
+        assert_eq!(raw.updated_at, stamp);
+    }
+
+    #[test]
+    fn summaries_carry_the_unread_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let mut unread = session("unread", "/tmp/project");
+        unread.unread = true;
+        store.save(&unread).unwrap();
+
+        let summaries = store.summaries();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].unread);
     }
 
     #[test]

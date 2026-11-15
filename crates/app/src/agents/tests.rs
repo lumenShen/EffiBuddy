@@ -24,6 +24,7 @@ fn request(workspace: &std::path::Path, background: bool) -> SubagentRequest {
         parent_session_id: "parent-session".to_string(),
         parent_call_id: "call-parent".to_string(),
         workspace: workspace.to_path_buf(),
+        additional_workspaces: Vec::new(),
         agent_name: None,
         parent_agent_id: Some("main".to_string()),
         parent_agent_name: Some("main".to_string()),

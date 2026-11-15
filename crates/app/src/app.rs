@@ -1,5 +1,6 @@
 //! The main application view.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -13,38 +14,41 @@ use effibuddy_agent_core::{
     BrokerApprovalGate, ContentBlock, DemoProvider, HarnessConfig, HarnessEvent, Message,
     ModelProvider, ProfileDiagnostic, RunOutcome, RunStatus, SharedSession, SubagentColor,
     SubagentProfile, SubagentReport, SubagentSpawner, SubagentStatus, TodoStatus, ToolCall,
-    ToolResult, lock_session, new_shared_session,
+    ToolResult, UserAttachment, lock_session, new_shared_session,
 };
-use effibuddy_agent_tools::{ComputerTool, builtin_tools};
+use effibuddy_agent_tools::{ComputerTool, builtin_tools_with_roots};
 use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{
-    BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, MotionController, MotionSpec,
-    Spinner, TextInputOptions, TextInputState, TextInputView, Theme, disclosure_chevron, divider,
-    ease_out_cubic, empty_state, icons, kbd, motion_item, overlay_motion_duration, radius,
-    reduce_motion, shadow_float, small_badge,
+    BadgeTone, Button, ButtonSize, ButtonVariant, CONTROL_MOTION, IconButton, MotionController,
+    MotionSpec, PaintShift, ProgressRing, Spinner, TextInputOptions, TextInputState, TextInputView,
+    Theme, disclosure_chevron, divider, ease_out_cubic, empty_state, icons, images, kbd,
+    motion_item, overlay_motion_duration, radius, reduce_motion, shadow_float, small_badge,
 };
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Div,
     Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
     Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowHandle,
-    WindowKind, WindowOptions, actions, anchored, div, list, point, prelude::*, px, size, svg,
-    transparent_black,
+    WindowKind, WindowOptions, actions, anchored, div, img, linear_color_stop, linear_gradient,
+    list, point, prelude::*, px, size, svg, transparent_black,
 };
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::chat::{
-    AgentCard, ChatList, RunSnapshot, agent_color, render_chat_item, render_scroll_to_bottom,
-    render_scrollbar,
+    AgentCard, ChatList, JumpFlash, PromptRailState, RunSnapshot, agent_color, render_chat_item,
+    render_prompt_rail as render_prompt_rail_element, render_scroll_to_bottom, render_scrollbar,
 };
 use crate::checkpoint::{RestoreAction, RestorePlan};
+use crate::composer_menu::ComposerMenuState;
 use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
 use crate::config::{AppConfig, MAX_UI_ZOOM, MIN_UI_ZOOM};
+use crate::draft_store::{DraftStore, TASK_SCOPE};
 use crate::events::{AppEvent, SubagentSpawnedInfo};
 use crate::graph::{GraphView, ViewMode, persist as graph_persist};
 use crate::model_config::ModelConfigStore;
 use crate::model_picker::ModelMenuState;
 use crate::perf;
+use crate::project_store::{ProjectStore, normalize_root, project_default_name, project_group_key};
 use crate::settings::{SettingsSection, SettingsState};
 use crate::side_pane::{
     AgentView, GitFile, SidePaneState, SidePaneTab, SidePaneTabKind, format_untracked_file,
@@ -58,6 +62,11 @@ use crate::subagent::SubagentService;
 /// two form one continuous column; when collapsed the sidebar slides out over
 /// [`PANE_SLIDE_SECS`] and is then removed from the tree.
 const SIDEBAR_WIDTH: f32 = 272.0;
+
+/// Dwell before the query rail opens its preview card. The bar widens
+/// immediately; only the floating card waits, so sweeping the rail does not
+/// strobe cards.
+const PROMPT_RAIL_CARD_DELAY: Duration = Duration::from_millis(110);
 
 /// One in-flight slide of the left sidebar or the right side pane. Progress
 /// follows `MotionSpec::LAYOUT`'s 220ms ease-out so a collapse reads like the
@@ -230,6 +239,16 @@ pub(crate) struct PendingInput {
     pub(crate) id: String,
     pub(crate) text: String,
     pub(crate) kind: PendingInputKind,
+    /// Composer attachments staged when the message was admitted. They ride
+    /// with the text through queue → run, so a queued file drop is not lost.
+    pub(crate) attachments: Vec<UserAttachment>,
+}
+
+/// One parent turn's user text plus its composer attachments.
+#[derive(Clone)]
+pub(crate) struct RunInput {
+    pub(crate) text: String,
+    pub(crate) attachments: Vec<UserAttachment>,
 }
 
 #[derive(Clone)]
@@ -262,13 +281,62 @@ pub(crate) struct EditConflictState {
     pub message_id: String,
     pub text: String,
     pub plan: RestorePlan,
+    /// Attachments staged for the edited message; an edit re-sends them.
+    pub attachments: Vec<UserAttachment>,
+}
+
+/// One project row in the sidebar. Sessions group by project id; a legacy
+/// group without a registry entry (its folder vanished) still renders so
+/// history never disappears.
+#[derive(Clone)]
+pub(crate) struct ProjectGroup {
+    /// `None` for a synthesized legacy group.
+    pub id: Option<String>,
+    /// Stable sidebar/collapse key: `project:<id>` or `project:legacy:<path>`.
+    pub key: String,
+    pub name: String,
+    /// Ordered folders, primary first.
+    pub roots: Vec<PathBuf>,
+}
+
+impl ProjectGroup {
+    fn primary(&self) -> Option<&Path> {
+        self.roots.first().map(PathBuf::as_path)
+    }
 }
 
 /// Popover anchored to a project's "more" button in the sidebar.
 #[derive(Default)]
 pub(crate) struct ProjectMenuState {
-    pub project: Option<PathBuf>,
+    pub target: Option<ProjectGroup>,
     pub position: Option<Point<Pixels>>,
+}
+
+/// Popover anchored to a conversation row's "more" button. Deleting is the
+/// only action for now and stays two-step: the first click arms the row, the
+/// second removes the transcript.
+#[derive(Default)]
+pub(crate) struct SessionMenuState {
+    pub target: Option<String>,
+    pub position: Option<Point<Pixels>>,
+    pub confirm_delete: bool,
+}
+
+/// Rename dialog for one conversation.
+#[derive(Clone)]
+pub(crate) struct SessionRenameState {
+    pub id: String,
+    pub error: Option<String>,
+}
+
+/// Draft state of the project folder editor dialog.
+#[derive(Clone)]
+pub(crate) struct ProjectEditorState {
+    pub id: String,
+    pub name: String,
+    pub roots: Vec<PathBuf>,
+    pub primary: Option<PathBuf>,
+    pub error: Option<String>,
 }
 
 /// UI-side projection of one subagent run. The child transcript is held via
@@ -316,6 +384,11 @@ pub struct AppView {
     pub(crate) config: AppConfig,
     pub(crate) models: ModelConfigStore,
     pub(crate) store: SessionStore,
+    /// Composer drafts and the single unsent conversation owned by each
+    /// project/task scope. Survives session switches and app restarts.
+    pub(crate) drafts: DraftStore,
+    /// Named multi-folder projects. Sessions group by project id, never path.
+    pub(crate) projects: ProjectStore,
     pub(crate) runtime: Option<tokio::runtime::Runtime>,
     pub(crate) app_tx: UnboundedSender<AppEvent>,
 
@@ -382,6 +455,9 @@ pub struct AppView {
     last_persist: Option<Instant>,
     /// Set while a trailing persist flush is scheduled after a throttled one.
     persist_flush_scheduled: bool,
+    /// Set while a debounced `drafts.json` write is pending. Draft writes are
+    /// tiny and coalesce keystrokes into one file write.
+    draft_save_scheduled: bool,
     /// `--bench` deadline; the bench loop refills the storm until it passes.
     bench_until: Option<Instant>,
     /// The stress streaming message, so the bench loop can refill its backlog.
@@ -422,11 +498,33 @@ pub struct AppView {
     pub(crate) composer_state: Entity<TextInputState>,
     composer: Entity<TextInputView>,
     _composer_subscription: gpui::Subscription,
+    /// `/`, `$` and `@` autocomplete state (trigger, filtered items, selection).
+    pub(crate) composer_menu: ComposerMenuState,
+    /// Files, images and skills staged for the next message. Cleared on send;
+    /// kept in place while editing an existing message.
+    pub(crate) composer_attachments: Vec<UserAttachment>,
+    /// Up/Down/Enter/Tab/Esc interception while the composer menu is open.
+    _composer_menu_keys_subscription: gpui::Subscription,
 
     pub(crate) settings_open: bool,
+    /// Sidebar donation dialog (reward QR code); closed by Esc or backdrop.
+    pub(crate) reward_open: bool,
     pub(crate) settings: SettingsState,
     pub(crate) model_menu: ModelMenuState,
     pub(crate) project_menu: ProjectMenuState,
+    /// Conversation-row "more" popover (`None` while closed).
+    pub(crate) session_menu: SessionMenuState,
+    /// Rename dialog for one conversation (`None` while closed).
+    pub(crate) session_rename: Option<SessionRenameState>,
+    session_rename_name: Entity<TextInputState>,
+    session_rename_name_view: Entity<TextInputView>,
+    _session_rename_name_subscription: gpui::Subscription,
+    /// Folder editor dialog for one project (`None` while closed).
+    pub(crate) project_editor: Option<ProjectEditorState>,
+    /// Name input inside the project editor dialog.
+    project_editor_name: Entity<TextInputState>,
+    project_editor_name_view: Entity<TextInputView>,
+    _project_editor_name_subscription: gpui::Subscription,
     _palette_subscription: gpui::Subscription,
 
     pub(crate) theme: Theme,
@@ -440,6 +538,15 @@ pub struct AppView {
     /// Set when the transcript structure changed; `render_chat` rebuilds the
     /// virtual-list snapshot once per change instead of once per frame.
     pub(crate) chat_dirty: bool,
+    /// Left-edge query navigator state (hover card, rail scroll) for the main
+    /// chat. Cleared together with `chat` on session switches.
+    prompt_rail: PromptRailState,
+    /// User bubble the last rail jump landed on; paints a one-shot ring.
+    jump_flash: Option<JumpFlash>,
+    jump_flash_seq: u64,
+    /// Guards the extra frame requested while the rail's list viewport is not
+    /// measured yet (first frame after a session opens or the window resizes).
+    prompt_rail_frame_scheduled: bool,
     /// Smooth-scroll handles for every overflow region outside the transcript.
     pub(crate) scrolls: SmoothScrollers,
     /// Keyed FLIP state for the sidebar session list. Reorders are cheap paint
@@ -466,11 +573,19 @@ pub struct AppView {
     /// `--preview-sidebar-hover` forces hover affordances on one project
     /// header and one session row so screenshots can verify them.
     preview_sidebar_hover: bool,
+    /// `--preview-context-tip` 在输入框旁常驻渲染上下文 tips，供截图验收
+    /// （Wayland 无法模拟真实 hover）。
+    preview_context_tip: bool,
+    /// 左栏会话行跑马灯的行内状态，key = session id。渲染（&self）需要按行
+    /// 创建/推进状态，因此套 RefCell；行内再套一层供 hover 事件短借。
+    sidebar_marquees: RefCell<HashMap<String, Rc<RefCell<SessionMarquee>>>>,
+    /// 跑马灯播放/收尾期间的逐帧重绘泵标记（与 typewriter 同款）。
+    sidebar_marquee_scheduled: bool,
 }
 
 impl AppView {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let config = AppConfig::load();
+        let mut config = AppConfig::load();
         let theme = if std::env::args().any(|argument| argument == "--dark") {
             Theme::dark()
         } else if std::env::args().any(|argument| argument == "--light") {
@@ -485,6 +600,7 @@ impl AppView {
         let models = ModelConfigStore::new(&config);
         let store = SessionStore::new();
         let summaries = store.summaries();
+        let drafts = DraftStore::new();
         let (persist_tx, mut persist_rx) = unbounded_channel::<PendingSave>();
         let preview_launch = std::env::args().any(|argument| {
             argument == "--preview"
@@ -503,21 +619,47 @@ impl AppView {
         let state = if preview_launch {
             models.new_session_state(config.workspace())
         } else {
-            summaries
-                .first()
-                .and_then(|summary| store.load(&summary.id))
+            // Reopen what the user last had in front of them. A missing or
+            // archived transcript is skipped; an empty session only counts
+            // when the draft registry still owns it (otherwise it is a stale
+            // pre-draft artifact and should stay invisible).
+            let last_active = drafts
+                .last_active()
+                .and_then(|id| store.load(id))
+                .filter(|session| !session.archived)
+                .filter(|session| {
+                    !session.messages.is_empty() || drafts.is_unsent(&session.id)
+                });
+            last_active
+                .or_else(|| {
+                    summaries
+                        .first()
+                        .and_then(|summary| store.load(&summary.id))
+                        .filter(|session| !session.archived)
+                })
                 .map(|mut session| {
                     models.normalize_session(&mut session);
                     session
                 })
                 .unwrap_or_else(|| {
-                    // Fresh session: seed the configured default permission mode.
+                    // No history: reopen the 任务 section's unsent draft when
+                    // there is one, so a restart never loses a half-written
+                    // prompt. Otherwise start a fresh task draft.
+                    if let Some(mut session) = drafts
+                        .scope_session(TASK_SCOPE)
+                        .and_then(|id| store.load(id))
+                        .filter(|session| session.messages.is_empty() && !session.archived)
+                    {
+                        models.normalize_session(&mut session);
+                        return session;
+                    }
                     let mut session = models.new_session_state(config.workspace());
                     session.permission_mode = config.effective_default_mode();
                     let _ = store.save(&session);
                     session
                 })
         };
+        let startup_cwd = state.cwd.clone();
         let active = Some(ActiveSession {
             shared: new_shared_session(state),
         });
@@ -599,10 +741,95 @@ impl AppView {
                         weak_alt.update(cx, |this, cx| this.send_message(text, true, window, cx));
                 })
         });
-        let composer_subscription = cx.observe(&composer_state, |_, _, cx| cx.notify());
+        let composer_subscription = cx.observe(&composer_state, |this, state, cx| {
+            this.composer_draft_changed(state.read(cx).content().to_string(), cx);
+            this.sync_composer_menu(cx);
+            cx.notify();
+        });
 
         let sessions = store.summaries();
         let archived_sessions = store.archived_summaries();
+
+        // Project registry: migrate the legacy single-folder registries once,
+        // then reconcile session folders on every launch so a lost
+        // projects.json never hides conversations from the sidebar.
+        let projects_file_existed = ProjectStore::path().exists();
+        let mut projects = ProjectStore::new();
+        let legacy_project_paths: Vec<PathBuf> = sessions
+            .iter()
+            .chain(archived_sessions.iter())
+            .filter_map(|summary| summary.project.clone())
+            .collect();
+        if !projects_file_existed {
+            let mapping = projects.migrate_legacy(&config.projects, &legacy_project_paths);
+            let mut config_changed = false;
+            if !mapping.is_empty() {
+                for group in &mut config.sidebar_collapsed_sections {
+                    let Some(rest) = group.strip_prefix("project:") else {
+                        continue;
+                    };
+                    let normalized = normalize_root(Path::new(rest));
+                    if let Some((_, id)) = mapping
+                        .iter()
+                        .find(|(candidate, _)| candidate == &normalized)
+                    {
+                        *group = project_group_key(id);
+                        config_changed = true;
+                    }
+                }
+            }
+            if !config.projects.is_empty() {
+                config.projects.clear();
+                config_changed = true;
+            }
+            if config_changed {
+                let _ = config.save();
+            }
+            let _ = projects.save();
+        } else if projects.reconcile(&legacy_project_paths) {
+            let _ = projects.save();
+        }
+        let project_editor_name = cx.new(|cx| {
+            TextInputState::new(
+                cx,
+                TextInputOptions::default()
+                    .multiline(false)
+                    .lines(1, 1)
+                    .placeholder("项目名称"),
+            )
+        });
+        let project_editor_name_subscription =
+            cx.observe(&project_editor_name, |_, _, cx| cx.notify());
+        let project_editor_name_view =
+            cx.new(|cx| TextInputView::new(project_editor_name.clone(), cx));
+
+        let session_rename_name = cx.new(|cx| {
+            TextInputState::new(
+                cx,
+                TextInputOptions::default()
+                    .multiline(false)
+                    .lines(1, 1)
+                    .placeholder("会话名称"),
+            )
+        });
+        let session_rename_name_subscription =
+            cx.observe(&session_rename_name, |this, _, cx| {
+                if let Some(state) = this.session_rename.as_mut() {
+                    state.error = None;
+                }
+                cx.notify();
+            });
+        let session_rename_weak = cx.entity().downgrade();
+        let session_rename_name_view = cx.new(|cx| {
+            TextInputView::new(session_rename_name.clone(), cx).on_submit(
+                move |text, window, cx| {
+                    let _ = session_rename_weak.update(cx, |this, cx| {
+                        this.save_session_rename(Some(text), window, cx)
+                    });
+                },
+            )
+        });
+
         let palette_query = cx.new(|cx| {
             TextInputState::new(
                 cx,
@@ -653,8 +880,77 @@ impl AppView {
             },
         );
 
-        let side = SidePaneState::new(cx, &config, config.workspace());
+        let side = SidePaneState::new(cx, &config, startup_cwd);
         let settings = SettingsState::new(cx, &config, &models);
+
+        // The composer's `/` and `@` menu owns the arrow keys, Enter/Tab and
+        // Escape while it is open — the text input's own bindings would
+        // otherwise move the caret or submit the half-typed token. Like the
+        // palette, this global interceptor runs before action dispatch.
+        let menu_keys_weak = cx.entity().downgrade();
+        let composer_menu_keys_subscription = cx.intercept_keystrokes(
+            move |event: &gpui::KeystrokeEvent, window, cx: &mut gpui::App| {
+                let key = event.keystroke.key.as_str();
+                let modifiers = event.keystroke.modifiers;
+                let state = menu_keys_weak
+                    .read_with(cx, |this, _| {
+                        let composer = this.composer_state.read(cx);
+                        let focused = composer.focus_handle().is_focused(window);
+                        (
+                            this.composer_menu.open,
+                            this.composer_menu.items.len(),
+                            focused,
+                            composer.is_composing(),
+                        )
+                    })
+                    .unwrap_or((false, 0, false, false));
+                let (open, count, focused, composing) = state;
+                if !open || !focused || composing {
+                    return;
+                }
+                match key {
+                    "up" | "down" if count > 0 => {
+                        let delta = if key == "up" { -1 } else { 1 };
+                        let _ = menu_keys_weak.update(cx, |this, cx| {
+                            this.move_composer_menu_selection(delta, cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                    "escape" => {
+                        let _ = menu_keys_weak.update(cx, |this, cx| {
+                            this.dismiss_composer_menu(cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                    "enter"
+                        if !modifiers.shift
+                            && !modifiers.control
+                            && !modifiers.platform
+                            && count > 0 =>
+                    {
+                        let _ = menu_keys_weak.update(cx, |this, cx| {
+                            let index = this
+                                .composer_menu
+                                .selected
+                                .min(this.composer_menu.items.len().saturating_sub(1));
+                            this.accept_composer_menu_item(index, window, cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                    "tab" if count > 0 => {
+                        let _ = menu_keys_weak.update(cx, |this, cx| {
+                            let index = this
+                                .composer_menu
+                                .selected
+                                .min(this.composer_menu.items.len().saturating_sub(1));
+                            this.accept_composer_menu_item(index, window, cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                    _ => {}
+                }
+            },
+        );
 
         // Read the collapse flags before `config` moves into the struct.
         let sidebar_collapsed = config.sidebar_collapsed;
@@ -663,6 +959,8 @@ impl AppView {
             config,
             models,
             store,
+            drafts,
+            projects,
             runtime,
             app_tx,
             sessions,
@@ -693,6 +991,7 @@ impl AppView {
             persist_tx,
             last_persist: None,
             persist_flush_scheduled: false,
+            draft_save_scheduled: false,
             bench_until: None,
             bench_stream: None,
             run_tick_stamp: 0,
@@ -710,10 +1009,23 @@ impl AppView {
             composer_state,
             composer,
             _composer_subscription: composer_subscription,
+            composer_menu: ComposerMenuState::default(),
+            composer_attachments: Vec::new(),
+            _composer_menu_keys_subscription: composer_menu_keys_subscription,
             settings_open: false,
+            reward_open: false,
             settings,
             model_menu: ModelMenuState::default(),
             project_menu: ProjectMenuState::default(),
+            session_menu: SessionMenuState::default(),
+            session_rename: None,
+            session_rename_name,
+            session_rename_name_view,
+            _session_rename_name_subscription: session_rename_name_subscription,
+            project_editor: None,
+            project_editor_name,
+            project_editor_name_view,
+            _project_editor_name_subscription: project_editor_name_subscription,
             theme,
             expanded_reasoning: HashSet::new(),
             expanded_tools: HashSet::new(),
@@ -721,6 +1033,10 @@ impl AppView {
             collapsed_turns: HashSet::new(),
             chat: ChatList::new(),
             chat_dirty: true,
+            prompt_rail: PromptRailState::default(),
+            jump_flash: None,
+            jump_flash_seq: 0,
+            prompt_rail_frame_scheduled: false,
             scrolls: SmoothScrollers::new(),
             motion: MotionController::new(),
             sidebar_grouping_dirty: false,
@@ -733,14 +1049,19 @@ impl AppView {
             run_ticker_active: false,
             last_error: None,
             notice: None,
-            preview_mode: false,
+            preview_mode: preview_launch,
             preview_sidebar_hover: false,
+            preview_context_tip: false,
+            sidebar_marquees: RefCell::new(HashMap::new()),
+            sidebar_marquee_scheduled: false,
             #[cfg(feature = "stress")]
             stress: None,
             #[cfg(feature = "stress")]
             stress_ticker_active: false,
         };
 
+        view.restore_composer_draft(cx);
+        view.remember_active_draft(cx);
         view.chat.install_scroll_handler(cx.entity().downgrade());
 
         // Session persistence happens off the UI thread: the foreground only
@@ -836,20 +1157,58 @@ impl AppView {
             view.preview_sidebar_hover = true;
             cx.notify();
         }
+        if std::env::args().any(|argument| argument == "--preview-context-tip") {
+            view.preview_mode = true;
+            view.preview_context_tip = true;
+            // 灌入会话内容与用量，让进度环和 tips 有真实占比可看。
+            if let Some(shared) = view.active_shared() {
+                let mut session = lock_session(&shared);
+                for index in 0..3 {
+                    session.push_message(Message::user(format!(
+                        "预览消息 {index}：帮我梳理这段日志里的报错模式，并挑出前三类高频问题。"
+                    )));
+                    let mut assistant = Message::assistant();
+                    assistant.set_text(format!(
+                        "预览回复 {index}：日志里主要是超时与限流两类问题；建议先从重试策略入手，\
+                         再检查网关的并发上限配置，最后核对客户端的退避参数。"
+                    ));
+                    session.push_message(assistant);
+                }
+                session.usage.prompt_tokens = 121_400;
+                session.usage.completion_tokens = 8_900;
+                session.usage.total_tokens = 130_300;
+                session.usage.cached_tokens = 96_500;
+                session.usage.last_prompt_tokens = 91_800;
+            }
+            cx.notify();
+        }
         if std::env::args().any(|argument| argument == "--preview-project-menu") {
             view.preview_mode = true;
-            let project = view
-                .config
+            let target = view
                 .projects
+                .projects()
                 .first()
-                .cloned()
+                .map(|project| ProjectGroup {
+                    id: Some(project.id.clone()),
+                    key: project_group_key(&project.id),
+                    name: project.name.clone(),
+                    roots: project.root_paths(),
+                })
                 .or_else(|| {
                     view.sessions
                         .iter()
-                        .find_map(|summary| summary.project.clone())
+                        .find_map(|summary| view.project_group_for_summary(summary))
                 })
-                .unwrap_or_else(|| view.config.workspace());
-            view.project_menu.project = Some(project);
+                .unwrap_or_else(|| {
+                    let workspace = view.config.workspace();
+                    ProjectGroup {
+                        id: None,
+                        key: format!("project:legacy:{}", workspace.display()),
+                        name: project_default_name(&workspace),
+                        roots: vec![workspace],
+                    }
+                });
+            view.project_menu.target = Some(target);
             view.project_menu.position = Some(point(px(240.0), px(300.0)));
             cx.notify();
         }
@@ -1077,12 +1436,17 @@ impl AppView {
         session.usage.prompt_tokens = 18_420;
         session.usage.completion_tokens = 2_140;
         session.usage.total_tokens = 20_560;
+        // 预览里让占用环 / 概览的上下文构成有真实数据可画。
+        session.usage.last_prompt_tokens = 18_420;
         session.touch();
 
         self.active = Some(ActiveSession {
             shared: new_shared_session(session.clone()),
         });
         self.chat.reset_session();
+        self.prompt_rail = PromptRailState::default();
+        self.jump_flash = None;
+        self.jump_flash_seq = 0;
         self.chat_dirty = true;
         self.chat.pin_to_bottom();
         self.graph.invalidate();
@@ -1093,7 +1457,9 @@ impl AppView {
             updated_at: session.updated_at,
             message_count: session.messages.len(),
             project: session.project.clone(),
+            project_id: session.project_id.clone(),
             pinned: session.pinned,
+            unread: session.unread,
         }];
         self.expanded_reasoning.insert(assistant_id.clone());
         self.expanded_tools.insert(js_call.id.clone());
@@ -1378,6 +1744,161 @@ impl AppView {
         self.active.as_ref().map(|active| active.shared.clone())
     }
 
+    /// Sidebar grouping key for the conversation's project (or 任务).
+    fn draft_scope_for_session(session: &effibuddy_agent_core::SessionState) -> String {
+        crate::draft_store::scope_key(session.project_id.as_deref(), session.project.as_deref())
+    }
+
+    /// True when the active conversation is still the unsent draft of `scope`.
+    /// Repeated “新建任务” clicks must land here instead of replacing it.
+    fn active_is_unsent_draft_for(&self, scope: &str) -> bool {
+        let Some(active) = &self.active else {
+            return false;
+        };
+        let session = lock_session(&active.shared);
+        session.messages.is_empty() && Self::draft_scope_for_session(&session) == scope
+    }
+
+    /// Composer observer: keep the in-memory draft current so a switch or a
+    /// crash-free shutdown never loses the typed text, then debounce the tiny
+    /// `drafts.json` write.
+    pub(crate) fn composer_draft_changed(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.preview_mode {
+            return;
+        }
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        if self.drafts.set_text(&id, text) {
+            self.schedule_draft_save(cx);
+        }
+    }
+
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        if self.preview_mode || self.draft_save_scheduled {
+            return;
+        }
+        self.draft_save_scheduled = true;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            let _ = weak.update(cx, |this, _| {
+                this.draft_save_scheduled = false;
+                let _ = this.drafts.save();
+            });
+        })
+        .detach();
+    }
+
+    fn save_drafts_now(&mut self) {
+        if self.preview_mode {
+            return;
+        }
+        let _ = self.drafts.save();
+    }
+
+    /// Seed the composer from the active conversation's saved draft. Silent:
+    /// switching must not re-enter the change observer for the target session.
+    fn restore_composer_draft(&mut self, cx: &mut Context<Self>) {
+        if self.preview_mode {
+            return;
+        }
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        let text = self.drafts.text(&id).to_string();
+        self.composer_attachments = self.drafts.attachments(&id);
+        // The menu belongs to the outgoing conversation's workspace.
+        self.composer_menu.close();
+        self.composer_state
+            .update(cx, |state, _| state.set_content_silent(text.clone()));
+        // A restored draft may still reference `$skill`; make its chip (and the
+        // attached body) match what the text says.
+        self.sync_skill_attachments(&text, cx);
+    }
+
+    /// Persist the staged file/image/skill chips for the active conversation.
+    /// They live in their own per-session file, so text typing never
+    /// re-serializes a multi-megabyte image payload.
+    pub(crate) fn persist_composer_attachments(&mut self, cx: &mut Context<Self>) {
+        let _ = cx;
+        if self.preview_mode {
+            return;
+        }
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        if let Err(error) = self
+            .drafts
+            .set_attachments(&id, &self.composer_attachments)
+        {
+            self.last_error = Some(error);
+        }
+    }
+
+    /// Remember the active conversation as its scope's unsent draft (when it
+    /// still has no messages) and as the app's last-open session.
+    fn remember_active_draft(&mut self, cx: &mut Context<Self>) {
+        let _ = cx;
+        if self.preview_mode {
+            return;
+        }
+        let Some(active) = &self.active else {
+            return;
+        };
+        let (id, empty, scope) = {
+            let session = lock_session(&active.shared);
+            (
+                session.id.clone(),
+                session.messages.is_empty(),
+                Self::draft_scope_for_session(&session),
+            )
+        };
+        let mut changed = self.drafts.set_last_active(&id);
+        if empty {
+            if self.drafts.scope_session(&scope) != Some(id.as_str()) {
+                self.drafts.bind_scope(&scope, &id);
+                changed = true;
+            }
+        } else if self.drafts.is_unsent(&id) {
+            // A crash between sending the first message and the RunStarted
+            // event can leave the binding behind; the transcript is history
+            // now, so stop offering it as an invisible draft. Keep any text
+            // typed for the next turn.
+            self.drafts.unbind_session(&id);
+            changed = true;
+        }
+        if changed {
+            self.save_drafts_now();
+        }
+    }
+
+    /// First user message sent: the conversation stops being a draft and must
+    /// appear in the sidebar immediately. Write it synchronously (the session
+    /// is one message long at this point) so the refresh that follows sees it.
+    fn publish_active_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let _ = cx;
+        if self.preview_mode {
+            return false;
+        }
+        let Some(shared) = self.active_shared() else {
+            return false;
+        };
+        let (id, has_messages) = {
+            let session = lock_session(&shared);
+            (session.id.clone(), !session.messages.is_empty())
+        };
+        if !has_messages || !self.drafts.unbind_session(&id) {
+            return false;
+        }
+        let _ = self.drafts.save();
+        if let Err(error) = self.save_active_metadata(&shared) {
+            self.last_error = Some(error);
+        }
+        true
+    }
+
     /// Minimum wall-clock spacing between session serializations. A chatty
     /// run fires a persist per tool boundary; serializing a megabyte-scale
     /// session that often — even off-thread — hammers the (mounted) disk.
@@ -1507,14 +2028,21 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let text = text.trim().to_string();
-        if text.is_empty() {
+        // A `$skill` reference may have been typed rather than picked from the
+        // menu; stage/reconcile its attachment before deciding the message is
+        // empty.
+        self.sync_skill_attachments(&text, cx);
+        if text.is_empty() && self.composer_attachments.is_empty() {
             return;
         }
         if self.active_run.is_some() {
             if self.edit_message.is_some() {
+                // Stay in edit mode; the staged attachments remain staged.
                 self.restore_composer_text(text, window, cx);
                 return;
             }
+            let attachments = std::mem::take(&mut self.composer_attachments);
+            self.persist_composer_attachments(cx);
             // Running: never reject. Enter queues for a fresh turn; Ctrl+Enter
             // hands the message to the harness for the next step boundary.
             if steer {
@@ -1523,11 +2051,12 @@ impl AppView {
                     .as_ref()
                     .expect("checked active_run above")
                     .handle
-                    .steer(text.clone());
+                    .steer_with_attachments(text.clone(), attachments.clone());
                 self.pending_inputs.push(PendingInput {
                     id: steer_id,
                     text,
                     kind: PendingInputKind::Steer,
+                    attachments,
                 });
                 self.notice = Some("将在下一个步骤边界插入当前回合。".to_string());
             } else {
@@ -1535,17 +2064,26 @@ impl AppView {
                     id: effibuddy_agent_core::ids::new_id(),
                     text,
                     kind: PendingInputKind::Queue,
+                    attachments,
                 });
                 self.notice = Some("已加入队列，当前回合结束后自动发送。".to_string());
             }
             cx.notify();
             return;
         }
+        let attachments = std::mem::take(&mut self.composer_attachments);
+        self.persist_composer_attachments(cx);
         if self.edit_message.is_some() {
-            self.commit_edit_message(text, window, cx);
+            self.commit_edit_message(text, attachments, window, cx);
             return;
         }
-        self.start_run(Some(text), cx);
+        self.start_run(
+            Some(RunInput {
+                text,
+                attachments,
+            }),
+            cx,
+        );
     }
 
     /// Drop one pending input from the queue bar.
@@ -1571,6 +2109,7 @@ impl AppView {
             return; // already handed to the harness; injection is pending
         }
         let text = input.text.clone();
+        let attachments = input.attachments.clone();
         let running = self.active_run.is_some();
         self.pending_inputs.remove(position);
         self.queue_held = false;
@@ -1580,16 +2119,17 @@ impl AppView {
                 .as_ref()
                 .expect("running checked above")
                 .handle
-                .steer(text.clone());
+                .steer_with_attachments(text.clone(), attachments.clone());
             self.pending_inputs.push(PendingInput {
                 id: steer_id,
                 text,
                 kind: PendingInputKind::Steer,
+                attachments,
             });
             self.notice = Some("将在下一个步骤边界插入当前回合。".to_string());
         } else {
             self.notice = None;
-            self.start_run(Some(text), cx);
+            self.start_run(Some(RunInput { text, attachments }), cx);
             return;
         }
         cx.notify();
@@ -1611,7 +2151,7 @@ impl AppView {
             return;
         };
         let root = crate::checkpoint::checkpoint_root();
-        let (text, plan) = {
+        let (text, plan, attachments) = {
             let session = lock_session(&shared);
             let Some(message) = session
                 .messages
@@ -1632,13 +2172,18 @@ impl AppView {
                 cx.notify();
                 return;
             }
-            let Ok(plan) = crate::checkpoint::plan_restore(&session, message_id, &root) else {
+            let Ok(plan) = crate::checkpoint::plan_restore_in(
+                &session,
+                message_id,
+                &root,
+                &self.project_roots_for_session_state(&session),
+            ) else {
                 self.notice = Some("无法读取这轮消息的文件检查点。".to_string());
                 self.chat_dirty = true;
                 cx.notify();
                 return;
             };
-            (message.text(), plan)
+            (message.text(), plan, message.attachments.clone())
         };
         let include_files = plan.has_file_changes();
         self.edit_message = Some(EditMessageState {
@@ -1648,6 +2193,10 @@ impl AppView {
         });
         self.undo_dialog = None;
         self.edit_conflict = None;
+        // Editing re-opens the message the way it was sent: its files/images
+        // come back as composer chips.
+        self.composer_attachments = attachments;
+        self.persist_composer_attachments(cx);
         self.composer_state
             .update(cx, |state, cx| state.set_content(text, window, cx));
         self.composer_focus_handle(cx).focus(window);
@@ -1657,6 +2206,8 @@ impl AppView {
     pub(crate) fn cancel_edit_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.edit_message = None;
         self.edit_conflict = None;
+        self.composer_attachments.clear();
+        self.persist_composer_attachments(cx);
         self.composer_state
             .update(cx, |state, cx| state.clear(window, cx));
         self.composer_focus_handle(cx).focus(window);
@@ -1672,32 +2223,50 @@ impl AppView {
 
     /// Submit from edit mode. The plan is recomputed here so a file changed
     /// while the composer was open cannot be clobbered silently.
-    fn commit_edit_message(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn commit_edit_message(
+        &mut self,
+        text: String,
+        attachments: Vec<UserAttachment>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(mut edit) = self.edit_message.take() else {
+            self.composer_attachments = attachments;
+            self.persist_composer_attachments(cx);
             return;
         };
         if self.message_rewind_blocked(cx) {
             self.edit_message = Some(edit);
+            self.composer_attachments = attachments;
             self.restore_composer_text(text, window, cx);
             return;
         }
         if !self.run_ready(cx) {
             self.edit_message = Some(edit);
+            self.composer_attachments = attachments;
             self.restore_composer_text(text, window, cx);
             return;
         }
         let Some(shared) = self.active_shared() else {
             self.edit_message = Some(edit);
+            self.composer_attachments = attachments;
+            self.persist_composer_attachments(cx);
             return;
         };
         let root = crate::checkpoint::checkpoint_root();
         let plan = {
             let session = lock_session(&shared);
-            match crate::checkpoint::plan_restore(&session, &edit.message_id, &root) {
+            match crate::checkpoint::plan_restore_in(
+                &session,
+                &edit.message_id,
+                &root,
+                &self.project_roots_for_session_state(&session),
+            ) {
                 Ok(plan) => plan,
                 Err(error) => {
                     self.edit_message = Some(edit);
                     self.last_error = Some(error);
+                    self.composer_attachments = attachments;
                     self.restore_composer_text(text, window, cx);
                     return;
                 }
@@ -1715,6 +2284,7 @@ impl AppView {
                 message_id,
                 text,
                 plan,
+                attachments,
             });
             window.blur();
             cx.notify();
@@ -1729,7 +2299,13 @@ impl AppView {
                 self.composer_state
                     .update(cx, |state, cx| state.clear(window, cx));
                 self.last_error = None;
-                self.start_run(Some(text), cx);
+                self.start_run(
+                    Some(RunInput {
+                        text,
+                        attachments,
+                    }),
+                    cx,
+                );
                 self.composer_focus_handle(cx).focus(window);
                 if self.active_run.is_some() && restored > 0 {
                     self.notice = Some(format!("已还原 {restored} 个文件，正在发送…"));
@@ -1739,6 +2315,7 @@ impl AppView {
             Err(error) => {
                 self.edit_message = Some(edit);
                 self.last_error = Some(error);
+                self.composer_attachments = attachments;
                 self.restore_composer_text(text, window, cx);
             }
         }
@@ -1747,6 +2324,7 @@ impl AppView {
     fn restore_composer_text(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_state
             .update(cx, |state, cx| state.set_content(text, window, cx));
+        self.persist_composer_attachments(cx);
         self.composer_focus_handle(cx).focus(window);
         self.edit_conflict = None;
         self.chat_dirty = true;
@@ -1795,7 +2373,12 @@ impl AppView {
                 return;
             }
             let excerpt = preview_text(&message.text(), 120);
-            let Ok(plan) = crate::checkpoint::plan_restore(&session, message_id, &root) else {
+            let Ok(plan) = crate::checkpoint::plan_restore_in(
+                &session,
+                message_id,
+                &root,
+                &self.project_roots_for_session_state(&session),
+            ) else {
                 self.notice = Some("无法读取这轮消息的文件检查点。".to_string());
                 self.chat_dirty = true;
                 cx.notify();
@@ -1828,6 +2411,8 @@ impl AppView {
             self.composer_state.update(cx, |state, cx| {
                 state.set_content(conflict.text, window, cx);
             });
+            self.composer_attachments = conflict.attachments;
+            self.persist_composer_attachments(cx);
             self.composer_focus_handle(cx).focus(window);
         }
         cx.notify();
@@ -1853,7 +2438,13 @@ impl AppView {
                 self.composer_state
                     .update(cx, |state, cx| state.clear(window, cx));
                 self.last_error = None;
-                self.start_run(Some(conflict.text), cx);
+                self.start_run(
+                    Some(RunInput {
+                        text: conflict.text,
+                        attachments: conflict.attachments,
+                    }),
+                    cx,
+                );
                 self.composer_focus_handle(cx).focus(window);
                 if self.active_run.is_some() {
                     self.notice = Some("已重置对话；冲突文件未改动。".to_string());
@@ -1914,7 +2505,13 @@ impl AppView {
                 let root = crate::checkpoint::checkpoint_root();
                 let refreshed = self.active_shared().and_then(|shared| {
                     let session = lock_session(&shared);
-                    crate::checkpoint::plan_restore(&session, &message_id, &root).ok()
+                    crate::checkpoint::plan_restore_in(
+                        &session,
+                        &message_id,
+                        &root,
+                        &self.project_roots_for_session_state(&session),
+                    )
+                    .ok()
                 });
                 self.undo_dialog = Some(UndoDialogState {
                     message_id,
@@ -2051,7 +2648,7 @@ impl AppView {
 
     /// Start one parent turn. `input = None` resumes an existing transcript
     /// (used for background-task notifications that were already appended).
-    fn start_run(&mut self, input: Option<String>, cx: &mut Context<Self>) {
+    fn start_run(&mut self, input: Option<RunInput>, cx: &mut Context<Self>) {
         if self.active_run.is_some() {
             self.notice = Some("当前任务仍在运行，请先停止。".to_string());
             cx.notify();
@@ -2069,7 +2666,8 @@ impl AppView {
         };
 
         let shared = active.shared.clone();
-        let workspace = lock_session(&shared).cwd.clone();
+        let (workspace, additional_workspaces) = self.workspace_roots_for_session(&shared);
+        let session_project_id = lock_session(&shared).project_id.clone();
         let permission_mode = lock_session(&shared).permission_mode;
 
         let (resolved, session_id, model) = {
@@ -2104,7 +2702,7 @@ impl AppView {
                 }
             }
         };
-        let mut tools = match builtin_tools(&workspace) {
+        let mut tools = match builtin_tools_with_roots(&workspace, &additional_workspaces) {
             Ok(tools) => tools,
             Err(error) => {
                 self.last_error = Some(format!("无法打开工作区 {}：{error}", workspace.display()));
@@ -2122,17 +2720,13 @@ impl AppView {
         }
         let computer_session_id = session_id.clone();
 
-        // The old two-state switch is gone: approval decisions now flow through
-        // ModeApprovalGate, so the harness always consults the gate and the
-        // session's permission mode decides locally.
+        // Project instructions belong to the session's own workspace, not the
+        // global task default: a project session must see its own AGENTS.md.
+        let project_instructions = crate::config::project_instructions_for(&workspace);
         let system_prompt_extra = if permission_mode == PermissionMode::Plan {
-            format!(
-                "{}\n\n{}",
-                self.config.project_instructions(),
-                PLAN_MODE_SYSTEM_PROMPT
-            )
+            format!("{}\n\n{}", project_instructions, PLAN_MODE_SYSTEM_PROMPT)
         } else {
-            self.config.project_instructions()
+            project_instructions.clone()
         };
         let checkpoint_recorder =
             Arc::new(crate::checkpoint::CheckpointRecorder::new(shared.clone()));
@@ -2146,7 +2740,10 @@ impl AppView {
                 Some(resolved.context_window())
             },
             auto_approve_tools: false,
+            compaction: self.config.compaction.clone(),
             system_prompt_extra,
+            additional_workspaces: additional_workspaces.clone(),
+            project_id: session_project_id.clone(),
             tool_timeout: Duration::from_secs(180),
             // `RunStarted` binds this to the user message that owns the turn;
             // child harnesses inherit the same sink through the cloned config,
@@ -2162,7 +2759,7 @@ impl AppView {
             model,
             resolved.reasoning_level.clone(),
             harness_config.clone(),
-            self.config.project_instructions(),
+            project_instructions,
             self.store.clone(),
             self.app_tx.clone(),
             runtime_handle.clone(),
@@ -2221,7 +2818,11 @@ impl AppView {
         let error_session = shared.clone();
         runtime_handle.spawn(async move {
             let result = match input {
-                Some(text) => harness.run_turn(text).await,
+                Some(input) => {
+                    harness
+                        .run_turn_with_attachments(input.text, input.attachments)
+                        .await
+                }
                 None => harness.run_pending().await,
             };
             if let Err(error) = result {
@@ -2379,6 +2980,10 @@ impl AppView {
                         recorder.bind_turn(turn_id);
                     }
                 }
+                // The first user message turns an invisible draft into real
+                // history; write it before the sidebar scan so the new row
+                // appears at once.
+                self.publish_active_draft(cx);
                 self.persist_active(cx);
                 self.refresh_sessions(cx);
                 structural = true;
@@ -3100,7 +3705,10 @@ impl AppView {
         }
         let head = head
             .map(|index| self.pending_inputs.remove(index))
-            .map(|input| input.text);
+            .map(|input| RunInput {
+                text: input.text,
+                attachments: input.attachments,
+            });
         if head.is_some() {
             self.queue_held = false;
         }
@@ -3539,6 +4147,8 @@ impl AppView {
         } else {
             self.expanded_turns.insert(id.to_string());
             self.collapsed_turns.remove(id);
+            // 手动展开也打点：展开内容按 50ms stagger 渐显。
+            self.chat.note_turn_expanded(id);
         }
     }
 
@@ -3596,9 +4206,13 @@ impl AppView {
     pub(crate) fn modal_blocks_scroll(&self) -> bool {
         self.palette_open
             || self.model_menu.open
-            || self.project_menu.project.is_some()
+            || self.project_menu.target.is_some()
+            || self.session_menu.target.is_some()
+            || self.session_rename.is_some()
+            || self.project_editor.is_some()
             || self.undo_dialog.is_some()
             || self.edit_conflict.is_some()
+            || self.reward_open
     }
 
     pub(crate) fn scroll_chat_to_bottom(&mut self) {
@@ -3611,15 +4225,115 @@ impl AppView {
     }
 
     fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_session_in_project(None, window, cx);
+        self.new_session_in_project(None, None, window, cx);
     }
 
-    /// Create a task. `project = None` goes to the sidebar's 任务 section and
-    /// runs in the configured workspace; `Some(path)` opens it inside a
-    /// project with that folder as the tool sandbox.
+    /// Resolve a session's project row: registry project by id, else legacy
+    /// path as a root, else a synthesized legacy group, else a plain task.
+    pub(crate) fn project_group(
+        &self,
+        project_id: Option<&str>,
+        legacy: Option<&Path>,
+    ) -> Option<ProjectGroup> {
+        if let Some(project) = self.projects.project_for_session(project_id, legacy) {
+            return Some(ProjectGroup {
+                id: Some(project.id.clone()),
+                key: project_group_key(&project.id),
+                name: project.name.clone(),
+                roots: project.root_paths(),
+            });
+        }
+        legacy.map(|path| ProjectGroup {
+            id: None,
+            key: format!("project:legacy:{}", path.display()),
+            name: project_default_name(path),
+            roots: vec![path.to_path_buf()],
+        })
+    }
+
+    fn project_group_for_summary(&self, summary: &SessionSummary) -> Option<ProjectGroup> {
+        self.project_group(summary.project_id.as_deref(), summary.project.as_deref())
+    }
+
+    /// Session cwd plus the project's other folders (in project order).
+    fn workspace_roots_for_session(&self, shared: &SharedSession) -> (PathBuf, Vec<PathBuf>) {
+        let (cwd, project_id, legacy) = {
+            let session = lock_session(shared);
+            (
+                session.cwd.clone(),
+                session.project_id.clone(),
+                session.project.clone(),
+            )
+        };
+        let additional = self
+            .projects
+            .project_for_session(project_id.as_deref(), legacy.as_deref())
+            .map(|project| project.additional_roots(&cwd))
+            .unwrap_or_default();
+        (cwd, additional)
+    }
+
+    /// All folders of the project owning this snapshot (empty for tasks).
+    fn project_roots_for_session_state(
+        &self,
+        session: &effibuddy_agent_core::SessionState,
+    ) -> Vec<PathBuf> {
+        self.projects
+            .project_for_session(session.project_id.as_deref(), session.project.as_deref())
+            .map(|project| project.root_paths())
+            .unwrap_or_default()
+    }
+
+    /// The active session's workspace: its project folder for project
+    /// sessions, the configured workspace for tasks.
+    pub(crate) fn active_workspace(&self) -> PathBuf {
+        self.active
+            .as_ref()
+            .map(|active| lock_session(&active.shared).cwd.clone())
+            .unwrap_or_else(|| self.config.workspace())
+    }
+
+    /// Label and tooltip for the sidebar footer: the active project's name and
+    /// primary folder, else the configured workspace.
+    fn sidebar_workspace_label(&self) -> (String, String) {
+        if let Some(active) = &self.active {
+            let (project_id, legacy) = {
+                let session = lock_session(&active.shared);
+                (session.project_id.clone(), session.project.clone())
+            };
+            if let Some(project) = self
+                .projects
+                .project_for_session(project_id.as_deref(), legacy.as_deref())
+            {
+                let path = project
+                    .primary()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                return (project.name.clone(), path);
+            }
+        }
+        let workspace = self.config.workspace();
+        let label = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| workspace.display().to_string());
+        (label, workspace.display().to_string())
+    }
+
+    /// Create a conversation. `project_id = None` without an override goes to
+    /// the sidebar's 任务 section and runs in the configured workspace.
+    /// `project_id = Some(id)` opens it in that project's primary folder;
+    /// `workspace_override` serves synthesized legacy groups.
+    ///
+    /// Each project/task scope owns at most one *unsent* conversation. Clicking
+    /// “新建任务” again returns to that draft (text, model and workspace
+    /// intact) instead of spawning another invisible transcript.
     fn new_session_in_project(
         &mut self,
-        project: Option<PathBuf>,
+        project_id: Option<String>,
+        workspace_override: Option<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3628,17 +4342,95 @@ impl AppView {
             cx.notify();
             return;
         }
+        let (workspace, legacy_project, project_id) = match project_id {
+            Some(id) => {
+                let primary = self
+                    .projects
+                    .by_id(&id)
+                    .and_then(|project| project.primary())
+                    .map(Path::to_path_buf);
+                let workspace = primary
+                    .or(workspace_override)
+                    .unwrap_or_else(|| self.config.workspace());
+                (workspace.clone(), Some(workspace), Some(id))
+            }
+            None => match workspace_override {
+                Some(path) => (path.clone(), Some(path), None),
+                None => (self.config.workspace(), None, None),
+            },
+        };
+        let scope = crate::draft_store::scope_key(
+            project_id.as_deref(),
+            legacy_project.as_deref(),
+        );
+
+        // Pressing the same scope's “+” again while its draft is open must not
+        // replace the draft or clear the half-written prompt.
+        if self.active_is_unsent_draft_for(&scope) {
+            self.project_menu = ProjectMenuState::default();
+            self.project_editor = None;
+            self.settings_open = false;
+            if let Some(id) = self.active_id() {
+                let mut changed = self.drafts.set_last_active(&id);
+                if self.drafts.scope_session(&scope) != Some(id.as_str()) {
+                    self.drafts.bind_scope(&scope, &id);
+                    changed = true;
+                }
+                if changed {
+                    self.save_drafts_now();
+                }
+            }
+            self.composer_focus_handle(cx).focus(window);
+            cx.notify();
+            return;
+        }
+
+        // A scope may already own an unsent conversation that is not active
+        // (the user looked at another session meanwhile). Reopen it rather
+        // than creating a second one.
+        if let Some(id) = self.drafts.scope_session(&scope).map(str::to_string) {
+            let still_unsent = self
+                .store
+                .load(&id)
+                .is_some_and(|state| state.messages.is_empty() && !state.archived);
+            if still_unsent {
+                self.select_session(&id, window, cx);
+                if self.active_id().as_deref() == Some(id.as_str()) {
+                    self.project_menu = ProjectMenuState::default();
+                    self.project_editor = None;
+                    self.notice = None;
+                    self.composer_focus_handle(cx).focus(window);
+                    cx.notify();
+                    return;
+                }
+            } else {
+                // The transcript vanished, was archived or already received
+                // its first message: drop the stale binding but keep the
+                // composer text in case it belongs to a follow-up turn.
+                self.drafts.unbind_session(&id);
+                self.save_drafts_now();
+            }
+        }
+
+        // Leaving a different unsent conversation behind: keep it bound to its
+        // own scope so its text and model come back later.
+        self.remember_active_draft(cx);
         self.persist_active(cx);
         self.retire_computer_session(cx);
-        let workspace = project.clone().unwrap_or_else(|| self.config.workspace());
         let mut session = self.models.new_session_state(workspace);
         session.permission_mode = self.config.effective_default_mode();
-        session.project = project;
+        session.project_id = project_id;
+        session.project = legacy_project;
+        let id = session.id.clone();
         let _ = self.store.save(&session);
+        self.drafts.bind_scope(&scope, &id);
+        self.drafts.set_last_active(&id);
+        self.save_drafts_now();
         self.active = Some(ActiveSession {
             shared: new_shared_session(session),
         });
         self.project_menu = ProjectMenuState::default();
+        self.project_editor = None;
         self.settings_open = false;
         self.reset_subagents();
         self.sync_side_pane_workspace(cx);
@@ -3650,36 +4442,38 @@ impl AppView {
         self.collapsed_turns.clear();
         self.clear_message_editing();
         self.chat.reset_session();
+        self.prompt_rail = PromptRailState::default();
+        self.jump_flash = None;
+        self.jump_flash_seq = 0;
         self.chat_dirty = true;
         self.chat.pin_to_bottom();
         self.graph.invalidate();
         self.graph.clear_selection();
+        self.composer_attachments.clear();
+        // The composer menu belongs to the outgoing conversation/workspace.
+        self.composer_menu.close();
         self.composer_state
-            .update(cx, |state, cx| state.clear(window, cx));
+            .update(cx, |state, _| state.set_content_silent(String::new()));
         self.refresh_sessions(cx);
         self.composer_focus_handle(cx).focus(window);
         cx.notify();
     }
 
-    /// Native folder picker behind the projects header's "+" button. The
-    /// chosen folder is registered as a workspace; canceling is a no-op.
-    fn pick_project_folder(&mut self, cx: &mut Context<Self>) {
+    /// Native multi-select folder picker behind the projects header's "+".
+    /// The selected folders become ONE project whose first folder is primary.
+    fn pick_project_folders(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: false,
             directories: true,
-            multiple: false,
-            prompt: Some("添加工作区".into()),
+            multiple: true,
+            prompt: Some("新建项目（可多选文件夹）".into()),
         });
         cx.spawn(async move |weak, cx| {
             let Ok(result) = receiver.await else {
                 return;
             };
             let _ = weak.update(cx, |this, cx| match result {
-                Ok(Some(paths)) => {
-                    if let Some(path) = paths.into_iter().next() {
-                        this.add_project_workspace(path, cx);
-                    }
-                }
+                Ok(Some(paths)) => this.create_project_from_folders(paths, cx),
                 Ok(None) => {}
                 Err(error) => {
                     this.last_error = Some(format!("无法打开文件夹选择器：{error}"));
@@ -3690,35 +4484,181 @@ impl AppView {
         .detach();
     }
 
-    /// Register a folder as a project. A project with no sessions would not
-    /// exist in the derived list, so the path is also persisted in the config.
-    fn add_project_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let path = std::fs::canonicalize(&path).unwrap_or(path);
-        let known = self.config.projects.iter().any(|project| project == &path)
-            || self
-                .sessions
-                .iter()
-                .any(|summary| summary.project.as_deref() == Some(path.as_path()));
-        if known {
-            self.notice = Some(format!("工作区已在项目中：{}", project_display_name(&path)));
+    fn create_project_from_folders(&mut self, folders: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut fresh: Vec<PathBuf> = Vec::new();
+        let mut duplicates: Vec<String> = Vec::new();
+        for folder in folders {
+            let folder = normalize_root(&folder);
+            if fresh.iter().any(|existing| existing == &folder) {
+                continue;
+            }
+            match self.projects.project_for_path(&folder) {
+                Some(existing) => duplicates.push(existing.name.clone()),
+                None => fresh.push(folder),
+            }
+        }
+        if fresh.is_empty() {
+            if let Some(name) = duplicates.first() {
+                self.notice = Some(format!("所选文件夹已在项目「{name}」中。"));
+            }
             cx.notify();
             return;
         }
-        self.config.projects.push(path.clone());
-        // A freshly added workspace should be visible immediately.
-        self.config
-            .sidebar_collapsed_sections
-            .retain(|group| group != "projects" && group != &project_group_key(&path));
-        let _ = self.config.save();
-        self.notice = Some(format!(
-            "已添加工作区：{}。悬停项目可新建任务。",
-            project_display_name(&path)
-        ));
+        match self.projects.create(&fresh) {
+            Ok(project) => {
+                if let Err(error) = self.projects.save() {
+                    self.last_error = Some(error);
+                }
+                // A freshly added project should be visible immediately.
+                self.config.sidebar_collapsed_sections.retain(|group| {
+                    group != "projects" && group != &project_group_key(&project.id)
+                });
+                let _ = self.config.save();
+                let mut message = if project.roots.len() > 1 {
+                    format!(
+                        "已新建项目「{}」：{} 个文件夹（主文件夹 {}）。",
+                        project.name,
+                        project.roots.len(),
+                        project
+                            .primary()
+                            .map(|path| path.display().to_string())
+                            .unwrap_or_default()
+                    )
+                } else {
+                    format!("已新建项目「{}」。悬停项目可新建任务。", project.name)
+                };
+                if !duplicates.is_empty() {
+                    message.push_str(" 部分文件夹已在其他项目中，已跳过。");
+                }
+                self.notice = Some(message);
+            }
+            Err(error) => self.last_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    // --- project folder editor -------------------------------------------
+
+    fn open_project_editor(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(project) = self.projects.by_id(id) else {
+            self.last_error = Some("项目不存在。".to_string());
+            cx.notify();
+            return;
+        };
+        let state = ProjectEditorState {
+            id: project.id.clone(),
+            name: project.name.clone(),
+            roots: project.root_paths(),
+            primary: project.primary().map(Path::to_path_buf),
+            error: None,
+        };
+        self.project_menu = ProjectMenuState::default();
+        self.project_editor_name.update(cx, |input, cx| {
+            input.set_content(&state.name, window, cx);
+        });
+        self.project_editor = Some(state);
+        cx.notify();
+    }
+
+    fn close_project_editor(&mut self, cx: &mut Context<Self>) {
+        self.project_editor = None;
+        cx.notify();
+    }
+
+    fn project_editor_add_folders(&mut self, cx: &mut Context<Self>) {
+        if self.project_editor.is_none() {
+            return;
+        }
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("添加文件夹".into()),
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(result) = receiver.await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                let outcome = match result {
+                    Ok(Some(paths)) => {
+                        if let Some(editor) = this.project_editor.as_mut() {
+                            for path in paths {
+                                let path = normalize_root(&path);
+                                if !editor.roots.iter().any(|root| root == &path) {
+                                    editor.roots.push(path);
+                                }
+                            }
+                            if editor.primary.is_none() {
+                                editor.primary = editor.roots.first().cloned();
+                            }
+                            editor.error = None;
+                        }
+                        Ok(())
+                    }
+                    Ok(None) => Ok(()),
+                    Err(error) => Err(format!("无法打开文件夹选择器：{error}")),
+                };
+                if let Err(error) = outcome {
+                    if let Some(editor) = this.project_editor.as_mut() {
+                        editor.error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn project_editor_remove_root(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let Some(editor) = self.project_editor.as_mut() else {
+            return;
+        };
+        editor.roots.retain(|candidate| candidate != root);
+        if editor.primary.as_deref() == Some(root) {
+            editor.primary = editor.roots.first().cloned();
+        }
+        cx.notify();
+    }
+
+    fn project_editor_make_primary(&mut self, root: &Path, cx: &mut Context<Self>) {
+        let Some(editor) = self.project_editor.as_mut() else {
+            return;
+        };
+        if editor.roots.iter().any(|candidate| candidate == root) {
+            editor.primary = Some(root.to_path_buf());
+            cx.notify();
+        }
+    }
+
+    fn save_project_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.project_editor.clone() else {
+            return;
+        };
+        let name = self.project_editor_name.read(cx).content().to_string();
+        let result = self
+            .projects
+            .update(&editor.id, &name, &editor.roots, editor.primary.as_deref())
+            .and_then(|()| self.projects.save());
+        match result {
+            Ok(()) => {
+                self.project_editor = None;
+                self.notice = Some("项目文件夹已更新。".to_string());
+            }
+            Err(error) => {
+                if let Some(editor) = self.project_editor.as_mut() {
+                    editor.error = Some(error);
+                }
+            }
+        }
+        window.focus(&self.composer_state.read(cx).focus_handle());
         cx.notify();
     }
 
     fn select_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_id().as_deref() == Some(id) {
+            // Clicking the active row still counts as reading it.
+            self.mark_session_read(id, cx);
             return;
         }
         if self.active_run.is_some() {
@@ -3726,6 +4666,9 @@ impl AppView {
             cx.notify();
             return;
         }
+        // Capture the outgoing composer text and unsent-draft binding before
+        // the active session changes.
+        self.remember_active_draft(cx);
         self.persist_active(cx);
         self.retire_computer_session(cx);
         let Some(mut state) = self.store.load(id) else {
@@ -3749,12 +4692,17 @@ impl AppView {
         self.collapsed_turns.clear();
         self.clear_message_editing();
         self.chat.reset_session();
+        self.prompt_rail = PromptRailState::default();
+        self.jump_flash = None;
+        self.jump_flash_seq = 0;
         self.chat_dirty = true;
         self.chat.pin_to_bottom();
         self.graph.invalidate();
         self.graph.clear_selection();
-        self.composer_state
-            .update(cx, |state, cx| state.clear(window, cx));
+        // Bring back whatever was typed here before the user switched away.
+        self.restore_composer_draft(cx);
+        self.remember_active_draft(cx);
+        self.mark_session_read(id, cx);
         self.composer_focus_handle(cx).focus(window);
         cx.notify();
     }
@@ -3802,7 +4750,7 @@ impl AppView {
     /// save makes the new flags visible to the immediately following session
     /// scans (e.g. the 归档 page), then the same snapshot is queued behind any
     /// already-staged writes so an older transcript cannot win afterwards.
-    fn save_active_metadata(&mut self, shared: &SharedSession) -> Result<(), String> {
+    pub(crate) fn save_active_metadata(&mut self, shared: &SharedSession) -> Result<(), String> {
         let snapshot = lock_session(shared).clone();
         // Serialize once. Write the JSON synchronously so the immediately
         // following session scan sees the metadata, then queue the same
@@ -3852,46 +4800,103 @@ impl AppView {
         }
 
         if is_active {
-            self.active = None;
-            self.settings_open = false;
-            if let Some(summary) = self
-                .sessions
-                .iter()
-                .find(|summary| summary.id != id)
-                .cloned()
-                && let Some(mut state) = self.store.load(&summary.id)
-            {
-                self.models.normalize_session(&mut state);
-                self.active = Some(ActiveSession {
-                    shared: new_shared_session(state),
-                });
-            }
-            if self.active.is_none() {
-                let mut session = self.models.new_session_state(self.config.workspace());
-                session.permission_mode = self.config.effective_default_mode();
-                let _ = self.store.save(&session);
-                self.active = Some(ActiveSession {
-                    shared: new_shared_session(session),
-                });
-            }
-            self.reset_subagents();
-            self.sync_side_pane_workspace(cx);
-            self.expanded_reasoning.clear();
-            self.expanded_tools.clear();
-            self.expanded_turns.clear();
-            self.collapsed_turns.clear();
-            self.clear_message_editing();
-            self.chat.reset_session();
-            self.chat_dirty = true;
-            self.chat.pin_to_bottom();
-            self.graph.invalidate();
-            self.graph.clear_selection();
-            self.composer_state
-                .update(cx, |state, _| state.set_content_silent(String::new()));
+            self.activate_session_after_removal(id, cx);
         }
 
         self.notice = Some("会话已归档，可在 设置 → 归档 中恢复。".to_string());
         self.refresh_sessions(cx);
+        self.refresh_archived_sessions(cx);
+        cx.notify();
+    }
+
+    /// Replace an active conversation that just left the sidebar (archived or
+    /// deleted). Picks the next history row, else the task scope's unsent
+    /// draft, else a fresh task draft — and restores that session's composer
+    /// draft text so both removal paths behave like a normal switch.
+    fn activate_session_after_removal(&mut self, removed_id: &str, cx: &mut Context<Self>) {
+        self.active = None;
+        self.settings_open = false;
+        if let Some(summary) = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id != removed_id)
+            .cloned()
+            && let Some(mut state) = self.store.load(&summary.id)
+        {
+            self.models.normalize_session(&mut state);
+            self.active = Some(ActiveSession {
+                shared: new_shared_session(state),
+            });
+        }
+        if self.active.is_none() {
+            let mut task_draft = self
+                .drafts
+                .scope_session(TASK_SCOPE)
+                .and_then(|id| self.store.load(id))
+                .filter(|session| session.messages.is_empty() && !session.archived);
+            if let Some(state) = task_draft.as_mut() {
+                self.models.normalize_session(state);
+                self.active = Some(ActiveSession {
+                    shared: new_shared_session(state.clone()),
+                });
+            } else {
+                let mut session = self.models.new_session_state(self.config.workspace());
+                session.permission_mode = self.config.effective_default_mode();
+                let id = session.id.clone();
+                let _ = self.store.save(&session);
+                self.drafts.bind_scope(TASK_SCOPE, &id);
+                self.active = Some(ActiveSession {
+                    shared: new_shared_session(session),
+                });
+            }
+        }
+        self.reset_subagents();
+        self.sync_side_pane_workspace(cx);
+        self.expanded_reasoning.clear();
+        self.expanded_tools.clear();
+        self.expanded_turns.clear();
+        self.collapsed_turns.clear();
+        self.clear_message_editing();
+        self.chat.reset_session();
+        self.prompt_rail = PromptRailState::default();
+        self.jump_flash = None;
+        self.jump_flash_seq = 0;
+        self.chat_dirty = true;
+        self.chat.pin_to_bottom();
+        self.graph.invalidate();
+        self.graph.clear_selection();
+        self.restore_composer_draft(cx);
+        self.remember_active_draft(cx);
+        if let Some(id) = self.active_id() {
+            self.mark_session_read(&id, cx);
+        }
+    }
+
+    /// Permanently remove a conversation from the sidebar's “more” menu. The
+    /// menu arms the confirmation first; this performs the second click.
+    fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let is_active = self.active_id().as_deref() == Some(id);
+        if is_active && self.active_run.is_some() {
+            self.notice = Some("任务运行中，不能删除当前会话。".to_string());
+            self.session_menu = SessionMenuState::default();
+            cx.notify();
+            return;
+        }
+        self.session_menu = SessionMenuState::default();
+        if let Err(error) = self.store.delete(id) {
+            self.last_error = Some(error);
+            cx.notify();
+            return;
+        }
+        crate::checkpoint::remove_session_checkpoints(id);
+        self.drafts.remove_session(id);
+        self.save_drafts_now();
+        if is_active {
+            self.activate_session_after_removal(id, cx);
+        }
+        self.notice = Some("会话已删除。".to_string());
+        self.refresh_sessions(cx);
+        // A conversation can also be deleted while its archived page is open.
         self.refresh_archived_sessions(cx);
         cx.notify();
     }
@@ -3930,10 +4935,13 @@ impl AppView {
         match self.store.delete(id) {
             Ok(()) => {
                 crate::checkpoint::remove_session_checkpoints(id);
+                self.drafts.remove_session(id);
+                self.save_drafts_now();
                 self.settings.status = Some((true, "已删除归档会话。".to_string()));
             }
             Err(error) => self.settings.status = Some((false, error)),
         }
+        self.refresh_sessions(cx);
         self.refresh_archived_sessions(cx);
         cx.notify();
     }
@@ -3946,24 +4954,33 @@ impl AppView {
     }
 
     fn toggle_sidebar_section(&mut self, group: &str, cx: &mut Context<Self>) {
-        if let Some(index) = self
+        let expanding = if let Some(index) = self
             .config
             .sidebar_collapsed_sections
             .iter()
             .position(|entry| entry == group)
         {
             self.config.sidebar_collapsed_sections.remove(index);
+            true
         } else {
             self.config
                 .sidebar_collapsed_sections
                 .push(group.to_string());
-        }
+            false
+        };
         let _ = self.config.save();
-        // Rows below the section move by its full height; a critically damped
-        // spring turns that layout jump into a paint-time transition and
-        // survives rapid toggling. Start after the disk write so the animation
-        // budget is not eaten by config persistence.
-        self.motion.begin(MotionSpec::SPRING_LAYOUT);
+        // Rows below the section move by its full height; a paint-time
+        // transition turns that layout jump into motion.
+        //
+        // 展开用临界阻尼 spring（长距离下落、连续点按不丢速度）；收回改用
+        // 220ms ease-out，动作敏捷不拖尾。新的行在渲染端按 50ms stagger 渐
+        // 显，与下方行的位移互不重叠。Start after the disk write so the
+        // animation budget is not eaten by config persistence.
+        self.motion.begin(if expanding {
+            MotionSpec::SPRING_LAYOUT
+        } else {
+            MotionSpec::LAYOUT
+        });
         cx.notify();
     }
 
@@ -3985,11 +5002,11 @@ impl AppView {
 
     fn open_project_menu(
         &mut self,
-        project: PathBuf,
+        target: ProjectGroup,
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.project_menu.project = Some(project);
+        self.project_menu.target = Some(target);
         self.project_menu.position = Some(position);
         cx.notify();
     }
@@ -3997,6 +5014,321 @@ impl AppView {
     pub(crate) fn close_project_menu(&mut self, cx: &mut Context<Self>) {
         self.project_menu = ProjectMenuState::default();
         cx.notify();
+    }
+
+    /// Open the conversation-row “more” popover. Anchored to the click point,
+    /// with the project menu closed so only one popover owns the backdrop.
+    fn open_session_menu(&mut self, id: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.session_menu = SessionMenuState {
+            target: Some(id.to_string()),
+            position: Some(position),
+            confirm_delete: false,
+        };
+        self.project_menu = ProjectMenuState::default();
+        self.model_menu.open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn close_session_menu(&mut self, cx: &mut Context<Self>) {
+        if self.session_menu.target.is_none() {
+            return;
+        }
+        self.session_menu = SessionMenuState::default();
+        cx.notify();
+    }
+
+    /// Set or clear the sidebar's unread marker. This is UI state only, so it
+    /// never touches `updated_at` and never reorders the list.
+    fn set_session_unread(&mut self, id: &str, unread: bool, cx: &mut Context<Self>) {
+        self.session_menu = SessionMenuState::default();
+        let is_active = self.active_id().as_deref() == Some(id);
+        let result = if is_active {
+            let Some(shared) = self.active_shared() else {
+                return;
+            };
+            {
+                let mut session = lock_session(&shared);
+                session.unread = unread;
+            }
+            self.save_active_metadata(&shared)
+        } else {
+            match self.store.load_for_update(id) {
+                Some(mut session) => {
+                    session.unread = unread;
+                    self.store.save(&session)
+                }
+                None => Err("无法读取该会话。".to_string()),
+            }
+        };
+        match result {
+            Ok(()) => {
+                if let Some(summary) = self.sessions.iter_mut().find(|summary| summary.id == id) {
+                    summary.unread = unread;
+                }
+                self.notice = Some(
+                    if unread {
+                        "已标为未读。"
+                    } else {
+                        "已标为已读。"
+                    }
+                    .to_string(),
+                );
+            }
+            Err(error) => self.last_error = Some(error),
+        }
+        cx.notify();
+    }
+
+    /// Opening a conversation clears its unread marker.
+    fn mark_session_read(&mut self, id: &str, cx: &mut Context<Self>) {
+        let was_unread = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .is_some_and(|summary| summary.unread);
+        if !was_unread {
+            return;
+        }
+        if let Some(summary) = self.sessions.iter_mut().find(|summary| summary.id == id) {
+            summary.unread = false;
+        }
+        let is_active = self.active_id().as_deref() == Some(id);
+        let result = if is_active {
+            let Some(shared) = self.active_shared() else {
+                return;
+            };
+            lock_session(&shared).unread = false;
+            self.save_active_metadata(&shared)
+        } else {
+            match self.store.load_for_update(id) {
+                Some(mut session) => {
+                    session.unread = false;
+                    self.store.save(&session)
+                }
+                None => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            self.last_error = Some(error);
+        }
+        cx.notify();
+    }
+
+    fn open_session_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(summary) = self.sessions.iter().find(|summary| summary.id == id).cloned() else {
+            return;
+        };
+        self.session_menu = SessionMenuState::default();
+        let name = if summary.title.trim().is_empty() {
+            "新的会话".to_string()
+        } else {
+            summary.title
+        };
+        self.session_rename_name
+            .update(cx, |input, cx| input.set_content(name, window, cx));
+        self.session_rename = Some(SessionRenameState {
+            id: id.to_string(),
+            error: None,
+        });
+        window.focus(&self.session_rename_name.read(cx).focus_handle());
+        cx.notify();
+    }
+
+    pub(crate) fn close_session_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session_rename.take().is_none() {
+            return;
+        }
+        window.focus(&self.composer_state.read(cx).focus_handle());
+        cx.notify();
+    }
+
+    fn save_session_rename(
+        &mut self,
+        submitted: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(rename) = self.session_rename.clone() else {
+            return;
+        };
+        // Enter submits through `TextInputView`, which takes the content out
+        // before invoking the handler; put it back first so the dialog keeps
+        // its value if validation or I/O fails.
+        let name = match submitted {
+            Some(text) => {
+                self.session_rename_name.update(cx, |state, cx| {
+                    state.set_content(text.clone(), window, cx)
+                });
+                text
+            }
+            None => self.session_rename_name.read(cx).content().to_string(),
+        };
+        let name: String = name.trim().chars().take(120).collect();
+        if name.is_empty() {
+            if let Some(state) = self.session_rename.as_mut() {
+                state.error = Some("会话名称不能为空。".to_string());
+            }
+            cx.notify();
+            return;
+        }
+        let is_active = self.active_id().as_deref() == Some(rename.id.as_str());
+        let result = if is_active {
+            let Some(shared) = self.active_shared() else {
+                return;
+            };
+            {
+                let mut session = lock_session(&shared);
+                session.title = name.clone();
+            }
+            self.save_active_metadata(&shared)
+        } else {
+            match self.store.load_for_update(&rename.id) {
+                Some(mut session) => {
+                    session.title = name.clone();
+                    self.store.save(&session)
+                }
+                None => Err("无法读取该会话。".to_string()),
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.session_rename = None;
+                if let Some(summary) = self
+                    .sessions
+                    .iter_mut()
+                    .find(|summary| summary.id == rename.id)
+                {
+                    summary.title = name;
+                }
+                self.notice = Some("会话名称已更新。".to_string());
+                self.refresh_sessions(cx);
+            }
+            Err(error) => {
+                if let Some(state) = self.session_rename.as_mut() {
+                    state.error = Some(error);
+                }
+            }
+        }
+        window.focus(&self.composer_state.read(cx).focus_handle());
+        cx.notify();
+    }
+
+    /// Ask where to save, then bundle the structured transcript tree and the
+    /// files it referenced into one zip.
+    fn export_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(summary) = self.sessions.iter().find(|summary| summary.id == id).cloned() else {
+            return;
+        };
+        self.session_menu = SessionMenuState::default();
+        let directory = dirs::download_dir()
+            .or_else(dirs::document_dir)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| self.config.workspace());
+        let suggested = export_file_name(&summary.title);
+        let receiver = cx.prompt_for_new_path(&directory, Some(suggested.as_str()));
+        self.notice = Some("选择导出位置…".to_string());
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(path))) => path,
+                Ok(Ok(None)) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if this.notice.as_deref() == Some("选择导出位置…") {
+                            this.notice = None;
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+                Ok(Err(error)) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        this.notice = None;
+                        this.last_error = Some(format!("无法打开保存对话框：{error}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => {
+                    let _ = weak.update(cx, |this, cx| {
+                        if this.notice.as_deref() == Some("选择导出位置…") {
+                            this.notice = None;
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let _ = weak.update(cx, |this, cx| {
+                this.begin_session_export(&summary.id, normalize_export_path(path), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn begin_session_export(&mut self, id: &str, destination: PathBuf, cx: &mut Context<Self>) {
+        let active_shared = if self.active_id().as_deref() == Some(id) {
+            self.active_shared()
+        } else {
+            None
+        };
+        // Resolve the project's extra folders from the summary so the session
+        // clone/load can happen entirely off the UI thread.
+        let project_roots = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .and_then(|summary| self.project_group_for_summary(summary))
+            .map(|group| group.roots)
+            .unwrap_or_default();
+        let store = self.store.clone();
+        let id = id.to_string();
+        self.notice = Some("正在导出会话…".to_string());
+        self.last_error = None;
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let main = match active_shared {
+                        Some(shared) => lock_session(&shared).clone(),
+                        None => store
+                            .load_raw(&id)
+                            .ok_or_else(|| format!("无法读取会话 {id}"))?,
+                    };
+                    let children = crate::session_export::descendants(&store, &main.id);
+                    crate::session_export::export(
+                        &main,
+                        &children,
+                        &project_roots,
+                        &destination,
+                    )
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                match result {
+                    Ok(report) => {
+                        let missing = if report.missing > 0 {
+                            format!("，{} 个文件缺失", report.missing)
+                        } else {
+                            String::new()
+                        };
+                        this.notice = Some(format!(
+                            "已导出 {} 个子代理、{} 个文件{} → {}",
+                            report.subagents,
+                            report.files,
+                            missing,
+                            report.path.display()
+                        ));
+                    }
+                    Err(error) => {
+                        this.notice = None;
+                        this.last_error = Some(format!("导出失败：{error}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn reveal_project_folder(&mut self, project: &Path, cx: &mut Context<Self>) {
@@ -4072,7 +5404,11 @@ impl AppView {
             session.permission_mode = session.permission_mode.next();
             session.touch();
         }
-        self.persist_active(cx);
+        // Persist immediately: the mode must survive an app close that races
+        // the throttled background writer, just like the model selection.
+        if let Err(error) = self.save_active_metadata(&shared) {
+            self.last_error = Some(error);
+        }
         cx.notify();
     }
 
@@ -4107,6 +5443,22 @@ impl AppView {
         self.fill_composer(&text, window, cx);
     }
 
+    /// Stage one real workspace file and open the `@` menu
+    /// (`--preview-composer-menu`). Interactive check for the mention menu and
+    /// the attachment chip row; the file index fills in after the first frame.
+    pub fn seed_composer_menu_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.preview_mode = true;
+        let workspace = self.composer_workspace();
+        for candidate in ["README.md", "Cargo.toml"] {
+            let path = workspace.join(candidate);
+            if path.is_file() {
+                self.attach_paths(vec![path], cx);
+                break;
+            }
+        }
+        self.fill_composer("@", window, cx);
+    }
+
     /// Show the floating computer-use bar and the composer hint without
     /// touching the real desktop (`--preview-computer`).
     pub fn seed_computer_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4138,6 +5490,7 @@ impl AppView {
     // --- command palette --------------------------------------------------
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer_menu.close();
         self.palette_open = true;
         self.palette_selected = 0;
         self.palette_selected_for.clear();
@@ -4689,35 +6042,358 @@ impl AppView {
             .into_any_element()
     }
 
-    /// Popover for a project's "more" button: new task, reveal the folder,
-    /// copy its path and collapse/expand the group.
+    /// Popover for a conversation row's “more” button. Deleting is
+    /// intentionally two-step: the row arms, the second click removes the
+    /// transcript (and any draft held for it).
+    fn render_session_menu(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let id = self.session_menu.target.clone()?;
+        let position = self.session_menu.position?;
+        let summary = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()?;
+        let theme = self.theme.clone();
+        let confirm = self.session_menu.confirm_delete;
+        let unread = summary.unread;
+        let id_for_export = id.clone();
+        let id_for_rename = id.clone();
+        let id_for_unread = id.clone();
+        let id_for_delete = id.clone();
+        let title = summary.title.clone();
+        let meta = format!(
+            "{} · {} 条消息",
+            relative_time(summary.updated_at),
+            summary.message_count
+        );
+        Some(
+            div()
+                .id("session-menu-backdrop")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_session_menu(cx)),
+                )
+                .child(
+                    anchored()
+                        .position(position)
+                        .offset(point(px(-148.0), px(6.0)))
+                        .snap_to_window_with_margin(px(12.0))
+                        .child(
+                            div()
+                                .id("session-menu")
+                                .w(px(184.0))
+                                .rounded(px(radius::MD))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.elevated)
+                                .shadow(shadow_float(&theme))
+                                .p(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.0))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation()
+                                })
+                                .child(
+                                    div()
+                                        .px(px(7.0))
+                                        .py(px(5.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(11.5))
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(theme.text)
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(9.5))
+                                                .text_color(theme.text_faint)
+                                                .child(meta),
+                                        ),
+                                )
+                                .child(div().h(px(1.0)).bg(theme.border).my(px(2.0)))
+                                .child(
+                                    session_menu_row(
+                                        &theme,
+                                        "session-menu-export",
+                                        icons::DOWNLOAD,
+                                        "导出会话…",
+                                        false,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.export_session(&id_for_export, cx);
+                                    })),
+                                )
+                                .child(
+                                    session_menu_row(
+                                        &theme,
+                                        "session-menu-rename",
+                                        icons::EDIT,
+                                        "修改会话名…",
+                                        false,
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_session_rename(&id_for_rename, window, cx);
+                                    })),
+                                )
+                                .child(
+                                    session_menu_row(
+                                        &theme,
+                                        "session-menu-unread",
+                                        icons::MAIL,
+                                        if unread { "标为已读" } else { "标为未读" },
+                                        false,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.set_session_unread(&id_for_unread, !unread, cx);
+                                    })),
+                                )
+                                .child(div().h(px(1.0)).bg(theme.border).my(px(2.0)))
+                                .child(
+                                    session_menu_row(
+                                        &theme,
+                                        "session-menu-delete",
+                                        icons::TRASH,
+                                        if confirm {
+                                            "确认删除会话"
+                                        } else {
+                                            "删除会话"
+                                        },
+                                        true,
+                                    )
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        if this.session_menu.confirm_delete {
+                                            this.delete_session(&id_for_delete, cx);
+                                        } else {
+                                            this.session_menu.confirm_delete = true;
+                                            cx.notify();
+                                        }
+                                    })),
+                                )
+                                .when(confirm, |element| {
+                                    element.child(
+                                        div()
+                                            .px(px(8.0))
+                                            .pb(px(5.0))
+                                            .text_size(px(9.5))
+                                            .text_color(theme.text_faint)
+                                            .child("删除后无法恢复。"),
+                                    )
+                                })
+                                .with_animation(
+                                    "session-menu-enter",
+                                    Animation::new(overlay_motion_duration())
+                                        .with_easing(ease_out_cubic),
+                                    |element, delta| {
+                                        element.opacity(delta).mt(px(4.0 * (1.0 - delta)))
+                                    },
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Centered rename dialog opened from the conversation's “more” menu.
+    fn render_session_rename(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let state = self.session_rename.as_ref()?;
+        let theme = self.theme.clone();
+        let input = self.session_rename_name_view.clone();
+        let error_row = state.error.clone().map(|error| {
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.danger)
+                .child(error)
+                .into_any_element()
+        });
+        Some(
+            div()
+                .id("session-rename-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(transparent_black())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| this.close_session_rename(window, cx)),
+                )
+                .child(
+                    div()
+                        .id("session-rename")
+                        .w(px(420.0))
+                        .rounded(px(radius::LG))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.elevated)
+                        .shadow(shadow_float(&theme))
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child("重命名会话"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(effibuddy_ui::section_label(&theme, "名称"))
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .px(px(8.0))
+                                        .rounded(px(radius::SM))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.surface)
+                                        .flex()
+                                        .items_center()
+                                        .child(input),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_faint)
+                                        .child("最多 120 个字符；不会改变会话的排序时间。"),
+                                ),
+                        )
+                        .children(error_row)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    Button::new("session-rename-cancel", "取消", &theme)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_session_rename(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("session-rename-save", "保存", &theme)
+                                        .variant(ButtonVariant::Primary)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_session_rename(None, window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Popover for a project's "more" button: new task, folder management,
+    /// per-root reveal, collapse/expand and removal.
     fn render_project_menu(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let project = self.project_menu.project.clone()?;
+        let target = self.project_menu.target.clone()?;
         let position = self.project_menu.position?;
         let theme = self.theme.clone();
-        let name = project_display_name(&project);
+        let name = target.name.clone();
         let initial = name
             .chars()
             .next()
             .map(|character| character.to_uppercase().to_string())
             .unwrap_or_default();
-        let color = project_color(&theme, &project);
-        let key = project_group_key(&project);
+        let color = project_color(&theme, &target.key);
+        let key = target.key.clone();
         let collapsed = self.sidebar_section_collapsed(&key);
-        let path_text = project.display().to_string();
-        let project_for_new = project.clone();
-        let project_for_reveal = project.clone();
-        let project_for_remove = project.clone();
-        let path_for_copy = path_text.clone();
+        let primary = target
+            .primary()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+        let path_text = primary.clone();
+        let path_for_copy = primary;
         let project_in_use = self
             .sessions
             .iter()
             .chain(self.archived_sessions.iter())
-            .any(|summary| summary.project.as_deref() == Some(project.as_path()));
+            .any(|summary| {
+                self.project_group_for_summary(summary)
+                    .is_some_and(|group| group.key == key)
+            });
+        let project_id_for_new = target.id.clone();
+        let project_primary_for_new = target.primary().map(Path::to_path_buf);
+        let project_id_for_edit = target.id.clone();
+        let project_id_for_remove = target.id.clone();
+        let project_name = name.clone();
+
+        // One reveal row per folder so multi-root projects open the right one.
+        let mut reveal_rows: Vec<AnyElement> = Vec::new();
+        for (index, root) in target.roots.iter().enumerate() {
+            let label = if target.roots.len() > 1 {
+                format!("打开：{}", project_default_name(root))
+            } else {
+                "在文件管理器中打开".to_string()
+            };
+            let root = root.clone();
+            reveal_rows.push(
+                div()
+                    .id(SharedString::from(format!("project-menu-reveal-{index}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(30.0))
+                    .px(px(7.0))
+                    .rounded(px(radius::XS))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.hover))
+                    .child(
+                        svg()
+                            .path(icons::FOLDER)
+                            .size(px(12.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(12.0))
+                            .text_color(theme.text)
+                            .child(label),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.reveal_project_folder(&root, cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         Some(
             div()
@@ -4793,7 +6469,15 @@ impl AppView {
                                                         .truncate()
                                                         .text_size(px(9.5))
                                                         .text_color(theme.text_faint)
-                                                        .child(path_text),
+                                                        .child(if target.roots.len() > 1 {
+                                                            format!(
+                                                                "{}  ·  {} 个文件夹",
+                                                                path_text,
+                                                                target.roots.len()
+                                                            )
+                                                        } else {
+                                                            path_text.clone()
+                                                        }),
                                                 ),
                                         ),
                                 )
@@ -4807,31 +6491,37 @@ impl AppView {
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, window, cx| {
-                                            let project = project_for_new.clone();
+                                            let project_id = project_id_for_new.clone();
+                                            let primary = project_primary_for_new.clone();
                                             this.project_menu = ProjectMenuState::default();
-                                            this.new_session_in_project(Some(project), window, cx);
+                                            this.new_session_in_project(
+                                                project_id, primary, window, cx,
+                                            );
                                         },
                                     )),
                                 )
-                                .child(
-                                    project_menu_row(
-                                        &theme,
-                                        "project-menu-reveal",
-                                        icons::FOLDER,
-                                        "在文件管理器中打开",
+                                .when_some(project_id_for_edit, |element, id| {
+                                    element.child(
+                                        project_menu_row(
+                                            &theme,
+                                            "project-menu-edit",
+                                            icons::EDIT,
+                                            "管理文件夹…",
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.open_project_editor(&id, window, cx);
+                                            }),
+                                        ),
                                     )
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.reveal_project_folder(&project_for_reveal, cx);
-                                        },
-                                    )),
-                                )
+                                })
+                                .children(reveal_rows)
                                 .child(
                                     project_menu_row(
                                         &theme,
                                         "project-menu-copy",
                                         icons::COPY,
-                                        "复制项目路径",
+                                        "复制主文件夹路径",
                                     )
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
@@ -4874,27 +6564,25 @@ impl AppView {
                                             project_menu_row(
                                                 &theme,
                                                 "project-menu-remove",
-                                                icons::X,
+                                                icons::TRASH,
                                                 "从项目列表移除",
                                             )
                                             .on_click(
                                                 cx.listener(move |this, _, _, cx| {
-                                                    this.config.projects.retain(|candidate| {
-                                                        candidate != &project_for_remove
-                                                    });
-                                                    this.config.sidebar_collapsed_sections.retain(
-                                                        |group| {
-                                                            group
-                                                                != &project_group_key(
-                                                                    &project_for_remove,
-                                                                )
-                                                        },
-                                                    );
-                                                    let _ = this.config.save();
+                                                    if let Some(id) = &project_id_for_remove {
+                                                        if this.projects.remove(id) {
+                                                            let _ = this.projects.save();
+                                                        }
+                                                        let id_key = project_group_key(id);
+                                                        this.config
+                                                            .sidebar_collapsed_sections
+                                                            .retain(|group| group != &id_key);
+                                                        let _ = this.config.save();
+                                                    }
                                                     this.project_menu = ProjectMenuState::default();
                                                     this.notice = Some(format!(
-                                                        "已移除工作区：{}",
-                                                        project_display_name(&project_for_remove)
+                                                        "已从项目列表移除：{}",
+                                                        project_name
                                                     ));
                                                     cx.notify();
                                                 }),
@@ -4915,49 +6603,337 @@ impl AppView {
         )
     }
 
-    fn render_sidebar(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// Centered folder editor for one project: rename, add/remove folders and
+    /// choose the primary folder that new sessions start in.
+    fn render_project_editor(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let editor = self.project_editor.clone()?;
+        let theme = self.theme.clone();
+        let mut root_rows: Vec<AnyElement> = Vec::new();
+        for (index, root) in editor.roots.iter().enumerate() {
+            let is_primary = editor.primary.as_deref() == Some(root.as_path());
+            let root_for_remove = root.clone();
+            let root_for_primary = root.clone();
+            root_rows.push(
+                div()
+                    .id(SharedString::from(format!("project-editor-root-{index}")))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .min_h(px(38.0))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(radius::XS))
+                    .bg(theme.sidebar)
+                    .child(
+                        svg()
+                            .path(icons::FOLDER)
+                            .size(px(13.0))
+                            .text_color(theme.text_faint),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.0))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text)
+                                    .child(project_default_name(root)),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(9.5))
+                                    .text_color(theme.text_faint)
+                                    .child(root.display().to_string()),
+                            ),
+                    )
+                    .when(is_primary, |element| {
+                        element.child(
+                            div()
+                                .flex_none()
+                                .rounded(px(999.0))
+                                .bg(theme.accent_soft)
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .text_size(px(9.0))
+                                .text_color(theme.accent)
+                                .child("主文件夹"),
+                        )
+                    })
+                    .when(!is_primary, |element| {
+                        element.child(
+                            sidebar_icon_button(
+                                &theme,
+                                SharedString::from(format!("project-editor-primary-{index}")),
+                                icons::PIN,
+                                theme.text_faint,
+                                "设为主文件夹",
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.project_editor_make_primary(&root_for_primary, cx);
+                                },
+                            )),
+                        )
+                    })
+                    .child(
+                        sidebar_icon_button(
+                            &theme,
+                            SharedString::from(format!("project-editor-remove-{index}")),
+                            icons::X,
+                            theme.text_faint,
+                            "移除文件夹",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.project_editor_remove_root(&root_for_remove, cx);
+                        })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let name_input = self.project_editor_name_view.clone();
+        let error_row = editor.error.clone().map(|error| {
+            div()
+                .text_size(px(11.0))
+                .text_color(theme.danger)
+                .child(error)
+                .into_any_element()
+        });
+        Some(
+            div()
+                .id("project-editor-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(transparent_black())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_project_editor(cx)),
+                )
+                .child(
+                    div()
+                        .id("project-editor")
+                        .w(px(460.0))
+                        .max_h(px(560.0))
+                        .rounded(px(radius::LG))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.elevated)
+                        .shadow(shadow_float(&theme))
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .text_size(px(14.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child("项目文件夹"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(effibuddy_ui::section_label(&theme, "名称"))
+                                .child(
+                                    div()
+                                        .h(px(34.0))
+                                        .px(px(8.0))
+                                        .rounded(px(radius::SM))
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .bg(theme.surface)
+                                        .flex()
+                                        .items_center()
+                                        .child(name_input),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(effibuddy_ui::section_label(&theme, "文件夹"))
+                                .child(div().flex().flex_col().gap(px(4.0)).children(root_rows)),
+                        )
+                        .child(
+                            project_menu_row(
+                                &theme,
+                                "project-editor-add",
+                                icons::PLUS,
+                                "添加文件夹…",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.project_editor_add_folders(cx);
+                            })),
+                        )
+                        .children(error_row)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    Button::new("project-editor-cancel", "取消", &theme)
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_project_editor(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("project-editor-save", "保存", &theme)
+                                        .variant(ButtonVariant::Primary)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.save_project_editor(window, cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// 取（或创建）某会话行的跑马灯状态。
+    fn sidebar_marquee(&self, id: &str) -> Rc<RefCell<SessionMarquee>> {
+        self.sidebar_marquees
+            .borrow_mut()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// 指针进出会话行：推进跑马灯状态机并触发重绘。
+    fn sidebar_marquee_hover(&mut self, id: &str, entered: bool, cx: &mut Context<Self>) {
+        if reduce_motion() {
+            return;
+        }
+        let marquee = self.sidebar_marquee(id);
+        if entered {
+            marquee.borrow_mut().pointer_enter();
+        } else {
+            marquee.borrow_mut().pointer_leave();
+        }
+        cx.notify();
+    }
+
+    /// 是否有会话行处于播放/收尾，需要逐帧重绘。
+    fn sidebar_marquee_animating(&self) -> bool {
+        self.sidebar_marquees
+            .borrow()
+            .values()
+            .any(|marquee| marquee.borrow().is_animating())
+    }
+
+    /// 计算一行会话名本帧的跑马灯绘制参数，同时推进状态机时钟。
+    fn sidebar_marquee_frame(
+        &self,
+        window: &Window,
+        theme: &Theme,
+        summary: &SessionSummary,
+        active: bool,
+    ) -> SessionMarqueeFrame {
+        let mut frame = SessionMarqueeFrame {
+            overflow: false,
+            offset: 0.0,
+            left_fade: 0.0,
+        };
+        let title_w = measured_line_width(
+            window,
+            &summary.title,
+            theme.ui_font(),
+            if active {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::NORMAL
+            },
+            SESSION_TITLE_SIZE,
+        );
+        frame.overflow = title_w > session_title_viewport_w();
+        if !frame.overflow || reduce_motion() {
+            // 不再溢出（或遵循减弱动效）：回静止态，避免帧泵空转。
+            self.sidebar_marquee(&summary.id).borrow_mut().reset();
+            return frame;
+        }
+        let distance = title_w + SESSION_MARQUEE_GAP;
+        let marquee = self.sidebar_marquee(&summary.id);
+        let mut marquee = marquee.borrow_mut();
+        marquee.distance.set(distance);
+        marquee.advance(distance, Instant::now());
+        match marquee.frame(distance, Instant::now()) {
+            MarqueeTick::None => {}
+            MarqueeTick::Play { offset } => {
+                frame.offset = offset;
+                frame.left_fade = SESSION_TITLE_FADE_W;
+            }
+            MarqueeTick::Retract { progress } => {
+                frame.left_fade = SESSION_TITLE_FADE_W * (1.0 - ease_out_cubic(progress));
+            }
+        }
+        frame
+    }
+
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let motion = self.motion.clone();
         let scroll_entity = cx.entity().downgrade();
         let active_id = self.active_id();
         let running = self.active_run.is_some();
-        let workspace = self.config.workspace();
-        let workspace_label = workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| workspace.display().to_string());
-        let workspace_path = workspace.display().to_string();
-        // Partition once; each group keeps the store's updated-at order, and
-        // projects appear in order of their most recent conversation.
+        let (workspace_label, workspace_path) = self.sidebar_workspace_label();
+        // Partition once; groups are keyed by project id (legacy session paths
+        // resolve through the project roots). Projects appear in order of their
+        // most recent conversation; registered projects without sessions stay
+        // visible after them.
         let mut pinned: Vec<&SessionSummary> = Vec::new();
-        let mut projects: Vec<(PathBuf, Vec<&SessionSummary>)> = Vec::new();
+        let mut projects: Vec<(ProjectGroup, Vec<&SessionSummary>)> = Vec::new();
         let mut tasks: Vec<&SessionSummary> = Vec::new();
         for summary in &self.sessions {
             if summary.pinned {
                 pinned.push(summary);
                 continue;
             }
-            match &summary.project {
-                Some(project) => {
-                    if let Some((_, group)) = projects
+            match self.project_group_for_summary(summary) {
+                Some(group) => {
+                    if let Some((_, members)) = projects
                         .iter_mut()
-                        .find(|(candidate, _)| candidate == project)
+                        .find(|(candidate, _)| candidate.key == group.key)
                     {
-                        group.push(summary);
+                        members.push(summary);
                     } else {
-                        projects.push((project.clone(), vec![summary]));
+                        projects.push((group, vec![summary]));
                     }
                 }
                 None => tasks.push(summary),
             }
         }
-        // Manually registered workspaces stay visible before their first task
-        // exists. Projects that own sessions already came from the scan above.
-        for project in &self.config.projects {
-            if !projects.iter().any(|(candidate, _)| candidate == project) {
-                projects.push((project.clone(), Vec::new()));
+        for project in self.projects.projects() {
+            let key = project_group_key(&project.id);
+            if !projects.iter().any(|(group, _)| group.key == key) {
+                projects.push((
+                    ProjectGroup {
+                        id: Some(project.id.clone()),
+                        key,
+                        name: project.name.clone(),
+                        roots: project.root_paths(),
+                    },
+                    Vec::new(),
+                ));
             }
         }
 
@@ -4973,11 +6949,11 @@ impl AppView {
             SharedString::from("project-add-workspace"),
             icons::PLUS,
             theme.text_faint,
-            "添加工作区",
+            "新建项目（可多选文件夹）",
         )
         .on_click(cx.listener(|this, _, _, cx| {
             cx.stop_propagation();
-            this.pick_project_folder(cx);
+            this.pick_project_folders(cx);
         }))
         .into_any_element();
 
@@ -5001,7 +6977,7 @@ impl AppView {
                 .into_any_element(),
             );
             if !pinned_collapsed {
-                for summary in &pinned {
+                for (stagger_ix, summary) in pinned.iter().enumerate() {
                     rows.push(motion_session_row(
                         &motion,
                         theme,
@@ -5009,6 +6985,13 @@ impl AppView {
                         active_id.as_deref() == Some(summary.id.as_str()),
                         true,
                         false,
+                        self.sidebar_marquee_frame(
+                            window,
+                            theme,
+                            summary,
+                            active_id.as_deref() == Some(summary.id.as_str()),
+                        ),
+                        stagger_ix,
                         cx,
                     ));
                 }
@@ -5041,13 +7024,13 @@ impl AppView {
                             .py(px(5.0))
                             .text_size(px(10.5))
                             .text_color(theme.text_faint)
-                            .child("暂无项目，点击右上角 + 添加工作区"),
+                            .child("暂无项目，点击右上角 + 新建项目"),
                     )
                     .into_any_element(),
                 );
             }
             for (project, group) in &projects {
-                let project_key = project_group_key(project);
+                let project_key = project.key.clone();
                 let collapsed = self.sidebar_section_collapsed(&project_key);
                 let header_hover = preview_header_pending;
                 preview_header_pending = false;
@@ -5075,7 +7058,7 @@ impl AppView {
                             .into_any_element(),
                         );
                     }
-                    for summary in group {
+                    for (stagger_ix, summary) in group.iter().enumerate() {
                         let row_hover = preview_row_pending && !header_hover;
                         if row_hover {
                             preview_row_pending = false;
@@ -5087,6 +7070,13 @@ impl AppView {
                             active_id.as_deref() == Some(summary.id.as_str()),
                             false,
                             row_hover,
+                            self.sidebar_marquee_frame(
+                                window,
+                                theme,
+                                summary,
+                                active_id.as_deref() == Some(summary.id.as_str()),
+                            ),
+                            stagger_ix,
                             cx,
                         ));
                     }
@@ -5126,7 +7116,7 @@ impl AppView {
                 );
             } else {
                 let mut preview_task_pending = self.preview_sidebar_hover && projects.is_empty();
-                for summary in &tasks {
+                for (stagger_ix, summary) in tasks.iter().enumerate() {
                     let row_hover = preview_task_pending;
                     preview_task_pending = false;
                     rows.push(motion_session_row(
@@ -5136,6 +7126,13 @@ impl AppView {
                         active_id.as_deref() == Some(summary.id.as_str()),
                         false,
                         row_hover,
+                        self.sidebar_marquee_frame(
+                            window,
+                            theme,
+                            summary,
+                            active_id.as_deref() == Some(summary.id.as_str()),
+                        ),
+                        stagger_ix,
                         cx,
                     ));
                 }
@@ -5245,62 +7242,79 @@ impl AppView {
             )
             .child(divider(theme))
             .child(
-                div().px_4().py_3().flex().flex_col().child(
-                    div()
-                        .id("sidebar-workspace")
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .h(px(26.0))
-                        .text_size(px(11.5))
-                        .text_color(theme.text_muted)
-                        .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
-                        .child(
-                            svg()
-                                .path(icons::FOLDER)
-                                .size(px(13.0))
-                                .text_color(theme.text_faint),
-                        )
-                        .child(div().flex_1().min_w(px(0.0)).truncate().child(workspace_label)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            IconButton::new(
-                                "theme-toggle",
-                                if theme.is_dark() {
-                                    icons::SUN
-                                } else {
-                                    icons::MOON
-                                },
-                                theme,
+                div()
+                    .px_4()
+                    .py_3()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("sidebar-workspace")
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .h(px(26.0))
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted)
+                            .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
+                            .child(
+                                svg()
+                                    .path(icons::FOLDER)
+                                    .size(px(13.0))
+                                    .text_color(theme.text_faint),
                             )
-                            .size(28.0, 14.0)
-                            .tooltip("切换主题 (Ctrl+Shift+T)")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
-                        )
-                        .child(
-                            Button::new("settings", "设置", theme)
-                                .icon(icons::SETTINGS)
-                                .size(ButtonSize::Sm)
-                                .variant(ButtonVariant::Ghost)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_settings(window, cx)
-                                })),
-                        )
-                        .when(running, |element| {
-                            element.child(
+                            .child(
                                 div()
                                     .flex_1()
-                                    .flex()
-                                    .justify_end()
-                                    .child(Spinner::new(theme.accent, 12.0)),
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .child(workspace_label),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                IconButton::new(
+                                    "theme-toggle",
+                                    if theme.is_dark() {
+                                        icons::SUN
+                                    } else {
+                                        icons::MOON
+                                    },
+                                    theme,
+                                )
+                                .size(28.0, 14.0)
+                                .tooltip("切换主题 (Ctrl+Shift+T)")
+                                .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
                             )
-                        }),
-                ),
+                            .child(
+                                Button::new("settings", "设置", theme)
+                                    .icon(icons::SETTINGS)
+                                    .size(ButtonSize::Sm)
+                                    .variant(ButtonVariant::Ghost)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_settings(window, cx)
+                                    })),
+                            )
+                            // Spacer pins the donation entry to the far right,
+                            // so the running spinner never pushes it around.
+                            .child(div().flex_1())
+                            .when(running, |element| {
+                                element.child(Spinner::new(theme.accent, 12.0))
+                            })
+                            .child(
+                                IconButton::new("reward", icons::HEART, theme)
+                                    .size(28.0, 14.0)
+                                    .tooltip("为开发者打赏")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.reward_open = true;
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -5413,6 +7427,34 @@ impl AppView {
             });
         }
 
+        // Turn 展开高度渐显：进度在渲染期按时刻计算，需要逐帧重绘（主会话
+        // 与侧栏子代理会话共用同一个泵标记）。
+        let turn_height_animating = self.chat.turn_height_animating()
+            || self
+                .side
+                .agent_views
+                .values()
+                .any(|view| view.chat.turn_height_animating());
+        if turn_height_animating && !self.chat.turn_height_frame_scheduled {
+            self.chat.turn_height_frame_scheduled = true;
+            cx.on_next_frame(window, |this, _, cx| {
+                this.chat.turn_height_frame_scheduled = false;
+                cx.notify();
+            });
+        }
+
+        // 会话名跑马灯：播放/收尾期间逐帧重绘；顺带清理已不存在会话的行状态。
+        self.sidebar_marquees
+            .borrow_mut()
+            .retain(|id, _| self.sessions.iter().any(|summary| summary.id.as_str() == id));
+        if self.sidebar_marquee_animating() && !self.sidebar_marquee_scheduled {
+            self.sidebar_marquee_scheduled = true;
+            cx.on_next_frame(window, |this, _, cx| {
+                this.sidebar_marquee_scheduled = false;
+                cx.notify();
+            });
+        }
+
         if self.chat_dirty {
             let approval = self.pending_approvals.first();
             let run = RunSnapshot {
@@ -5434,7 +7476,7 @@ impl AppView {
         }
         self.chat.sync_scroll();
 
-        let (title, message_count, current_todo, usage) = {
+        let (title, message_count, current_todo) = {
             let session = lock_session(&shared);
             (
                 session.display_title(),
@@ -5444,7 +7486,6 @@ impl AppView {
                     .iter()
                     .find(|todo| todo.status == TodoStatus::InProgress)
                     .map(|todo| todo.content.clone()),
-                session.usage.clone(),
             )
         };
         let show_empty = message_count == 0 && self.last_error.is_none() && self.notice.is_none();
@@ -5458,41 +7499,24 @@ impl AppView {
             .pending_approvals
             .iter()
             .any(|pending| pending.agent_id.is_none());
-        let resolved = self.active_resolved_model();
-        let demo_mode = self.models.demo_mode(self.config.use_demo, &resolved);
-        let context_window = if demo_mode {
-            64_000
-        } else {
-            resolved.context_window()
-        };
-        let context_pct = (usage.last_prompt_tokens as f64 / context_window.max(1) as f64 * 100.0)
-            .clamp(0.0, 99.9);
-        let capsule_target = if running_agents > 0 {
-            SidePaneTab::agents()
-        } else {
-            SidePaneTab::plan()
-        };
-        let (capsule_icon, capsule_text, capsule_tone) = if running_agents > 0 {
-            (
+        // 标题栏只保留输入框没有的状态（子代理 / 批准 / 当前任务）；上下文
+        // 占用与模型选择统一收敛到输入框，避免两处重复展示。
+        let capsule = if running_agents > 0 {
+            Some((
+                SidePaneTab::agents(),
                 icons::SPARKLES,
                 format!("{running_agents} 个子代理运行中"),
                 theme.agent_blue,
-            )
+            ))
         } else if waiting_main {
-            (icons::ALERT, "等待你的批准".to_string(), theme.warning)
-        } else if let Some(todo) = current_todo {
-            (icons::CLOCK, todo, theme.text_muted)
+            Some((
+                SidePaneTab::overview(),
+                icons::ALERT,
+                "等待你的批准".to_string(),
+                theme.warning,
+            ))
         } else {
-            (
-                icons::CLOCK,
-                format!("上下文 {context_pct:.0}%"),
-                theme.text_faint,
-            )
-        };
-        let model_label = if demo_mode {
-            "DEMO".to_string()
-        } else {
-            resolved.model_label().to_string()
+            current_todo.map(|todo| (SidePaneTab::overview(), icons::CLOCK, todo, theme.text_muted))
         };
 
         let update_banner = self.render_update_banner(cx);
@@ -5534,72 +7558,35 @@ impl AppView {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(
-                        div()
-                            .id("status-capsule")
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .h(px(26.0))
-                            .px(px(9.0))
-                            .rounded(px(999.0))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.surface)
-                            .cursor_pointer()
-                            .hover(|style| style.bg(theme.surface_alt))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_sidebar_kind(capsule_target.clone(), cx);
-                            }))
-                            .child(
-                                svg()
-                                    .path(capsule_icon)
-                                    .size(px(12.0))
-                                    .text_color(capsule_tone),
-                            )
-                            .child(
-                                div()
-                                    .max_w(px(190.0))
-                                    .truncate()
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .child(capsule_text),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("header-model")
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .h(px(26.0))
-                            .px(px(9.0))
-                            .rounded(px(999.0))
-                            .bg(theme.surface_alt)
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted)
-                            .cursor_pointer()
-                            .tooltip(effibuddy_ui::tooltip(&theme, "切换模型"))
-                            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                                this.open_model_menu(event.position(), cx);
-                            }))
-                            .child(div().flex_none().size(px(6.0)).rounded(px(999.0)).bg(
-                                if demo_mode {
-                                    theme.warning
-                                } else if resolved.live {
-                                    theme.success
-                                } else {
-                                    theme.warning
-                                },
-                            ))
-                            .child(model_label)
-                            .child(
-                                svg()
-                                    .path(icons::CHEVRON_DOWN)
-                                    .size(px(10.0))
-                                    .text_color(theme.text_faint),
-                            ),
-                    )
+                    .when_some(capsule, |element, (target, icon, text, tone)| {
+                        element.child(
+                            div()
+                                .id("status-capsule")
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .h(px(26.0))
+                                .px(px(9.0))
+                                .rounded(px(999.0))
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.surface)
+                                .cursor_pointer()
+                                .hover(|style| style.bg(theme.surface_alt))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_sidebar_kind(target.clone(), cx);
+                                }))
+                                .child(svg().path(icon).size(px(12.0)).text_color(tone))
+                                .child(
+                                    div()
+                                        .max_w(px(190.0))
+                                        .truncate()
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .child(text),
+                                ),
+                        )
+                    })
                     .child(
                         IconButton::new("toggle-panel", icons::PANEL_RIGHT, &theme)
                             .size(28.0, 15.0)
@@ -5622,7 +7609,7 @@ impl AppView {
                 .into_any_element()
         } else {
             let agent_cards = self.agent_cards();
-            let view = Rc::new(self.chat.prepare_frame(
+            let mut view = self.chat.prepare_frame(
                 self.active_run.is_some(),
                 true,
                 &self.expanded_reasoning,
@@ -5630,7 +7617,9 @@ impl AppView {
                 &self.expanded_turns,
                 &self.collapsed_turns,
                 &agent_cards,
-            ));
+            );
+            view.jump_flash = self.jump_flash.clone();
+            let view = Rc::new(view);
             let state = self.chat.list_state.clone();
             let entity = cx.entity().downgrade();
             let item_theme = theme.clone();
@@ -5638,20 +7627,26 @@ impl AppView {
                 render_chat_item(index, &view, &item_theme, &entity)
             });
 
-            // Painted last so its capture-phase wheel listener runs after the
-            // nested claim overlays: anything the reasoning bodies and code
-            // panels don't claim becomes glide input for the chat list.
-            let wheel_entity = cx.entity().downgrade();
             let mut container = div()
                 .flex_1()
                 .min_h(px(0.0))
                 .relative()
-                .child(rows.size_full())
-                .child(
-                    crate::chat::chat_wheel_interceptor(wheel_entity)
-                        .absolute()
-                        .inset_0(),
-                );
+                .child(rows.size_full());
+            // The rail is painted before the wheel interceptor so its own
+            // capture-phase wheel claim runs first; clicks still land on the
+            // rows because the interceptor has no hitbox.
+            if let Some(rail) = self.render_prompt_rail(window, cx) {
+                container = container.child(rail);
+            }
+            // Painted last so its capture-phase wheel listener runs after the
+            // nested claim overlays: anything the reasoning bodies and code
+            // panels don't claim becomes glide input for the chat list.
+            let wheel_entity = cx.entity().downgrade();
+            container = container.child(
+                crate::chat::chat_wheel_interceptor(wheel_entity)
+                    .absolute()
+                    .inset_0(),
+            );
             if !self.chat.pinned() {
                 container = container.child(render_scroll_to_bottom(
                     &theme,
@@ -5670,15 +7665,159 @@ impl AppView {
             container.into_any_element()
         };
 
+        let drop_highlight = theme.accent_soft.opacity(0.15);
         div()
             .size_full()
             .flex()
             .flex_col()
+            // The whole conversation accepts OS file drops, not only the
+            // composer card; the card's own handler wins when the pointer is
+            // over it (`stop_propagation`).
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                style.bg(drop_highlight)
+            })
+            .on_drop(cx.listener(
+                |this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.attach_paths(paths.paths().to_vec(), cx);
+                    this.composer_focus_handle(cx).focus(window);
+                },
+            ))
             .child(header)
             .children(update_banner)
             .child(body)
             .child(self.render_composer(window, cx))
             .into_any_element()
+    }
+
+    /// Build the left-edge query rail for this frame, or `None` when the
+    /// transcript has no queries / the viewport is not measured yet.
+    fn render_prompt_rail(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let marks = self.chat.prompt_marks();
+        let Some(metrics) = self.chat.prompt_rail_metrics() else {
+            // The list viewport is measured during layout, so the first frame
+            // of a session (and the first after a resize) has no bounds yet.
+            // Ask for exactly one more frame instead of waiting for unrelated
+            // input to repaint the rail into existence.
+            if !marks.is_empty() && !self.prompt_rail_frame_scheduled {
+                let bounds = self.chat.list_state.viewport_bounds();
+                if bounds.size.height <= px(0.0) || bounds.size.width <= px(0.0) {
+                    self.prompt_rail_frame_scheduled = true;
+                    cx.on_next_frame(window, |this, _, cx| {
+                        this.prompt_rail_frame_scheduled = false;
+                        cx.notify();
+                    });
+                }
+            }
+            return None;
+        };
+        let active = self.chat.active_prompt_index().unwrap_or(0);
+        if self.prompt_rail.follow(active, &metrics) {
+            // The rail moved under a possibly stationary pointer; its old row
+            // no longer sits under the cursor, so drop the hover/card instead
+            // of leaving them attached to a bar that scrolled away.
+            self.prompt_rail.previous_hover = None;
+            self.prompt_rail.hover = None;
+            self.prompt_rail.card = None;
+            self.prompt_rail.hover_seq = self.prompt_rail.hover_seq.wrapping_add(1);
+        }
+        let entity = cx.entity().downgrade();
+        Some(render_prompt_rail_element(
+            &self.theme,
+            &marks,
+            &self.prompt_rail,
+            &metrics,
+            active,
+            &entity,
+        ))
+    }
+
+    /// Hovering a rail row widens its bar immediately; the preview card waits
+    /// for a short dwell so sweeping down the rail does not flicker cards.
+    pub(crate) fn prompt_rail_hover(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if self.prompt_rail.hover == index {
+            return;
+        }
+        self.prompt_rail.previous_hover = self.prompt_rail.hover;
+        self.prompt_rail.hover = index;
+        self.prompt_rail.hover_seq = self.prompt_rail.hover_seq.wrapping_add(1);
+        let Some(index) = index else {
+            self.prompt_rail.card = None;
+            cx.notify();
+            return;
+        };
+        let seq = self.prompt_rail.hover_seq;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor().timer(PROMPT_RAIL_CARD_DELAY).await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.prompt_rail.hover == Some(index) && this.prompt_rail.hover_seq == seq {
+                    this.prompt_rail.card = Some(index);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Jump to a query. `ChatList::jump_to_prompt` already resolved the slot,
+    /// so this is a single `scroll_to`; the flash ring confirms the landing.
+    pub(crate) fn prompt_rail_click(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(message_id) = self.chat.jump_to_prompt(index) else {
+            return;
+        };
+        self.jump_flash_seq = self.jump_flash_seq.wrapping_add(1);
+        let seq = self.jump_flash_seq;
+        self.jump_flash = Some(JumpFlash {
+            message_id,
+            seq,
+        });
+        // The ring fades out on its own; drop the state one beat later so a
+        // reduced-motion static ring (and the removed element) cannot linger.
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1200))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                if this
+                    .jump_flash
+                    .as_ref()
+                    .is_some_and(|flash| flash.seq == seq)
+                {
+                    this.jump_flash = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        self.prompt_rail.card = None;
+        self.prompt_rail.hover_seq = self.prompt_rail.hover_seq.wrapping_add(1);
+        cx.notify();
+    }
+
+    /// Wheel over the rail scrolls the rail itself (claiming the event before
+    /// the chat interceptor) and drops the hover card, like ZCode's navigator.
+    pub(crate) fn prompt_rail_wheel(&mut self, pixel_y: f32, cx: &mut Context<Self>) -> bool {
+        let Some(metrics) = self.chat.prompt_rail_metrics() else {
+            return false;
+        };
+        if metrics.max_scroll <= 0.0 {
+            return false;
+        }
+        let next = (self.prompt_rail.scroll - pixel_y).clamp(0.0, metrics.max_scroll);
+        if (next - self.prompt_rail.scroll).abs() < 0.01 {
+            return false;
+        }
+        self.prompt_rail.scroll = next;
+        self.prompt_rail.previous_hover = self.prompt_rail.hover;
+        self.prompt_rail.hover = None;
+        self.prompt_rail.hover_seq = self.prompt_rail.hover_seq.wrapping_add(1);
+        self.prompt_rail.card = None;
+        cx.notify();
+        true
     }
 
     fn render_empty_chat(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -5833,7 +7972,8 @@ impl AppView {
     fn render_composer(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let running = self.active_run.is_some();
-        let empty = self.composer_state.read(cx).content().trim().is_empty();
+        let empty = self.composer_state.read(cx).content().trim().is_empty()
+            && !self.composer_has_attachments();
         let focused = self
             .composer_state
             .read(cx)
@@ -5847,14 +7987,11 @@ impl AppView {
         } else {
             resolved.context_window()
         };
-        let context_pct = self
+        let context_usage = self
             .active_shared()
-            .map(|shared| {
-                let session = lock_session(&shared);
-                ((session.usage.last_prompt_tokens as f64) / context_window.max(1) as f64 * 100.0)
-                    .clamp(0.0, 99.9)
-            })
-            .unwrap_or(0.0);
+            .map(|shared| crate::context_meter::collect(&shared, context_window))
+            .unwrap_or_else(|| crate::context_meter::ContextUsage::empty(context_window));
+        let context_pct = context_usage.percent();
 
         let permission_mode = self.permission_mode();
         let (permission_label, permission_color, permission_bg, permission_icon) =
@@ -5937,183 +8074,182 @@ impl AppView {
                 )
         };
 
-        let composer_card = div()
-            .w_full()
-            .max_w(px(760.0))
-            .rounded(px(radius::XL))
-            .border_1()
-            .border_color(if focused {
-                theme.focus_ring
-            } else {
-                theme.border
-            })
-            .bg(theme.surface)
-            .shadow(shadow_float(theme))
-            .pt(px(14.0))
-            .px(px(16.0))
-            .pb(px(12.0))
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .on_mouse_down(MouseButton::Left, {
-                let state = self.composer_state.clone();
-                move |_, window, cx| {
-                    let _ = state.update(cx, |state, _| {
-                        window.focus(&state.focus_handle());
-                    });
-                }
-            })
-            .child(self.composer.clone())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .h(px(34.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                IconButton::new("composer-add", icons::PLUS, theme)
-                                    .size(26.0, 13.0)
-                                    .tooltip("打开命令面板 (Ctrl K)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_palette(window, cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-permission")
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(5.0))
-                                    .h(px(26.0))
-                                    .px(px(9.0))
-                                    .rounded(px(999.0))
-                                    .bg(permission_bg)
-                                    .text_color(permission_color)
-                                    .text_size(px(11.0))
-                                    .cursor_pointer()
-                                    .tooltip(effibuddy_ui::tooltip(
-                                        theme,
-                                        "权限模式 · Shift+Tab 切换",
-                                    ))
-                                    .hover(|style| style.bg(theme.active))
-                                    .on_click(
-                                        cx.listener(|this, _, _, cx| {
+        let drop_theme = theme.clone();
+        let mut composer_card =
+            div()
+                .w_full()
+                .max_w(px(760.0))
+                .rounded(px(radius::XL))
+                .border_1()
+                .border_color(if focused {
+                    theme.focus_ring
+                } else {
+                    theme.border
+                })
+                .bg(theme.surface)
+                .shadow(shadow_float(theme))
+                // Dropping OS files anywhere on the card stages them for the
+                // next message. `drag_over` is re-evaluated every frame from
+                // the active drag, so the highlight cannot stick.
+                .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                    style.bg(drop_theme.accent_soft).border_color(drop_theme.accent)
+                })
+                .on_drop(cx.listener(
+                    |this, paths: &gpui::ExternalPaths, window, cx| {
+                        this.attach_paths(paths.paths().to_vec(), cx);
+                        this.composer_focus_handle(cx).focus(window);
+                    },
+                ))
+                .pt(px(14.0))
+                .px(px(16.0))
+                .pb(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(12.0))
+                .on_mouse_down(MouseButton::Left, {
+                    let state = self.composer_state.clone();
+                    move |_, window, cx| {
+                        let _ = state.update(cx, |state, _| {
+                            window.focus(&state.focus_handle());
+                        });
+                    }
+                });
+        if let Some(chips) = self.render_composer_attachments(cx) {
+            composer_card = composer_card.child(chips);
+        }
+        let composer_card = composer_card
+                .child(self.composer.clone())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .h(px(34.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    IconButton::new("composer-add", icons::PLUS, theme)
+                                        .size(26.0, 13.0)
+                                        .tooltip("添加文件到会话（也可直接拖入）")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_composer_files(cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("composer-permission")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(999.0))
+                                        .bg(permission_bg)
+                                        .text_color(permission_color)
+                                        .text_size(px(11.0))
+                                        .cursor_pointer()
+                                        .tooltip(effibuddy_ui::tooltip(
+                                            theme,
+                                            "权限模式 · Shift+Tab 切换",
+                                        ))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(|this, _, _, cx| {
                                             this.cycle_permission_mode(cx)
-                                        }),
-                                    )
-                                    .child(
-                                        svg()
-                                            .path(permission_icon)
-                                            .size(px(11.0))
-                                            .text_color(permission_color),
-                                    )
-                                    .child(permission_label.to_string())
-                                    .child(
-                                        svg()
-                                            .path(icons::CHEVRON_DOWN)
-                                            .size(px(9.0))
-                                            .text_color(permission_color),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .id("composer-context")
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .h(px(26.0))
-                                    .px(px(9.0))
-                                    .rounded(px(999.0))
-                                    .bg(theme.surface_alt)
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_faint)
-                                    .cursor_pointer()
-                                    .tooltip(effibuddy_ui::tooltip(
-                                        theme,
-                                        "上下文占用 · 点击查看计划面板",
-                                    ))
-                                    .hover(|style| style.bg(theme.active))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.open_sidebar_kind(SidePaneTab::plan(), cx);
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .w(px(26.0))
-                                            .h(px(3.0))
-                                            .rounded(px(999.0))
-                                            .bg(theme.border)
-                                            .child(
-                                                div()
-                                                    .h(px(3.0))
-                                                    .w(px((26.0 * context_pct as f32 / 100.0).max(
-                                                        if context_pct > 0.0 { 1.0 } else { 0.0 },
-                                                    )))
-                                                    .rounded(px(999.0))
-                                                    .bg(if context_pct > 75.0 {
-                                                        theme.warning
-                                                    } else {
-                                                        theme.success
-                                                    }),
-                                            ),
-                                    )
-                                    .child(if context_pct < 10.0 {
-                                        format!("ctx {context_pct:.1}%")
-                                    } else {
-                                        format!("ctx {context_pct:.0}%")
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .id("composer-model")
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .h(px(26.0))
-                                    .px(px(9.0))
-                                    .rounded(px(999.0))
-                                    .bg(theme.surface_alt)
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_muted)
-                                    .cursor_pointer()
-                                    .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
-                                    .hover(|style| style.bg(theme.active))
-                                    .on_click(cx.listener(
-                                        |this, event: &gpui::ClickEvent, _, cx| {
-                                            this.open_model_menu(event.position(), cx);
-                                        },
-                                    ))
-                                    .child(div().size(px(6.0)).rounded(px(999.0)).bg(
-                                        if demo_mode {
-                                            theme.warning
-                                        } else if resolved.live {
-                                            theme.success
-                                        } else {
-                                            theme.warning
-                                        },
-                                    ))
-                                    .child(resolved.model_label().to_string())
-                                    .child(
-                                        svg()
-                                            .path(icons::CHEVRON_DOWN)
-                                            .size(px(10.0))
-                                            .text_color(theme.text_faint),
-                                    ),
-                            )
-                            .child(send),
-                    ),
-            );
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(permission_icon)
+                                                .size(px(11.0))
+                                                .text_color(permission_color),
+                                        )
+                                        .child(permission_label.to_string())
+                                        .child(
+                                            svg()
+                                                .path(icons::CHEVRON_DOWN)
+                                                .size(px(9.0))
+                                                .text_color(permission_color),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id("composer-context")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(26.0))
+                                        .rounded(px(999.0))
+                                        .bg(theme.surface_alt)
+                                        .cursor_pointer()
+                                        .tooltip(crate::context_meter::context_tooltip(
+                                            theme,
+                                            context_usage.clone(),
+                                        ))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_sidebar_kind(SidePaneTab::overview(), cx);
+                                        }))
+                                        // 静止时只给进度环不给百分比；占用构成与累计
+                                        // 消耗都在悬停 tips 里展开。
+                                        .child(
+                                            ProgressRing::new(context_usage.fraction(), 16.0)
+                                                .stroke_width(2.2)
+                                                .track(theme.border_strong)
+                                                .progress(if context_pct > 75.0 {
+                                                    theme.warning
+                                                } else {
+                                                    theme.success
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("composer-model")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(999.0))
+                                        .bg(theme.surface_alt)
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .cursor_pointer()
+                                        .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, _, cx| {
+                                                this.open_model_menu(event.position(), cx);
+                                            },
+                                        ))
+                                        .child(div().size(px(6.0)).rounded(px(999.0)).bg(
+                                            if demo_mode {
+                                                theme.warning
+                                            } else if resolved.live {
+                                                theme.success
+                                            } else {
+                                                theme.warning
+                                            },
+                                        ))
+                                        .child(resolved.model_label().to_string())
+                                        .child(
+                                            svg()
+                                                .path(icons::CHEVRON_DOWN)
+                                                .size(px(10.0))
+                                                .text_color(theme.text_faint),
+                                        ),
+                                )
+                                .child(send),
+                        ),
+                );
 
         let mut column = div()
             .w_full()
@@ -6199,6 +8335,28 @@ impl AppView {
             column = column.child(self.render_queue_bar(cx));
         }
 
+        if self.preview_context_tip {
+            // 预览：把 hover tips 常驻渲染在输入框上方（对齐 context 环一侧），
+            // Wayland 截图验收用；真实交互仍走 tooltip 闭包。
+            column = column.child(
+                div()
+                    .w_full()
+                    .max_w(px(760.0))
+                    .flex()
+                    .justify_end()
+                    .child(cx.new(|_cx| {
+                        crate::context_meter::ContextUsageTip::new(
+                            theme.clone(),
+                            context_usage.clone(),
+                        )
+                    })),
+            );
+        }
+
+        if let Some(menu) = self.render_composer_menu(window, cx) {
+            column = column.child(menu);
+        }
+
         column
             .child(composer_card)
             .child(
@@ -6216,7 +8374,7 @@ impl AppView {
                         theme.text_faint
                     })
                     .child(footer_left)
-                    .child("Ctrl K 命令 · Esc 停止"),
+                    .child("Ctrl K 命令 · / 技能·工具 · @ 文件"),
             )
             .into_any_element()
     }
@@ -6924,6 +9082,119 @@ impl AppView {
             .into_any_element()
     }
 
+    /// Donation entry behind the sidebar heart. The QR code is a raster asset
+    /// in the design system's `AssetSource`, so `img()` loads it by path.
+    fn render_reward_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let backdrop_entity = cx.entity().downgrade();
+        let card = div()
+            .id("reward-dialog")
+            .w(px(396.0))
+            .rounded(px(radius::XL))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.elevated)
+            .shadow(shadow_float(theme))
+            .p(px(18.0))
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .size(px(30.0))
+                            .rounded(px(radius::MD))
+                            .bg(theme.accent_soft)
+                            .child(svg().path(icons::HEART).size(px(15.0)).text_color(theme.text)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child("为开发者打赏"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_faint)
+                                    .child("微信扫一扫，金额随意"),
+                            ),
+                    )
+                    .child(
+                        IconButton::new("reward-close", icons::X, theme)
+                            .size(24.0, 13.0)
+                            .tooltip("关闭 (Esc)")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.reward_open = false;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                // A QR code needs its quiet white field; the image already has
+                // one, the wrapper only rounds the corners.
+                div()
+                    .rounded(px(radius::MD))
+                    .overflow_hidden()
+                    .bg(gpui::white())
+                    .child(img(images::REWARD_QR).w(px(360.0)).h(px(360.0))),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .text_center()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_faint)
+                    .child("感谢你支持 EffiBuddy 与 rein 的开发 · gozaoo"),
+            )
+            .with_animation(
+                "reward-dialog-enter",
+                Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                |element, delta| element.mt(px(4.0 * (1.0 - delta))),
+            );
+
+        div()
+            .id("reward-dialog-backdrop")
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+            .bg(theme.overlay)
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                let _ = backdrop_entity.update(cx, |this, cx| {
+                    this.reward_open = false;
+                    cx.notify();
+                });
+            })
+            .child(card)
+            .with_animation(
+                "reward-dialog-backdrop-enter",
+                Animation::new(overlay_motion_duration()).with_easing(ease_out_cubic),
+                |element, delta| element.opacity(delta),
+            )
+            .into_any_element()
+    }
+
     fn render_palette(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let query = self.palette_query.read(cx).content().to_string();
@@ -7265,14 +9536,23 @@ impl Render for AppView {
                     this.dismiss_edit_conflict(window, cx);
                 } else if this.undo_dialog.is_some() {
                     this.close_undo_dialog(window, cx);
+                } else if this.reward_open {
+                    this.reward_open = false;
+                    cx.notify();
                 } else if this.edit_message.is_some() {
                     this.cancel_edit_message(window, cx);
                 } else if this.palette_open {
                     this.close_palette(window, cx);
                 } else if this.model_menu.open {
                     this.close_model_menu(cx);
-                } else if this.project_menu.project.is_some() {
+                } else if this.project_menu.target.is_some() {
                     this.close_project_menu(cx);
+                } else if this.session_menu.target.is_some() {
+                    this.close_session_menu(cx);
+                } else if this.session_rename.is_some() {
+                    this.close_session_rename(window, cx);
+                } else if this.project_editor.is_some() {
+                    this.close_project_editor(cx);
                 } else if this.settings.model_editor.open {
                     this.close_model_editor(cx);
                 } else if this.view_mode == ViewMode::Graph && this.graph.selected.is_some() {
@@ -7366,6 +9646,15 @@ impl Render for AppView {
             .when_some(self.render_project_menu(window, cx), |element, menu| {
                 element.child(menu)
             })
+            .when_some(self.render_session_menu(window, cx), |element, menu| {
+                element.child(menu)
+            })
+            .when_some(self.render_project_editor(window, cx), |element, editor| {
+                element.child(editor)
+            })
+            .when_some(self.render_session_rename(window, cx), |element, dialog| {
+                element.child(dialog)
+            })
             .when_some(self.render_model_menu(window, cx), |element, menu| {
                 element.child(menu)
             })
@@ -7374,6 +9663,9 @@ impl Render for AppView {
             })
             .when(self.palette_open, |element| {
                 element.child(self.render_palette(window, cx))
+            })
+            .when(self.reward_open, |element| {
+                element.child(self.render_reward_dialog(cx))
             })
             .when(
                 self.undo_dialog.is_some() || self.edit_conflict.is_some(),
@@ -7441,6 +9733,9 @@ impl Drop for AppView {
             if let Ok(save) = self.store.stage(&snapshot) {
                 let _ = self.persist_tx.send(save);
             }
+            // Flush the composer draft synchronously: the debounced writer may
+            // not get another executor turn before the process exits.
+            let _ = self.drafts.save();
         }
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(Duration::from_millis(400));
@@ -7895,24 +10190,42 @@ fn project_menu_row(
         )
 }
 
-/// Stable collapse key for one project group in the sidebar.
-fn project_group_key(project: &Path) -> String {
-    format!("project:{}", project.display())
-}
-
-pub(crate) fn project_display_name(project: &Path) -> String {
-    project
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| project.display().to_string())
+/// One row in a conversation's “more” popover.
+fn session_menu_row(
+    theme: &Theme,
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    danger: bool,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(30.0))
+        .px(px(7.0))
+        .rounded(px(radius::XS))
+        .cursor_pointer()
+        .hover(|style| style.bg(if danger { theme.danger_soft } else { theme.hover }))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(12.0))
+                .text_color(if danger { theme.danger } else { theme.text_muted }),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(if danger { theme.danger } else { theme.text })
+                .child(label),
+        )
 }
 
 /// Deterministic per-project accent, mirroring ZCode's colored program icons.
-fn project_color(theme: &Theme, project: &Path) -> gpui::Hsla {
+fn project_color(theme: &Theme, seed: &str) -> gpui::Hsla {
     let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in project.to_string_lossy().as_bytes() {
+    for byte in seed.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
@@ -7947,6 +10260,9 @@ fn sidebar_icon_button(
 
 /// Collapsible section header (`置顶` / `全部项目` / `任务`). `trailing` holds
 /// an optional action such as the projects section's "添加工作区" button.
+///
+/// 折叠箭头跟在文字右侧（而非行首）；除置顶外，箭头仅在行悬停时出现。
+/// 箭头用 opacity 显隐，占位不变，悬停时行内不会抖动。
 fn sidebar_section_header(
     theme: &Theme,
     group: &'static str,
@@ -7956,8 +10272,11 @@ fn sidebar_section_header(
     trailing: Option<AnyElement>,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
+    let row_group = SharedString::from(format!("sidebar-section-{group}"));
+    let chevron_hover_gated = group != "pinned";
     div()
-        .id(SharedString::from(format!("sidebar-section-{group}")))
+        .id(row_group.clone())
+        .group(row_group.clone())
         .flex()
         .items_center()
         .gap(px(4.0))
@@ -7970,19 +10289,36 @@ fn sidebar_section_header(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.toggle_sidebar_section(group, cx);
         }))
-        .child(disclosure_chevron(
-            SharedString::from(format!("sidebar-chevron-{group}")),
-            !collapsed,
-            theme.text_faint,
-            10.0,
-        ))
         .child(
             div()
                 .flex_1()
-                .text_size(px(10.0))
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text_faint)
-                .child(label),
+                .min_w(px(0.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text_faint)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .opacity(if chevron_hover_gated { 0.0 } else { 1.0 })
+                        .when(chevron_hover_gated, |element| {
+                            element.group_hover(row_group, |style| style.opacity(1.0))
+                        })
+                        .child(disclosure_chevron(
+                            SharedString::from(format!("sidebar-chevron-{group}")),
+                            !collapsed,
+                            theme.text_faint,
+                            10.0,
+                        )),
+                ),
         )
         .child(
             div()
@@ -7994,28 +10330,35 @@ fn sidebar_section_header(
         .into_any_element()
 }
 
-/// Project header: colored program icon + name, with more/new-task actions
+/// Project header: colored avatar + name, with more/new-task actions
 /// revealed on hover. Clicking the row collapses the project.
 fn sidebar_project_header(
     theme: &Theme,
-    project: &Path,
+    project: &ProjectGroup,
     collapsed: bool,
     force_hover: bool,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    let key = project_group_key(project);
+    let key = project.key.clone();
     let row_group = SharedString::from(format!("project-row:{key}"));
-    let name = project_display_name(project);
+    let name = project.name.clone();
     let initial = name
         .chars()
         .next()
         .map(|character| character.to_uppercase().to_string())
         .unwrap_or_default();
-    let color = project_color(theme, project);
-    let project_for_click = project.to_path_buf();
-    let project_for_menu = project.to_path_buf();
-    let project_for_add = project.to_path_buf();
-    let tooltip_text = project.display().to_string();
+    let color = project_color(theme, &project.key);
+    let key_for_click = key.clone();
+    let project_for_menu = project.clone();
+    let project_for_add = project.clone();
+    let tooltip_text = project
+        .roots
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let additional = project.roots.len().saturating_sub(1);
+    let multi_root = project.roots.len() > 1;
 
     div()
         .id(SharedString::from(format!("project-row-{key}")))
@@ -8031,14 +10374,8 @@ fn sidebar_project_header(
         .when(force_hover, |element| element.bg(theme.hover))
         .tooltip(effibuddy_ui::tooltip(theme, tooltip_text))
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.toggle_sidebar_section(&project_group_key(&project_for_click), cx);
+            this.toggle_sidebar_section(&key_for_click, cx);
         }))
-        .child(disclosure_chevron(
-            SharedString::from(format!("project-chevron-{key}")),
-            !collapsed,
-            theme.text_faint,
-            10.0,
-        ))
         .child(
             div()
                 .flex_none()
@@ -8056,16 +10393,45 @@ fn sidebar_project_header(
                         .child(initial),
                 ),
         )
+        // 项目头折叠其会话列表：箭头同样跟在名字文字右侧；名字过长时收缩
+        // 截断，箭头始终可见。
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .truncate()
-                .text_size(px(12.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
-                .child(name),
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(12.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text_muted)
+                        .child(name),
+                )
+                .child(disclosure_chevron(
+                    SharedString::from(format!("project-chevron-{key}")),
+                    !collapsed,
+                    theme.text_faint,
+                    10.0,
+                )),
         )
+        .when(multi_root, |element| {
+            element.child(
+                div()
+                    .flex_none()
+                    .rounded(px(999.0))
+                    .bg(theme.active)
+                    .px(px(5.0))
+                    .py(px(1.0))
+                    .text_size(px(9.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(format!("+{additional}")),
+            )
+        })
         .child(
             div()
                 .flex_none()
@@ -8099,16 +10465,203 @@ fn sidebar_project_header(
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.new_session_in_project(Some(project_for_add.clone()), window, cx);
+                        let project_id = project_for_add.id.clone();
+                        let primary = project_for_add.primary().map(Path::to_path_buf);
+                        this.new_session_in_project(project_id, primary, window, cx);
                     })),
                 ),
         )
         .into_any_element()
 }
 
+/// 展开时新行的渐显 stagger：每行延迟 50ms，封顶 10 行。
+const SESSION_ENTER_STAGGER: Duration = Duration::from_millis(50);
+const SESSION_ENTER_STAGGER_STEPS: usize = 10;
+/// 会话名跑马灯速度（px/s）。视口约 176px，整循环约 5s 起，节奏平缓。
+const SESSION_MARQUEE_SPEED: f32 = 55.0;
+/// 双副本文本条带的副本间隔（px）：循环一周后文本头部在这里停留。
+const SESSION_MARQUEE_GAP: f32 = 24.0;
+/// 会话名遮罩淡出宽度：0.5em @ 12.5px。
+const SESSION_TITLE_FADE_W: f32 = 6.25;
+/// 会话名字号（测量与渲染共用）。
+const SESSION_TITLE_SIZE: f32 = 12.5;
+
+/// 会话名视口宽度。常量与 `sidebar_session_row` 的行布局一一对应：
+/// 侧栏 272 − 列表左右 10×2 − 行左右 4×2 − 置顶钮 18 − 两个行 gap 5×2 −
+/// 时间列 40。改动行布局时同步这里。
+fn session_title_viewport_w() -> f32 {
+    SIDEBAR_WIDTH - 2.0 * 10.0 - 2.0 * 4.0 - 18.0 - 2.0 * 5.0 - 40.0
+}
+
+/// 单次循环时长（秒）：距离 = 文本宽 + 副本间隔。
+fn marquee_cycle_duration(distance: f32) -> f32 {
+    if distance <= 0.0 {
+        0.0
+    } else {
+        distance / SESSION_MARQUEE_SPEED
+    }
+}
+
+/// 一帧的跑马灯绘制参数（随帧变化，渲染期算出）。
+#[derive(Clone, Copy, Debug)]
+struct SessionMarqueeFrame {
+    /// 会话名溢出视口：右缘淡出常显，跑马灯可用。
+    overflow: bool,
+    /// 文本条带的绘制期左移量；0 表示静止。
+    offset: f32,
+    /// 左缘遮罩宽度；0 表示不绘制。
+    left_fade: f32,
+}
+
+/// 状态机某帧的输出。
+#[derive(Clone, Copy)]
+enum MarqueeTick {
+    None,
+    /// 播放中：条带绘制期左移 offset（px）。
+    Play { offset: f32 },
+    /// 收尾：偏移已回 0，左缘遮罩按 progress（0..1）收回。
+    Retract { progress: f32 },
+}
+
+/// 会话行跑马灯状态机。
+///
+/// 状态只在两个时机变更：指针进/出（hover 事件）与 `advance`（每帧渲染
+/// 推进 Finish→Retract→Idle 的时钟）。偏移一律绘制期平移（PaintShift），
+/// 不触碰布局。打断策略：进入播放中的行沿用原周期时钟（偏移连续、不跳
+/// 变）；离开后播完当前周期，回到 left=0（与静止态对齐）再收回遮罩。
+#[derive(Debug, Default)]
+struct SessionMarquee {
+    phase: MarqueePhase,
+    /// 最近一帧的循环距离（文本宽 + 副本间隔）；0 = 未溢出/未测量。
+    distance: Cell<f32>,
+}
+
+#[derive(Debug, Default)]
+enum MarqueePhase {
+    /// 静止：溢出时仅右缘淡出。
+    #[default]
+    Idle,
+    /// 循环播放中。`cycle_start` 是本轮循环起点。
+    Playing { cycle_start: Instant },
+    /// 指针已离开：继续播到下一个 left=0 边界再收尾。
+    Finish { cycle_start: Instant, left_at: Instant },
+    /// 偏移已回 0，左缘遮罩正在收回（150ms ease-out）。
+    Retract { start: Instant },
+}
+
+impl SessionMarquee {
+    fn is_animating(&self) -> bool {
+        !matches!(self.phase, MarqueePhase::Idle)
+    }
+
+    /// 回到静止态（标题不再溢出 / 减弱动效）。
+    fn reset(&mut self) {
+        self.phase = MarqueePhase::Idle;
+    }
+
+    /// 指针进入。播放中/收尾等待时延续原时钟（不打断当前周期）；其余从
+    /// 0 起新周期，与静止态的文本位置对齐。
+    fn pointer_enter(&mut self) {
+        self.phase = match self.phase {
+            MarqueePhase::Playing { cycle_start } | MarqueePhase::Finish { cycle_start, .. } => {
+                MarqueePhase::Playing { cycle_start }
+            }
+            _ => MarqueePhase::Playing {
+                cycle_start: Instant::now(),
+            },
+        };
+    }
+
+    /// 指针离开：播到下一个 left=0 边界再收尾。重复离开只刷新 `left_at`，
+    /// 不重置时钟。
+    fn pointer_leave(&mut self) {
+        if let MarqueePhase::Playing { cycle_start } = self.phase {
+            self.phase = MarqueePhase::Finish {
+                cycle_start,
+                left_at: Instant::now(),
+            };
+        }
+    }
+
+    /// 每帧由渲染调用：把 Finish/Retract 推进到下一相位。
+    fn advance(&mut self, distance: f32, now: Instant) {
+        match self.phase {
+            MarqueePhase::Finish {
+                cycle_start,
+                left_at,
+            } => {
+                let duration = marquee_cycle_duration(distance);
+                if duration <= 0.0 {
+                    return;
+                }
+                // 下一个整数倍周期边界即 left=0。deadline 回溯到边界时刻，
+                // 帧率抖动时收回动画也从正确位置起步。
+                let k = ((left_at - cycle_start).as_secs_f32() / duration).floor() + 1.0;
+                let deadline = cycle_start + Duration::from_secs_f32(duration * k);
+                if now >= deadline {
+                    self.phase = MarqueePhase::Retract { start: deadline };
+                }
+            }
+            MarqueePhase::Retract { start } if now - start >= CONTROL_MOTION => {
+                self.phase = MarqueePhase::Idle;
+            }
+            _ => {}
+        }
+    }
+
+    /// 本帧的输出。
+    fn frame(&self, distance: f32, now: Instant) -> MarqueeTick {
+        match self.phase {
+            MarqueePhase::Idle => MarqueeTick::None,
+            MarqueePhase::Playing { cycle_start } | MarqueePhase::Finish { cycle_start, .. } => {
+                let duration = marquee_cycle_duration(distance);
+                if duration <= 0.0 {
+                    return MarqueeTick::None;
+                }
+                let t = ((now - cycle_start).as_secs_f32() / duration).fract();
+                MarqueeTick::Play {
+                    offset: -distance * t,
+                }
+            }
+            MarqueePhase::Retract { start } => {
+                let t = ((now - start).as_secs_f32() / CONTROL_MOTION.as_secs_f32()).clamp(0.0, 1.0);
+                MarqueeTick::Retract { progress: t }
+            }
+        }
+    }
+}
+
+/// 用文本系统测量单行宽度；`layout_line` 按帧缓存，同一帧内重复测量近似免费。
+fn measured_line_width(
+    window: &Window,
+    text: &str,
+    font_family: &'static str,
+    weight: gpui::FontWeight,
+    font_size: f32,
+) -> f32 {
+    let font = gpui::Font {
+        weight,
+        ..gpui::font(font_family)
+    };
+    let run = gpui::TextRun {
+        len: text.len(),
+        font,
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .layout_line(text, px(font_size), &[run], None)
+        .width
+        .into()
+}
+
 /// One conversation row: title + relative time, with pin and archive actions
 /// revealed on hover. Pinned rows live in the 置顶 section and show the pin
 /// affordance in its active color.
+#[allow(clippy::too_many_arguments)]
 fn motion_session_row(
     motion: &MotionController,
     theme: &Theme,
@@ -8116,11 +10669,18 @@ fn motion_session_row(
     active: bool,
     pinned_group: bool,
     force_hover: bool,
+    marquee: SessionMarqueeFrame,
+    stagger: usize,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let motion_id = SharedString::from(summary.id.clone());
-    let mut row = sidebar_session_row(theme, summary, active, pinned_group, force_hover, cx);
-    if let Some(progress) = motion.enter_progress(&motion_id) {
+    let mut row =
+        sidebar_session_row(theme, summary, active, pinned_group, force_hover, marquee, cx);
+    // 展开时新行按 50ms stagger 渐显。只延迟透明度：下方已存在的行仍然
+    // 立刻位移（不延迟 FLIP），所以新行淡入时不会和滑动中的内容重叠；
+    // stagger 封顶 10 行，长列表末行不会等太久。
+    let delay = SESSION_ENTER_STAGGER * stagger.min(SESSION_ENTER_STAGGER_STEPS) as u32;
+    if let Some(progress) = motion.enter_progress_with_delay(&motion_id, delay) {
         row = row.opacity(progress);
     }
     motion_item(motion, motion_id, row)
@@ -8134,14 +10694,18 @@ fn sidebar_session_row(
     active: bool,
     pinned_group: bool,
     force_hover: bool,
+    marquee: SessionMarqueeFrame,
     cx: &mut Context<AppView>,
 ) -> Stateful<Div> {
     let id = summary.id.clone();
     let title = summary.title.clone();
     let time = relative_time(summary.updated_at);
+    let unread = summary.unread;
     let row_group = SharedString::from(format!("session-row-{}", id));
     let id_for_click = id.clone();
+    let id_for_hover = id.clone();
     let id_for_pin = id.clone();
+    let id_for_more = id.clone();
     let id_for_archive = id.clone();
 
     div()
@@ -8166,6 +10730,10 @@ fn sidebar_session_row(
         .cursor_pointer()
         .on_click(cx.listener(move |this, _, window, cx| {
             this.select_session(&id_for_click, window, cx);
+        }))
+        // 会话名跑马灯：进入播放，离开播完当前周期再收尾。
+        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+            this.sidebar_marquee_hover(&id_for_hover, *hovered, cx);
         }))
         .child(
             sidebar_icon_button(
@@ -8194,41 +10762,75 @@ fn sidebar_session_row(
                 this.toggle_pin(&id_for_pin, cx);
             })),
         )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(12.5))
-                .font_weight(if active {
-                    gpui::FontWeight::MEDIUM
-                } else {
-                    gpui::FontWeight::NORMAL
-                })
-                .text_color(if active { theme.text } else { theme.text_muted })
-                .child(title),
-        )
+        .child(session_title(
+            theme,
+            &title,
+            active,
+            &row_group,
+            marquee,
+        ))
         .child(
             div()
                 .relative()
                 .flex_none()
+                .w(px(40.0))
                 .flex()
                 .items_center()
                 .justify_end()
                 .child(
                     div()
-                        .text_size(px(10.0))
-                        .text_color(theme.text_faint)
+                        .flex()
+                        .items_center()
+                        .justify_end()
                         .when(force_hover, |element| element.opacity(0.0))
                         .group_hover(row_group.clone(), |style| style.opacity(0.0))
-                        .child(time),
+                        .child(if unread {
+                            div()
+                                .id(SharedString::from(format!("unread-dot-{id}")))
+                                .size(px(7.0))
+                                .rounded(px(999.0))
+                                .bg(theme.accent)
+                                .tooltip(effibuddy_ui::tooltip(
+                                    theme,
+                                    format!("未读 · {time}"),
+                                ))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(time)
+                                .into_any_element()
+                        }),
                 )
                 .child(
                     div()
                         .absolute()
                         .right(px(0.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(1.0))
                         .opacity(if force_hover { 1.0 } else { 0.0 })
                         .group_hover(row_group, |style| style.opacity(1.0))
+                        .child(
+                            sidebar_icon_button(
+                                theme,
+                                SharedString::from(format!("more-{id_for_more}")),
+                                icons::MORE,
+                                theme.text_faint,
+                                "更多",
+                            )
+                            .on_click(cx.listener(
+                                move |this, event: &gpui::ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_session_menu(
+                                        &id_for_more,
+                                        event.position(),
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
                         .child(
                             sidebar_icon_button(
                                 theme,
@@ -8246,6 +10848,99 @@ fn sidebar_session_row(
                         ),
                 ),
         )
+}
+
+/// 会话名视口。溢出时右缘常显 0.5em 淡出（GPUI 没有 mask-image，用与行
+/// 背景同色的渐变盖片等效实现）；跑马灯播放时双副本条带经 PaintShift 左
+/// 移循环、两端遮罩；离开后条带播回 left=0，左缘遮罩收回。
+fn session_title(
+    theme: &Theme,
+    title: &str,
+    active: bool,
+    row_group: &SharedString,
+    frame: SessionMarqueeFrame,
+) -> Div {
+    let text_style = |element: Div| {
+        element
+            .text_size(px(SESSION_TITLE_SIZE))
+            .font_weight(if active {
+                gpui::FontWeight::MEDIUM
+            } else {
+                gpui::FontWeight::NORMAL
+            })
+            .text_color(if active { theme.text } else { theme.text_muted })
+    };
+    if !frame.overflow {
+        return text_style(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .child(title.to_string()),
+        );
+    }
+
+    // 遮罩渐变基色必须与行背景一致：静止=侧栏底色，行悬停时经 group_hover
+    // 换成 hover 色，激活行恒为 accent_soft。
+    let fade_base = if active { theme.accent_soft } else { theme.sidebar };
+    let fade_gradient = |base: gpui::Hsla, inward: bool| {
+        let (left, right) = if inward {
+            (base.opacity(0.0), base)
+        } else {
+            (base, base.opacity(0.0))
+        };
+        linear_gradient(90.0, linear_color_stop(left, 0.0), linear_color_stop(right, 1.0))
+    };
+
+    div()
+        .relative()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .overflow_hidden()
+        .child(PaintShift::new(
+            point(px(frame.offset), px(0.0)),
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(SESSION_MARQUEE_GAP))
+                .child(text_style(div().flex_none()).child(title.to_string()))
+                .child(text_style(div().flex_none()).child(title.to_string())),
+        ))
+        .child(
+            // 右缘淡出：静止与播放时都显示。
+            div()
+                .absolute()
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .right(px(0.0))
+                .w(px(SESSION_TITLE_FADE_W))
+                .bg(fade_gradient(fade_base, true))
+                .when(!active, |element| {
+                    element.group_hover(row_group.clone(), |style| {
+                        style.bg(fade_gradient(theme.hover, true))
+                    })
+                }),
+        )
+        .when(frame.left_fade > 0.05, |element| {
+            element.child(
+                // 左缘淡出：播放中全宽，收尾时收回。
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .bottom(px(0.0))
+                    .left(px(0.0))
+                    .w(px(frame.left_fade))
+                    .bg(fade_gradient(fade_base, false))
+                    .when(!active, |element| {
+                        element.group_hover(row_group.clone(), |style| {
+                            style.bg(fade_gradient(theme.hover, false))
+                        })
+                    }),
+            )
+        })
 }
 
 /// Open a project folder in the platform file manager.
@@ -8285,16 +10980,50 @@ fn day_greeting() -> &'static str {
     }
 }
 
+/// Suggested file name for an export. Titles can contain characters that are
+/// illegal on some platforms, so keep only the readable part.
+fn export_file_name(title: &str) -> String {
+    let mut safe = String::new();
+    for ch in title.chars().take(40) {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            safe.push('_');
+        } else {
+            safe.push(ch);
+        }
+    }
+    let safe = safe.trim().trim_matches('.').to_string();
+    let safe = if safe.is_empty() {
+        "session".to_string()
+    } else {
+        safe
+    };
+    format!(
+        "EffiBuddy-{safe}-{}.zip",
+        Local::now().format("%Y%m%d-%H%M")
+    )
+}
+
+fn normalize_export_path(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        path.set_extension("zip");
+    }
+    path
+}
+
 pub(crate) fn relative_time(time: DateTime<Utc>) -> String {
     let delta = Utc::now().signed_duration_since(time);
     if delta.num_minutes() < 1 {
         "刚刚".to_string()
     } else if delta.num_minutes() < 60 {
-        format!("{} 分钟前", delta.num_minutes())
+        format!("{} 分钟", delta.num_minutes())
     } else if delta.num_hours() < 24 {
-        format!("{} 小时前", delta.num_hours())
+        format!("{} 小时", delta.num_hours())
     } else if delta.num_days() < 7 {
-        format!("{} 天前", delta.num_days())
+        format!("{} 天", delta.num_days())
     } else {
         time.with_timezone(&Local).format("%m-%d").to_string()
     }

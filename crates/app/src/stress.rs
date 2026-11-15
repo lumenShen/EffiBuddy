@@ -583,6 +583,7 @@ impl AppView {
                             parent_session_id: parent_session_id.clone(),
                             parent_call_id: format!("call_stress_{index}"),
                             workspace: stress_workspace.clone(),
+                            additional_workspaces: Vec::new(),
                             agent_name: Some(format!("stress-{index:04}")),
                             parent_agent_id: Some("main".to_string()),
                             parent_agent_name: Some("main".to_string()),

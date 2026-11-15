@@ -292,6 +292,7 @@ mod tests {
     fn context_with_huge_echo() -> ToolContext {
         ToolContext {
             cwd: std::env::temp_dir(),
+            additional_workspaces: Vec::new(),
             session_id: "test-session".to_string(),
             agent_id: "main".to_string(),
             agent_name: None,
