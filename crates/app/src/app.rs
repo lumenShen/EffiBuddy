@@ -14,7 +14,7 @@ use effibuddy_agent_core::{
     BrokerApprovalGate, ContentBlock, DemoProvider, HarnessConfig, HarnessEvent, Message,
     ModelProvider, ProfileDiagnostic, RunOutcome, RunStatus, SharedSession, SubagentColor,
     SubagentProfile, SubagentReport, SubagentSpawner, SubagentStatus, TodoStatus, ToolCall,
-    ToolResult, UserAttachment, lock_session, new_shared_session,
+    ToolResult, Usage, UserAttachment, lock_session, new_shared_session,
 };
 use effibuddy_agent_tools::{ComputerTool, builtin_tools_with_roots};
 use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
@@ -42,6 +42,7 @@ use crate::checkpoint::{RestoreAction, RestorePlan};
 use crate::composer_menu::ComposerMenuState;
 use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
 use crate::config::{AppConfig, MAX_UI_ZOOM, MIN_UI_ZOOM};
+use crate::context_meter::{ContextUsage, SubagentUsage};
 use crate::draft_store::{DraftStore, TASK_SCOPE};
 use crate::events::{AppEvent, SubagentSpawnedInfo};
 use crate::graph::{GraphView, ViewMode, persist as graph_persist};
@@ -217,12 +218,48 @@ pub(crate) struct ActiveSession {
 }
 
 pub(crate) struct ActiveRun {
+    /// Conversation this harness belongs to. Events are routed by it, and a
+    /// run parked in `background_runs` keeps streaming after the user switches
+    /// away.
+    session_id: String,
+    shared: SharedSession,
     run_id: Option<String>,
     handle: AgentHandle,
     approval: Arc<BrokerApprovalGate>,
     started_at: Instant,
     /// Bound to the user message that owns this run once `RunStarted` lands.
     checkpoint: Option<Arc<crate::checkpoint::CheckpointRecorder>>,
+}
+
+/// UI state that belongs to one conversation but is not part of the transcript:
+/// the queue bar, pending approvals, background-task notifications and the
+/// subagent task list. It is parked here when the user switches away and
+/// restored when the conversation becomes active again, so two sessions never
+/// see each other's queues.
+pub(crate) struct SessionUiState {
+    pub(crate) pending_inputs: Vec<PendingInput>,
+    pub(crate) queue_held: bool,
+    pub(crate) pending_subagent_notifications: Vec<String>,
+    pub(crate) pending_approvals: Vec<PendingApproval>,
+    pub(crate) subagent_tasks: Vec<AgentTask>,
+    pub(crate) subagent_task_index: HashMap<String, usize>,
+    /// Last failure shown by that conversation; restored on switch so a
+    /// background failure is not lost.
+    pub(crate) last_error: Option<String>,
+}
+
+impl Default for SessionUiState {
+    fn default() -> Self {
+        Self {
+            pending_inputs: Vec::new(),
+            queue_held: false,
+            pending_subagent_notifications: Vec::new(),
+            pending_approvals: Vec::new(),
+            subagent_tasks: Vec::new(),
+            subagent_task_index: HashMap::new(),
+            last_error: None,
+        }
+    }
 }
 
 /// Delivery lane for a message typed while a run is active. `Queue` waits for
@@ -283,6 +320,15 @@ pub(crate) struct EditConflictState {
     pub plan: RestorePlan,
     /// Attachments staged for the edited message; an edit re-sends them.
     pub attachments: Vec<UserAttachment>,
+}
+
+/// Visual state of one sidebar conversation row. Running children count as
+/// activity too, so a session whose main turn ended but whose background agents
+/// still work keeps its indicator.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SessionRowStatus {
+    pub(crate) running: bool,
+    pub(crate) waiting_approval: bool,
 }
 
 /// One project row in the sidebar. Sessions group by project id; a legacy
@@ -372,6 +418,10 @@ pub(crate) struct AgentTask {
     pub error: Option<String>,
     pub data: Option<serde_json::Value>,
     pub tool_uses: usize,
+    /// 子会话的完整累计用量。运行中由 `UsageUpdated` 事件刷新，结束时
+    /// 取终态报告，恢复时取落盘记录；概览页汇总全部子任务时直接读它，
+    /// 不再逐帧锁每个子会话。
+    pub usage: Usage,
     pub total_tokens: u64,
     pub duration_ms: u64,
     pub waiting_approval: bool,
@@ -396,7 +446,18 @@ pub struct AppView {
     /// Conversations archived from the sidebar; listed in Settings → 归档.
     pub(crate) archived_sessions: Vec<SessionSummary>,
     pub(crate) active: Option<ActiveSession>,
+    /// Run of the active conversation, if any.
     pub(crate) active_run: Option<ActiveRun>,
+    /// Runs that keep going while another conversation is in front. Switching
+    /// parks `active_run` here and takes the target's run back out, so every
+    /// existing active-session UI path stays unchanged.
+    pub(crate) background_runs: HashMap<String, ActiveRun>,
+    /// Per-conversation queue/approval/subagent UI parked by switching.
+    pub(crate) background_sessions: HashMap<String, SessionUiState>,
+    /// Live shared sessions of conversations with a run or running children.
+    /// Background events write through these instead of reloading the disk
+    /// transcript (a throttled save may still be behind).
+    pub(crate) session_shares: HashMap<String, SharedSession>,
     pub(crate) pending_approvals: Vec<PendingApproval>,
     /// User message currently being edited in the composer. The next submit
     /// trims the transcript at this message and optionally restores files.
@@ -449,10 +510,13 @@ pub struct AppView {
     agent_ticker_active: bool,
     /// Staged session saves, drained one at a time off the UI thread.
     persist_tx: UnboundedSender<PendingSave>,
-    /// Wall clock of the last completed persist staging; enforces the minimum
-    /// interval between background serializations of a (potentially huge)
-    /// session.
-    last_persist: Option<Instant>,
+    /// Wall clock of the last completed persist staging per session; enforces
+    /// the minimum interval between background serializations of a
+    /// (potentially huge) transcript.
+    last_persist: HashMap<String, Instant>,
+    /// Throttled sessions waiting for the trailing flush. Keyed by session id
+    /// so a switch during the wait cannot persist the wrong conversation.
+    pending_persists: HashMap<String, SharedSession>,
     /// Set while a trailing persist flush is scheduled after a throttled one.
     persist_flush_scheduled: bool,
     /// Set while a debounced `drafts.json` write is pending. Draft writes are
@@ -703,23 +767,33 @@ impl AppView {
         let window_closed_subscription = cx.on_window_closed({
             let weak = self_weak.clone();
             move |cx| {
-                let _ = weak.update(cx, |this, cx| {
-                    let Some(handle) = this.computer_overlay else {
-                        return;
-                    };
-                    if handle.update(cx, |_, _, _| {}).is_ok() {
-                        return;
-                    }
-                    // The floating bar was closed by the user/window manager.
-                    this.computer_overlay = None;
-                    if let Some(session_id) = this
-                        .active
-                        .as_ref()
-                        .map(|active| lock_session(&active.shared).id.clone())
-                    {
-                        this.computer.stop(&session_id);
-                    }
-                    this.interrupt(cx);
+                // Mirror `close_computer_overlay`: that path removes the bar
+                // window from inside AppView's own update (the overlay events
+                // ride the AppEvent pump), and close observers run before the
+                // outer update has released AppView. Updating it here directly
+                // panics with "cannot update AppView while it is already being
+                // updated"; the deferral runs after the nested window update
+                // unwinds and the lease is gone.
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| {
+                        let Some(handle) = this.computer_overlay else {
+                            return;
+                        };
+                        if handle.update(cx, |_, _, _| {}).is_ok() {
+                            return;
+                        }
+                        // The floating bar was closed by the user/window manager.
+                        this.computer_overlay = None;
+                        if let Some(session_id) = this
+                            .active
+                            .as_ref()
+                            .map(|active| lock_session(&active.shared).id.clone())
+                        {
+                            this.computer.stop(&session_id);
+                        }
+                        this.interrupt(cx);
+                    });
                 });
             }
         });
@@ -972,6 +1046,9 @@ impl AppView {
             archived_sessions,
             active,
             active_run: None,
+            background_runs: HashMap::new(),
+            background_sessions: HashMap::new(),
+            session_shares: HashMap::new(),
             pending_approvals: Vec::new(),
             edit_message: None,
             undo_dialog: None,
@@ -994,7 +1071,8 @@ impl AppView {
             queue_held: false,
             agent_ticker_active: false,
             persist_tx,
-            last_persist: None,
+            last_persist: HashMap::new(),
+            pending_persists: HashMap::new(),
             persist_flush_scheduled: false,
             draft_save_scheduled: false,
             bench_until: None,
@@ -1515,6 +1593,7 @@ impl AppView {
         child.usage.total_tokens = 8_420;
         child.usage.prompt_tokens = 7_900;
         child.usage.completion_tokens = 520;
+        let child_usage = child.usage.clone();
         child.touch();
         let child_shared = new_shared_session(child.clone());
         self.push_subagent_task(AgentTask {
@@ -1549,6 +1628,7 @@ impl AppView {
             error: None,
             data: None,
             tool_uses: 3,
+            usage: child_usage,
             total_tokens: 8_420,
             duration_ms: 35_000,
             waiting_approval: false,
@@ -1571,6 +1651,11 @@ impl AppView {
             );
             running_assistant.set_text("正在搜索 `ToolRegistry::register` 的调用点…");
             running_child.push_message(running_assistant);
+            running_child.usage.prompt_tokens = 21_300;
+            running_child.usage.completion_tokens = 1_860;
+            running_child.usage.cached_tokens = 12_000;
+            running_child.usage.total_tokens = 23_160;
+            let running_usage = running_child.usage.clone();
             self.push_subagent_task(AgentTask {
                 agent_id: "agent_preview_running".to_string(),
                 name: "tool-scout".to_string(),
@@ -1601,7 +1686,8 @@ impl AppView {
                 error: None,
                 data: None,
                 tool_uses: 2,
-                total_tokens: 0,
+                usage: running_usage,
+                total_tokens: 23_160,
                 duration_ms: 0,
                 waiting_approval: false,
                 restored: false,
@@ -1765,6 +1851,222 @@ impl AppView {
         self.active.as_ref().map(|active| active.shared.clone())
     }
 
+    fn session_is_active(&self, id: &str) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| lock_session(&active.shared).id == id)
+    }
+
+    /// True when this conversation has a live main run, either in front or
+    /// parked in the background. A session with only running children counts
+    /// as busy for wake/queue purposes, but not for the main run.
+    fn run_active_for(&self, id: &str) -> bool {
+        (self.session_is_active(id) && self.active_run.is_some())
+            || self.background_runs.contains_key(id)
+    }
+
+    /// Resolve the live state of a conversation, loading it from disk only when
+    /// this app session has not touched it yet. Background events must use the
+    /// in-memory copy: a throttled save may still hold an older transcript.
+    fn shared_for_session(&mut self, id: &str) -> Option<SharedSession> {
+        if let Some(active) = &self.active
+            && lock_session(&active.shared).id == id
+        {
+            return Some(active.shared.clone());
+        }
+        if let Some(run) = self.background_runs.get(id) {
+            return Some(run.shared.clone());
+        }
+        if let Some(shared) = self.session_shares.get(id) {
+            return Some(shared.clone());
+        }
+        let mut state = self.store.load(id)?;
+        self.models.normalize_session(&mut state);
+        let shared = new_shared_session(state);
+        self.session_shares.insert(id.to_string(), shared.clone());
+        Some(shared)
+    }
+
+    /// Park the outgoing conversation's run and its queue/approval/subagent UI.
+    /// Called before `active` changes, so events that arrive during the switch
+    /// still route by session id.
+    fn stash_active_session_ui(&mut self) {
+        let Some(id) = self.active_id() else {
+            return;
+        };
+        let state = SessionUiState {
+            pending_inputs: std::mem::take(&mut self.pending_inputs),
+            queue_held: std::mem::take(&mut self.queue_held),
+            pending_subagent_notifications: std::mem::take(
+                &mut self.pending_subagent_notifications,
+            ),
+            pending_approvals: std::mem::take(&mut self.pending_approvals),
+            subagent_tasks: std::mem::take(&mut self.subagent_tasks),
+            subagent_task_index: std::mem::take(&mut self.subagent_task_index),
+            last_error: self.last_error.take(),
+        };
+        if let Some(run) = self.active_run.take() {
+            self.background_runs.insert(id.clone(), run);
+        }
+        self.background_sessions.insert(id.clone(), state);
+        // Keep the in-memory transcript: the throttled writer may still be
+        // behind, and a later switch must not resurrect stale disk state.
+        if let Some(active) = &self.active {
+            self.session_shares
+                .insert(id.clone(), active.shared.clone());
+        }
+    }
+
+    /// Make a parked conversation active again, restoring its run and queue.
+    fn restore_session_ui(&mut self, id: &str) {
+        let state = self.background_sessions.remove(id).unwrap_or_default();
+        let SessionUiState {
+            pending_inputs,
+            queue_held,
+            pending_subagent_notifications,
+            pending_approvals,
+            subagent_tasks,
+            subagent_task_index,
+            last_error,
+        } = state;
+        self.pending_inputs = pending_inputs;
+        self.queue_held = queue_held;
+        self.pending_subagent_notifications = pending_subagent_notifications;
+        self.pending_approvals = pending_approvals;
+        self.subagent_tasks = subagent_tasks;
+        self.subagent_task_index = subagent_task_index;
+        self.last_error = last_error;
+        self.active_run = self.background_runs.remove(id);
+        if let Some(run) = &self.active_run {
+            self.session_shares
+                .insert(id.to_string(), run.shared.clone());
+        }
+    }
+
+    /// Forget every parking lot entry for a conversation that is being removed
+    /// or replaced by an empty one. Any live run is interrupted so a deleted
+    /// session cannot keep working in the background.
+    fn discard_active_session_ui(&mut self) {
+        if let Some(id) = self.active_id() {
+            self.background_sessions.remove(&id);
+            self.session_shares.remove(&id);
+            if let Some(run) = self.background_runs.remove(&id) {
+                run.handle.interrupt();
+                run.approval.deny_all();
+            }
+            for service in &self.subagent_services {
+                if service.parent_session_id() == id {
+                    service.stop_all();
+                }
+            }
+        }
+        if let Some(run) = self.active_run.take() {
+            run.handle.interrupt();
+            run.approval.deny_all();
+        }
+        self.pending_inputs.clear();
+        self.queue_held = false;
+        self.pending_subagent_notifications.clear();
+        self.pending_approvals.clear();
+        self.subagent_tasks.clear();
+        self.subagent_task_index.clear();
+    }
+
+    /// Forget every parking-lot entry for a conversation that left the
+    /// sidebar (archived or deleted) while it was not active.
+    fn forget_session_runtime(&mut self, id: &str) {
+        self.background_sessions.remove(id);
+        self.session_shares.remove(id);
+        if let Some(run) = self.background_runs.remove(id) {
+            run.handle.interrupt();
+            run.approval.deny_all();
+        }
+        for service in &self.subagent_services {
+            if service.parent_session_id() == id {
+                service.stop_all();
+            }
+        }
+    }
+
+    /// Reset only the UI projections that belong to the transcript (task rows
+    /// and open child tabs). Queue/approval state is already parked or
+    /// restored around a switch, and subagent services of background
+    /// conversations must keep running.
+    fn clear_session_ui_views(&mut self) {
+        self.subagent_tasks.clear();
+        self.subagent_task_index.clear();
+        self.side.agent_views.clear();
+        let ids: Vec<String> = self
+            .side
+            .tabs
+            .iter()
+            .filter(|tab| matches!(tab.kind, SidePaneTabKind::Agent(_)))
+            .map(|tab| tab.id.clone())
+            .collect();
+        for id in ids {
+            self.side.close_tab(&id);
+        }
+    }
+
+    /// Seed the typewriter buffer from a running transcript that was opened
+    /// mid-turn (switch back to a background run, or a restored live run).
+    fn prime_active_chat_stream(&mut self) {
+        if self.active_run.is_none() {
+            return;
+        }
+        let Some(shared) = self.active_shared() else {
+            return;
+        };
+        let session = lock_session(&shared);
+        if let Some(message) = session.messages.iter().rev().find(|message| {
+            message.role == effibuddy_agent_core::Role::Assistant
+                && (!message.text().trim().is_empty() || !message.reasoning().trim().is_empty())
+        }) {
+            self.chat.prime_stream(message);
+        }
+    }
+
+    /// Record a failure on the conversation it belongs to without leaking it
+    /// into whichever transcript happens to be in front.
+    fn note_session_error(&mut self, session_id: &str, error: String) {
+        if self.session_is_active(session_id) {
+            self.last_error = Some(error);
+        } else {
+            self.background_sessions
+                .entry(session_id.to_string())
+                .or_default()
+                .last_error = Some(error);
+        }
+    }
+
+    /// Sidebar status for one row: live main run, running children, or a
+    /// pending approval while the conversation sits in the background.
+    fn session_row_status(&self, id: &str) -> SessionRowStatus {
+        if self.session_is_active(id) {
+            let running = self.active_run.is_some()
+                || self
+                    .subagent_tasks
+                    .iter()
+                    .any(|task| task.status == SubagentStatus::Running);
+            return SessionRowStatus {
+                running,
+                waiting_approval: !self.pending_approvals.is_empty(),
+            };
+        }
+        let state = self.background_sessions.get(id);
+        let running = self.background_runs.contains_key(id)
+            || state.is_some_and(|state| {
+                state
+                    .subagent_tasks
+                    .iter()
+                    .any(|task| task.status == SubagentStatus::Running)
+            });
+        SessionRowStatus {
+            running,
+            waiting_approval: state.is_some_and(|state| !state.pending_approvals.is_empty()),
+        }
+    }
+
     /// Sidebar grouping key for the conversation's project (or 任务).
     fn draft_scope_for_session(session: &effibuddy_agent_core::SessionState) -> String {
         crate::draft_store::scope_key(session.project_id.as_deref(), session.project.as_deref())
@@ -1899,23 +2201,31 @@ impl AppView {
     /// appear in the sidebar immediately. Write it synchronously (the session
     /// is one message long at this point) so the refresh that follows sees it.
     fn publish_active_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let shared = self.active_shared();
+        match shared {
+            Some(shared) => self.publish_draft_for(&shared, cx),
+            None => false,
+        }
+    }
+
+    /// Turn an invisible draft into real history for any conversation, active
+    /// or background. Write synchronously (the session is one message long at
+    /// this point) so the sidebar refresh that follows sees it.
+    fn publish_draft_for(&mut self, shared: &SharedSession, cx: &mut Context<Self>) -> bool {
         let _ = cx;
         if self.preview_mode {
             return false;
         }
-        let Some(shared) = self.active_shared() else {
-            return false;
-        };
         let (id, has_messages) = {
-            let session = lock_session(&shared);
+            let session = lock_session(shared);
             (session.id.clone(), !session.messages.is_empty())
         };
         if !has_messages || !self.drafts.unbind_session(&id) {
             return false;
         }
         let _ = self.drafts.save();
-        if let Err(error) = self.save_active_metadata(&shared) {
-            self.last_error = Some(error);
+        if let Err(error) = self.save_active_metadata(shared) {
+            self.note_session_error(&id, error);
         }
         true
     }
@@ -1959,30 +2269,52 @@ impl AppView {
         if self.stress.is_some() {
             return;
         }
-        let Some(active) = &self.active else {
+        let Some(shared) = self.active_shared() else {
             return;
         };
-        let now = Instant::now();
-        if let Some(last) = self.last_persist
-            && now.duration_since(last) < Self::PERSIST_MIN_INTERVAL
-        {
-            if !self.persist_flush_scheduled {
-                self.persist_flush_scheduled = true;
-                cx.spawn(async move |weak, cx| {
-                    cx.background_executor()
-                        .timer(Self::PERSIST_MIN_INTERVAL)
-                        .await;
-                    let _ = weak.update(cx, |this, cx| {
-                        this.persist_flush_scheduled = false;
-                        this.persist_active(cx);
-                    });
-                })
-                .detach();
-            }
+        let session_id = lock_session(&shared).id.clone();
+        self.persist_session(&session_id, &shared, cx);
+    }
+
+    /// Persist one session, whether it is active or running in the background.
+    /// Cloning and JSON serialization run on the background executor: they used
+    /// to run on the UI thread, which stalled the frame for megabyte-scale
+    /// transcripts. Throttled per session with a trailing flush so bursty runs
+    /// coalesce into one write per quiet period.
+    pub(crate) fn persist_session(
+        &mut self,
+        session_id: &str,
+        shared: &SharedSession,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview_mode {
             return;
         }
-        self.last_persist = Some(now);
-        let shared = active.shared.clone();
+        #[cfg(feature = "stress")]
+        if self.stress.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.last_persist.get(session_id)
+            && now.duration_since(*last) < Self::PERSIST_MIN_INTERVAL
+        {
+            self.pending_persists
+                .insert(session_id.to_string(), shared.clone());
+            self.schedule_persist_flush(cx);
+            return;
+        }
+        self.stage_persist(session_id, shared.clone(), now, cx);
+    }
+
+    /// Serialize one session off the UI thread and queue the write.
+    fn stage_persist(
+        &mut self,
+        session_id: &str,
+        shared: SharedSession,
+        now: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_persist.insert(session_id.to_string(), now);
         let store = self.store.clone();
         let persist_tx = self.persist_tx.clone();
         cx.background_executor()
@@ -1993,6 +2325,28 @@ impl AppView {
                 }
             })
             .detach();
+    }
+
+    /// One trailing flush covers every parked session; a session that is still
+    /// inside its quiet period is re-queued for the next window.
+    fn schedule_persist_flush(&mut self, cx: &mut Context<Self>) {
+        if self.persist_flush_scheduled {
+            return;
+        }
+        self.persist_flush_scheduled = true;
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(Self::PERSIST_MIN_INTERVAL)
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.persist_flush_scheduled = false;
+                let pending = std::mem::take(&mut this.pending_persists);
+                for (id, shared) in pending {
+                    this.persist_session(&id, &shared, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Re-list sessions on a background thread; the newest scan wins.
@@ -2667,31 +3021,50 @@ impl AppView {
         Ok(restored)
     }
 
-    /// Start one parent turn. `input = None` resumes an existing transcript
-    /// (used for background-task notifications that were already appended).
+    /// Start one parent turn in the active conversation.
     fn start_run(&mut self, input: Option<RunInput>, cx: &mut Context<Self>) {
-        if self.active_run.is_some() {
-            self.notice = Some("当前任务仍在运行，请先停止。".to_string());
-            cx.notify();
-            return;
-        }
-        let Some(active) = &self.active else {
+        let Some(shared) = self.active_shared() else {
             self.last_error = Some("没有活动会话。".to_string());
             cx.notify();
             return;
         };
+        self.start_run_for(shared, input, cx);
+    }
+
+    /// Start one parent turn for a specific conversation. `input = None`
+    /// resumes an existing transcript (used for background-task notifications
+    /// that were already appended). A run for a conversation that is not in
+    /// front keeps streaming into its own session; the UI notices through the
+    /// sidebar indicator and picks it up on the next switch.
+    fn start_run_for(
+        &mut self,
+        shared: SharedSession,
+        input: Option<RunInput>,
+        cx: &mut Context<Self>,
+    ) {
+        let session_id = lock_session(&shared).id.clone();
+        let in_front = self.session_is_active(&session_id);
+        if self.run_active_for(&session_id) {
+            if in_front {
+                self.notice = Some("当前任务仍在运行，请先停止。".to_string());
+                cx.notify();
+            }
+            return;
+        }
         let Some(runtime_handle) = self.runtime.as_ref().map(|runtime| runtime.handle()) else {
-            self.last_error = Some("后台运行时不可用。".to_string());
+            self.note_session_error(&session_id, "后台运行时不可用。".to_string());
+            if in_front {
+                self.chat_dirty = true;
+            }
             cx.notify();
             return;
         };
 
-        let shared = active.shared.clone();
         let (workspace, additional_workspaces) = self.workspace_roots_for_session(&shared);
         let session_project_id = lock_session(&shared).project_id.clone();
         let permission_mode = lock_session(&shared).permission_mode;
 
-        let (resolved, session_id, model) = {
+        let (resolved, model) = {
             let mut session = lock_session(&shared);
             let resolved = self.models.resolve_session(&session);
             let selection = resolved.selection();
@@ -2701,23 +3074,32 @@ impl AppView {
                 selection.reasoning_level,
             );
             session.last_error = None;
-            (resolved, session.id.clone(), session.model.clone())
+            (resolved, session.model.clone())
         };
         let demo_mode = self.models.demo_mode(self.config.use_demo, &resolved);
         let provider: Arc<dyn ModelProvider> = if demo_mode {
             Arc::new(DemoProvider::new())
         } else if !resolved.live {
-            self.last_error = Some(format!(
-                "供应商「{}」尚未配置 API Key。请在设置 → 模型中填写，或切换到其他供应商。",
-                resolved.provider_label()
-            ));
+            self.note_session_error(
+                &session_id,
+                format!(
+                    "供应商「{}」尚未配置 API Key。请在设置 → 模型中填写，或切换到其他供应商。",
+                    resolved.provider_label()
+                ),
+            );
+            if in_front {
+                self.chat_dirty = true;
+            }
             cx.notify();
             return;
         } else {
             match resolved.build_provider_for(Some(&session_id)) {
                 Ok(provider) => provider,
                 Err(error) => {
-                    self.last_error = Some(format!("无法创建模型客户端：{error}"));
+                    self.note_session_error(&session_id, format!("无法创建模型客户端：{error}"));
+                    if in_front {
+                        self.chat_dirty = true;
+                    }
                     cx.notify();
                     return;
                 }
@@ -2726,7 +3108,13 @@ impl AppView {
         let mut tools = match builtin_tools_with_roots(&workspace, &additional_workspaces) {
             Ok(tools) => tools,
             Err(error) => {
-                self.last_error = Some(format!("无法打开工作区 {}：{error}", workspace.display()));
+                self.note_session_error(
+                    &session_id,
+                    format!("无法打开工作区 {}：{error}", workspace.display()),
+                );
+                if in_front {
+                    self.chat_dirty = true;
+                }
                 cx.notify();
                 return;
             }
@@ -2775,7 +3163,7 @@ impl AppView {
 
         let service = SubagentService::new(
             provider.clone(),
-            session_id,
+            session_id.clone(),
             resolved.provider.id.clone(),
             model,
             resolved.reasoning_level.clone(),
@@ -2828,15 +3216,23 @@ impl AppView {
         let harness = Arc::new(harness);
 
         let forward_tx = self.app_tx.clone();
+        let forward_session_id = session_id.clone();
         runtime_handle.spawn(async move {
             while let Some(event) = harness_rx.recv().await {
-                if forward_tx.send(AppEvent::Main(event)).is_err() {
+                if forward_tx
+                    .send(AppEvent::Main {
+                        session_id: forward_session_id.clone(),
+                        event,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         });
         let error_tx = self.app_tx.clone();
         let error_session = shared.clone();
+        let error_session_id = session_id.clone();
         runtime_handle.spawn(async move {
             let result = match input {
                 Some(input) => {
@@ -2848,32 +3244,85 @@ impl AppView {
             };
             if let Err(error) = result {
                 lock_session(&error_session).set_status(RunStatus::Idle);
-                let _ = error_tx.send(AppEvent::Main(HarnessEvent::RunFinished {
-                    run_id: String::new(),
-                    outcome: RunOutcome::Failed(error.to_string()),
-                }));
+                let _ = error_tx.send(AppEvent::Main {
+                    session_id: error_session_id,
+                    event: HarnessEvent::RunFinished {
+                        run_id: String::new(),
+                        outcome: RunOutcome::Failed(error.to_string()),
+                    },
+                });
             }
         });
 
+        self.session_shares
+            .insert(session_id.clone(), shared.clone());
         self.subagent_services.push(service);
-        if self.subagent_services.len() > 8 {
-            self.subagent_services.remove(0);
-        }
-        self.active_run = Some(ActiveRun {
+        self.prune_subagent_services();
+        let run = ActiveRun {
+            session_id: session_id.clone(),
+            shared: shared.clone(),
             run_id: None,
             handle,
             approval,
             started_at: Instant::now(),
             checkpoint: Some(checkpoint_recorder),
-        });
-        self.pending_approvals
-            .retain(|pending| pending.agent_id.is_some());
-        self.last_error = None;
-        self.notice = None;
-        self.chat.pin_to_bottom();
-        self.chat_dirty = true;
-        self.ensure_run_ticker(cx);
+        };
+        if in_front {
+            self.active_run = Some(run);
+            self.pending_approvals
+                .retain(|pending| pending.agent_id.is_some());
+            self.last_error = None;
+            self.notice = None;
+            self.chat.pin_to_bottom();
+            self.chat_dirty = true;
+            self.ensure_run_ticker(cx);
+        } else {
+            self.background_runs.insert(session_id.clone(), run);
+            self.background_sessions
+                .entry(session_id.clone())
+                .or_default()
+                .pending_approvals
+                .retain(|pending| pending.agent_id.is_some());
+            self.background_sessions
+                .entry(session_id.clone())
+                .or_default()
+                .last_error = None;
+        }
         cx.notify();
+    }
+
+    /// Drop services of idle conversations when the list grows, but never a
+    /// service whose parent still has a run or running children — its approval
+    /// gate and stop button must stay reachable.
+    fn prune_subagent_services(&mut self) {
+        if self.subagent_services.len() <= 16 {
+            return;
+        }
+        let active_id = self.active_id();
+        let mut index = 0;
+        while self.subagent_services.len() > 8 && index < self.subagent_services.len() {
+            let parent = self.subagent_services[index]
+                .parent_session_id()
+                .to_string();
+            let busy = self.background_runs.contains_key(&parent)
+                || self.background_sessions.get(&parent).is_some_and(|state| {
+                    state
+                        .subagent_tasks
+                        .iter()
+                        .any(|task| task.status == SubagentStatus::Running)
+                })
+                || (active_id.as_deref() == Some(parent.as_str())
+                    && (self.active_run.is_some()
+                        || self
+                            .subagent_tasks
+                            .iter()
+                            .any(|task| task.status == SubagentStatus::Running)));
+            if busy {
+                index += 1;
+            } else {
+                self.subagent_services.remove(index);
+            }
+        }
     }
 
     /// Keep the "工作中 · 1 分 16 秒" footer moving even while a tool is
@@ -2944,8 +3393,16 @@ impl AppView {
                 }
             }
         }
+        // Stop only the active conversation's children. A background session
+        // may be running in parallel and must not be collateral damage.
+        let active_id = self.active_id();
         for service in &self.subagent_services {
-            service.stop_all();
+            if active_id
+                .as_deref()
+                .is_some_and(|id| service.parent_session_id() == id)
+            {
+                service.stop_all();
+            }
         }
         for task in &mut self.subagent_tasks {
             if task.status == SubagentStatus::Running {
@@ -2991,8 +3448,8 @@ impl AppView {
         let mut structural = false;
         match &event {
             HarnessEvent::RunStarted { run_id, .. } => {
-                let turn_id = self.active_shared().and_then(|shared| {
-                    let session = lock_session(&shared);
+                let turn_id = self.active_run.as_ref().and_then(|run| {
+                    let session = lock_session(&run.shared);
                     session.latest_user_turn_id().map(str::to_string)
                 });
                 if let Some(run) = &mut self.active_run {
@@ -3053,7 +3510,9 @@ impl AppView {
                 structural = true;
             }
             HarnessEvent::ToolCallFinished { result } => {
-                self.record_workflow_result(result, cx);
+                if let Some(session_id) = self.active_id() {
+                    self.record_workflow_result_for(&session_id, result, cx);
+                }
                 self.persist_active(cx);
                 structural = true;
             }
@@ -3073,6 +3532,10 @@ impl AppView {
                 // failure) come back to the host. Bar entries still marked
                 // Steer are exactly those messages, so normalize them instead
                 // of re-pushing the reclaimed text.
+                let finished = self
+                    .active_run
+                    .as_ref()
+                    .map(|run| (run.session_id.clone(), run.shared.clone()));
                 if let Some(run) = &self.active_run {
                     run.handle.take_pending_steers();
                 }
@@ -3090,13 +3553,10 @@ impl AppView {
                 // Hide the control bar and restore parked windows/workspace.
                 // Consent is retained for the conversation unless the user hit
                 // Stop (which revokes it in runtime.stop()).
-                if let Some(session_id) = self
-                    .active
-                    .as_ref()
-                    .map(|active| lock_session(&active.shared).id.clone())
-                {
+                if let Some((session_id, _)) = &finished {
                     if let Some(runtime) = &self.runtime {
                         let computer = self.computer.clone();
+                        let session_id = session_id.clone();
                         runtime.spawn(async move {
                             computer.finish_session(&session_id).await;
                         });
@@ -3131,8 +3591,10 @@ impl AppView {
             self.graph.invalidate();
         }
         if let HarnessEvent::RunFinished { outcome, .. } = &event {
-            if outcome.is_success() {
-                self.resume_after_run(cx);
+            if outcome.is_success()
+                && let Some(session_id) = self.active_id()
+            {
+                self.resume_after_run_for(&session_id, cx);
             }
         }
         // Token deltas are picked up by the typewriter reveal loop, which
@@ -3141,6 +3603,169 @@ impl AppView {
         // events always wake the view.
         if structural || !self.chat.reveal_frame_scheduled {
             cx.notify();
+        }
+    }
+
+    /// A main-harness event for a conversation that is not in front. The
+    /// harness already writes the transcript into the shared session; here we
+    /// keep the parked UI state (queue, approvals, unread marker) and the disk
+    /// copy current, and auto-continue that session's own queue.
+    fn handle_background_event(
+        &mut self,
+        session_id: &str,
+        event: HarnessEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(shared) = self
+            .background_runs
+            .get(session_id)
+            .map(|run| run.shared.clone())
+            .or_else(|| self.session_shares.get(session_id).cloned())
+        else {
+            return;
+        };
+        self.background_sessions
+            .entry(session_id.to_string())
+            .or_default();
+        let mut structural = false;
+        match &event {
+            HarnessEvent::RunStarted { run_id, .. } => {
+                let turn_id = self.background_runs.get(session_id).and_then(|run| {
+                    let session = lock_session(&run.shared);
+                    session.latest_user_turn_id().map(str::to_string)
+                });
+                if let Some(run) = self.background_runs.get_mut(session_id) {
+                    run.run_id = Some(run_id.clone());
+                    if let (Some(recorder), Some(turn_id)) = (&run.checkpoint, turn_id) {
+                        recorder.bind_turn(turn_id);
+                    }
+                }
+                self.publish_draft_for(&shared, cx);
+                self.persist_session(session_id, &shared, cx);
+                self.refresh_sessions(cx);
+                structural = true;
+            }
+            HarnessEvent::StepStarted { .. }
+            | HarnessEvent::AssistantStarted { .. }
+            | HarnessEvent::ToolCallStarted { .. }
+            | HarnessEvent::SessionChanged => {
+                structural = true;
+            }
+            // Deltas already landed in the shared transcript; the hidden
+            // transcript's typewriter mirror is not running.
+            HarnessEvent::TextDelta { .. } | HarnessEvent::ReasoningDelta { .. } => {}
+            HarnessEvent::AssistantFinished { .. } => {
+                self.persist_session(session_id, &shared, cx);
+                structural = true;
+            }
+            HarnessEvent::ApprovalRequested { request } => {
+                let state = self
+                    .background_sessions
+                    .entry(session_id.to_string())
+                    .or_default();
+                if !state
+                    .pending_approvals
+                    .iter()
+                    .any(|pending| pending.request.id == request.id)
+                {
+                    state.pending_approvals.push(PendingApproval {
+                        agent_id: None,
+                        request: request.clone(),
+                    });
+                }
+                // The row turns into an attention indicator: the run is
+                // blocked until the user opens this conversation.
+                self.mark_session_unread_live(session_id, &shared);
+                structural = true;
+            }
+            HarnessEvent::ApprovalResolved { request_id, .. } => {
+                if let Some(state) = self.background_sessions.get_mut(session_id) {
+                    state
+                        .pending_approvals
+                        .retain(|pending| &pending.request.id != request_id);
+                }
+                structural = true;
+            }
+            HarnessEvent::ToolCallFinished { result } => {
+                self.record_workflow_result_for(session_id, result, cx);
+                self.persist_session(session_id, &shared, cx);
+                structural = true;
+            }
+            HarnessEvent::SteerDrained { steer_id, .. } => {
+                if let Some(state) = self.background_sessions.get_mut(session_id) {
+                    state
+                        .pending_inputs
+                        .retain(|input| input.id != steer_id.as_str());
+                }
+                self.persist_session(session_id, &shared, cx);
+                structural = true;
+            }
+            HarnessEvent::RunFinished { outcome, .. } => {
+                if let Some(run) = self.background_runs.get(session_id) {
+                    run.handle.take_pending_steers();
+                }
+                {
+                    let state = self
+                        .background_sessions
+                        .entry(session_id.to_string())
+                        .or_default();
+                    for input in &mut state.pending_inputs {
+                        input.kind = PendingInputKind::Queue;
+                    }
+                    state.queue_held = !matches!(outcome, RunOutcome::Completed)
+                        && !state.pending_inputs.is_empty();
+                    state
+                        .pending_approvals
+                        .retain(|pending| pending.agent_id.is_some());
+                    if let RunOutcome::Failed(error) = outcome {
+                        state.last_error = Some(error.clone());
+                    }
+                }
+                self.background_runs.remove(session_id);
+                if let Some(runtime) = &self.runtime {
+                    let computer = self.computer.clone();
+                    let session_id = session_id.to_string();
+                    runtime.spawn(async move {
+                        computer.finish_session(&session_id).await;
+                    });
+                }
+                self.mark_session_unread_live(session_id, &shared);
+                // Write synchronously before the sidebar rescans: a throttled
+                // save could land after the scan and make the unread marker
+                // flicker away.
+                if !self.preview_mode
+                    && let Err(error) = self.save_active_metadata(&shared)
+                {
+                    self.note_session_error(session_id, error);
+                }
+                self.refresh_sessions(cx);
+                structural = true;
+            }
+            HarnessEvent::TodosUpdated { .. } | HarnessEvent::ContextCompacted { .. } => {
+                self.persist_session(session_id, &shared, cx);
+            }
+            HarnessEvent::UsageUpdated { .. } => {}
+        }
+        if structural {
+            cx.notify();
+        }
+        if let HarnessEvent::RunFinished { outcome, .. } = &event
+            && outcome.is_success()
+        {
+            self.resume_after_run_for(session_id, cx);
+        }
+    }
+
+    /// Mark a background conversation as having something new, without
+    /// reordering the sidebar (only `updated_at` does that).
+    fn mark_session_unread_live(&mut self, session_id: &str, shared: &SharedSession) {
+        lock_session(shared).unread = true;
+        if let Some(summary) = self
+            .sessions
+            .iter_mut()
+            .find(|summary| summary.id == session_id)
+        {
+            summary.unread = true;
         }
     }
 
@@ -3153,14 +3778,34 @@ impl AppView {
             return;
         }
         match event {
-            AppEvent::Main(event) => self.handle_event(event, cx),
-            AppEvent::SubagentSpawned(info) => self.handle_subagent_spawned(info, cx),
-            AppEvent::SubagentHarness { agent_id, event } => {
-                self.handle_subagent_event(&agent_id, event, cx)
+            AppEvent::Main { session_id, event } => {
+                if self.session_is_active(&session_id) {
+                    self.handle_event(event, cx);
+                } else {
+                    self.handle_background_event(&session_id, event, cx);
+                }
             }
-            AppEvent::SubagentFinished(report) => self.handle_subagent_finished(report, cx),
-            AppEvent::AgentMessageToMain(message) => self.handle_agent_message_to_main(message, cx),
-            AppEvent::AgentMessageDelivered(info) => self.handle_agent_message_delivered(info, cx),
+            AppEvent::SubagentSpawned {
+                parent_session_id,
+                info,
+            } => self.handle_subagent_spawned(&parent_session_id, info, cx),
+            AppEvent::SubagentHarness {
+                parent_session_id,
+                agent_id,
+                event,
+            } => self.handle_subagent_event(&parent_session_id, &agent_id, event, cx),
+            AppEvent::SubagentFinished {
+                parent_session_id,
+                report,
+            } => self.handle_subagent_finished(&parent_session_id, report, cx),
+            AppEvent::AgentMessageToMain {
+                parent_session_id,
+                message,
+            } => self.handle_agent_message_to_main(&parent_session_id, message, cx),
+            AppEvent::AgentMessageDelivered {
+                parent_session_id,
+                info,
+            } => self.handle_agent_message_delivered(&parent_session_id, info, cx),
             AppEvent::ComputerOverlay(event) => self.handle_computer_overlay(event, cx),
             AppEvent::UpdateChecked(result) => self.handle_update_checked(result, cx),
             // Stress deltas are consumed by `stress_observe` above; the arm
@@ -3247,7 +3892,11 @@ impl AppView {
             .map(|active| lock_session(&active.shared).id.clone());
         match &event.kind {
             OverlayEventKind::Hide | OverlayEventKind::CaptureHide => {
-                self.close_computer_overlay(cx);
+                // A background conversation's capture must not close the bar
+                // that belongs to the active one.
+                if active_session.as_deref() == Some(event.session_id.as_str()) {
+                    self.close_computer_overlay(cx);
+                }
             }
             OverlayEventKind::Show { .. } | OverlayEventKind::Update { .. } => {
                 if active_session.as_deref() != Some(event.session_id.as_str()) {
@@ -3379,34 +4028,47 @@ impl AppView {
     /// an inter-agent card. If the main agent is idle it is woken.
     fn handle_agent_message_to_main(
         &mut self,
+        parent_session_id: &str,
         message: effibuddy_agent_core::AgentMessage,
         cx: &mut Context<Self>,
     ) {
-        let Some(shared) = self.active_shared() else {
+        let Some(shared) = self.shared_for_session(parent_session_id) else {
             return;
         };
+        let in_front = self.session_is_active(parent_session_id);
         {
             let mut session = lock_session(&shared);
             session.push_message(Message::from_agent_message(&message));
             graph_persist::record_message(&mut session.graph, &message, false, true);
             session.touch();
         }
-        self.persist_active(cx);
-        self.graph.invalidate();
-        self.chat_dirty = true;
-        if self.active_run.is_none() {
-            self.notice = Some(format!("收到来自 {} 的消息", message.from_name));
-            self.start_run(None, cx);
+        if in_front {
+            self.persist_active(cx);
+            self.graph.invalidate();
+            self.chat_dirty = true;
+        } else {
+            self.persist_session(parent_session_id, &shared, cx);
+            self.mark_session_unread_live(parent_session_id, &shared);
+        }
+        if !self.run_active_for(parent_session_id) {
+            if in_front {
+                self.notice = Some(format!("收到来自 {} 的消息", message.from_name));
+            }
+            self.start_run_for(shared, None, cx);
         }
         cx.notify();
     }
 
     fn handle_agent_message_delivered(
         &mut self,
+        parent_session_id: &str,
         info: crate::events::AgentMessageDeliveredInfo,
         cx: &mut Context<Self>,
     ) {
-        if let Some(shared) = self.active_shared() {
+        let Some(shared) = self.shared_for_session(parent_session_id) else {
+            return;
+        };
+        {
             let mut session = lock_session(&shared);
             graph_persist::record_message(
                 &mut session.graph,
@@ -3416,20 +4078,29 @@ impl AppView {
             );
             session.touch();
         }
-        self.persist_active(cx);
-        self.graph.invalidate();
-        self.chat_dirty = true;
+        if self.session_is_active(parent_session_id) {
+            self.persist_active(cx);
+            self.graph.invalidate();
+            self.chat_dirty = true;
+        } else {
+            self.persist_session(parent_session_id, &shared, cx);
+        }
         cx.notify();
     }
 
-    fn record_workflow_result(&mut self, result: &ToolResult, cx: &mut Context<Self>) {
+    fn record_workflow_result_for(
+        &mut self,
+        parent_session_id: &str,
+        result: &ToolResult,
+        cx: &mut Context<Self>,
+    ) {
         let Some(metadata) = &result.metadata else {
             return;
         };
         if metadata.get("workflow").is_none() {
             return;
         }
-        let Some(shared) = self.active_shared() else {
+        let Some(shared) = self.shared_for_session(parent_session_id) else {
             return;
         };
         {
@@ -3437,21 +4108,42 @@ impl AppView {
             graph_persist::record_workflow_metadata(&mut session.graph, metadata);
             session.touch();
         }
-        self.persist_active(cx);
-        self.graph.invalidate();
-        self.chat_dirty = true;
+        if self.session_is_active(parent_session_id) {
+            self.persist_active(cx);
+            self.graph.invalidate();
+            self.chat_dirty = true;
+        } else {
+            self.persist_session(parent_session_id, &shared, cx);
+        }
     }
 
-    fn handle_subagent_spawned(&mut self, info: SubagentSpawnedInfo, cx: &mut Context<Self>) {
-        if self.subagent_task_index.contains_key(&info.agent_id) {
+    fn handle_subagent_spawned(
+        &mut self,
+        parent_session_id: &str,
+        info: SubagentSpawnedInfo,
+        cx: &mut Context<Self>,
+    ) {
+        if self.subagent_task_index.contains_key(&info.agent_id)
+            || self
+                .background_sessions
+                .get(parent_session_id)
+                .is_some_and(|state| state.subagent_task_index.contains_key(&info.agent_id))
+        {
             return;
         }
-        if let Some(shared) = self.active_shared() {
+        let Some(shared) = self.shared_for_session(parent_session_id) else {
+            return;
+        };
+        let in_front = self.session_is_active(parent_session_id);
+        {
             let mut session = lock_session(&shared);
             graph_persist::record_spawn(&mut session.graph, &info);
             session.touch();
         }
-        self.push_subagent_task(AgentTask {
+        // A wake of a restored agent starts with the usage already on disk.
+        let usage = lock_session(&info.shared).usage.clone();
+        let total_tokens = usage.total_tokens;
+        let task = AgentTask {
             agent_id: info.agent_id,
             name: info.name,
             profile: info.profile,
@@ -3481,25 +4173,42 @@ impl AppView {
             error: None,
             data: None,
             tool_uses: 0,
-            total_tokens: 0,
+            usage,
+            total_tokens,
             duration_ms: 0,
             waiting_approval: false,
             restored: false,
-        });
-        self.persist_active(cx);
-        self.graph.invalidate();
-        self.chat_dirty = true;
-        self.ensure_agent_ticker(cx);
+        };
+        if in_front {
+            self.push_subagent_task(task);
+            self.persist_active(cx);
+            self.graph.invalidate();
+            self.chat_dirty = true;
+            self.ensure_agent_ticker(cx);
+        } else {
+            let state = self
+                .background_sessions
+                .entry(parent_session_id.to_string())
+                .or_default();
+            state
+                .subagent_task_index
+                .insert(task.agent_id.clone(), state.subagent_tasks.len());
+            state.subagent_tasks.push(task);
+            self.persist_session(parent_session_id, &shared, cx);
+            self.mark_session_unread_live(parent_session_id, &shared);
+        }
         cx.notify();
     }
 
     fn handle_subagent_event(
         &mut self,
+        parent_session_id: &str,
         agent_id: &str,
         event: HarnessEvent,
         cx: &mut Context<Self>,
     ) {
-        let viewing = self.side.agent_views.contains_key(agent_id);
+        let in_front = self.session_is_active(parent_session_id);
+        let viewing = in_front && self.side.agent_views.contains_key(agent_id);
         let mut structural = false;
         // Only topology/status changes redraw the graph. Per-step churn
         // (steps, assistant messages, tool calls, todos) invalidates nothing:
@@ -3508,7 +4217,7 @@ impl AppView {
         let mut graph_relevant = false;
         match &event {
             HarnessEvent::RunStarted { .. } => {
-                if let Some(task) = self.subagent_task_mut(agent_id) {
+                if let Some(task) = self.subagent_task_mut_for(parent_session_id, agent_id) {
                     task.status = SubagentStatus::Running;
                 }
                 structural = true;
@@ -3534,9 +4243,7 @@ impl AppView {
             HarnessEvent::AssistantFinished { message_id, .. } => {
                 if viewing {
                     let message = self
-                        .subagent_tasks
-                        .iter()
-                        .find(|task| task.agent_id == agent_id)
+                        .subagent_task_for(parent_session_id, agent_id)
                         .and_then(|task| {
                             let session = lock_session(&task.shared);
                             session
@@ -3554,26 +4261,42 @@ impl AppView {
                 structural = true;
             }
             HarnessEvent::ApprovalRequested { request } => {
-                if !self
-                    .pending_approvals
+                let approvals = if in_front {
+                    &mut self.pending_approvals
+                } else {
+                    &mut self
+                        .background_sessions
+                        .entry(parent_session_id.to_string())
+                        .or_default()
+                        .pending_approvals
+                };
+                if !approvals
                     .iter()
                     .any(|pending| pending.request.id == request.id)
                 {
-                    self.pending_approvals.push(PendingApproval {
+                    approvals.push(PendingApproval {
                         agent_id: Some(agent_id.to_string()),
                         request: request.clone(),
                     });
                 }
-                if let Some(task) = self.subagent_task_mut(agent_id) {
+                if let Some(task) = self.subagent_task_mut_for(parent_session_id, agent_id) {
                     task.waiting_approval = true;
                 }
                 structural = true;
                 graph_relevant = true;
             }
             HarnessEvent::ApprovalResolved { request_id, .. } => {
-                self.pending_approvals
-                    .retain(|pending| &pending.request.id != request_id);
-                if let Some(task) = self.subagent_task_mut(agent_id) {
+                let approvals = if in_front {
+                    &mut self.pending_approvals
+                } else {
+                    &mut self
+                        .background_sessions
+                        .entry(parent_session_id.to_string())
+                        .or_default()
+                        .pending_approvals
+                };
+                approvals.retain(|pending| &pending.request.id != request_id);
+                if let Some(task) = self.subagent_task_mut_for(parent_session_id, agent_id) {
                     task.waiting_approval = false;
                 }
                 structural = true;
@@ -3583,7 +4306,7 @@ impl AppView {
                 structural = true;
             }
             HarnessEvent::ToolCallFinished { result } => {
-                self.record_workflow_result(result, cx);
+                self.record_workflow_result_for(parent_session_id, result, cx);
                 structural = true;
             }
             HarnessEvent::RunFinished { .. } => {
@@ -3592,18 +4315,28 @@ impl AppView {
                 }
                 structural = true;
             }
+            HarnessEvent::UsageUpdated { usage } => {
+                // 子会话的用量增量已经并入它自己的会话；这里保留最新快照，
+                // 概览页汇总时无需逐帧加锁读取子会话。
+                if let Some(task) = self.subagent_task_mut_for(parent_session_id, agent_id) {
+                    task.usage = usage.clone();
+                    task.total_tokens = usage.total_tokens;
+                }
+                structural = true;
+            }
             HarnessEvent::TodosUpdated { .. }
             | HarnessEvent::ContextCompacted { .. }
             | HarnessEvent::SessionChanged
-            | HarnessEvent::SteerDrained { .. }
-            | HarnessEvent::UsageUpdated { .. } => {
+            | HarnessEvent::SteerDrained { .. } => {
                 structural = true;
             }
         }
         if structural {
-            self.chat_dirty = true;
-            if graph_relevant {
-                self.graph.invalidate();
+            if in_front {
+                self.chat_dirty = true;
+                if graph_relevant {
+                    self.graph.invalidate();
+                }
             }
             if let Some(view) = self.side.agent_views.get_mut(agent_id) {
                 view.dirty = true;
@@ -3618,42 +4351,58 @@ impl AppView {
         }
     }
 
-    fn handle_subagent_finished(&mut self, report: SubagentReport, cx: &mut Context<Self>) {
+    fn handle_subagent_finished(
+        &mut self,
+        parent_session_id: &str,
+        report: SubagentReport,
+        cx: &mut Context<Self>,
+    ) {
         let agent_id = report.agent_id.clone();
-        let active_id = self.active_id();
-        let mut belongs_to_active = false;
+        let Some(shared) = self.shared_for_session(parent_session_id) else {
+            return;
+        };
+        let in_front = self.session_is_active(parent_session_id);
         let mut known = false;
-        if let Some(task) = self.subagent_task_mut(&agent_id) {
+        if let Some(task) = self.subagent_task_mut_for(parent_session_id, &agent_id) {
             known = true;
-            belongs_to_active =
-                active_id.as_deref() == Some(task.parent_session_id.as_str()) || task.depth > 0;
             task.name = report.name.clone();
             task.status = report.status;
             task.report = Some(report.report.clone());
             task.error = report.error.clone();
             task.data = report.data.clone();
             task.tool_uses = report.tool_uses;
+            task.usage = report.usage.clone();
             task.total_tokens = report.usage.total_tokens;
             task.duration_ms = report.duration_ms;
             task.finished_at = Some(Instant::now());
             task.waiting_approval = false;
         }
-        if let Some(shared) = self.active_shared() {
+        {
             let mut session = lock_session(&shared);
             graph_persist::record_finish(&mut session.graph, &report);
             session.touch();
         }
-        self.graph.invalidate();
-        self.persist_active(cx);
-        self.pending_approvals
-            .retain(|pending| pending.agent_id.as_deref() != Some(agent_id.as_str()));
-        if let Some(view) = self.side.agent_views.get_mut(&agent_id) {
-            view.chat.end_stream();
-            view.dirty = true;
+        if in_front {
+            self.graph.invalidate();
+            self.persist_active(cx);
+            self.pending_approvals
+                .retain(|pending| pending.agent_id.as_deref() != Some(agent_id.as_str()));
+            if let Some(view) = self.side.agent_views.get_mut(&agent_id) {
+                view.chat.end_stream();
+                view.dirty = true;
+            }
+            self.chat_dirty = true;
+        } else {
+            if let Some(state) = self.background_sessions.get_mut(parent_session_id) {
+                state
+                    .pending_approvals
+                    .retain(|pending| pending.agent_id.as_deref() != Some(agent_id.as_str()));
+            }
+            self.persist_session(parent_session_id, &shared, cx);
+            self.mark_session_unread_live(parent_session_id, &shared);
         }
-        self.chat_dirty = true;
 
-        if known {
+        if known && in_front {
             self.notice = match report.status {
                 SubagentStatus::Completed => {
                     Some(format!("子代理「{}」已完成", report.description))
@@ -3667,40 +4416,68 @@ impl AppView {
             };
         }
 
-        if belongs_to_active
-            && report.background
+        if report.background
             && !report.wake
             && matches!(
                 report.status,
                 SubagentStatus::Completed | SubagentStatus::Failed
             )
         {
-            self.pending_subagent_notifications
-                .push(format_task_notification(&report));
-            self.maybe_flush_subagent_notifications(cx);
+            let notification = format_task_notification(&report);
+            if in_front {
+                self.pending_subagent_notifications.push(notification);
+            } else {
+                self.background_sessions
+                    .entry(parent_session_id.to_string())
+                    .or_default()
+                    .pending_subagent_notifications
+                    .push(notification);
+            }
+            self.maybe_flush_subagent_notifications_for(parent_session_id, cx);
         }
-        self.ensure_agent_ticker(cx);
+        if in_front {
+            self.ensure_agent_ticker(cx);
+        }
         cx.notify();
     }
 
-    fn maybe_flush_subagent_notifications(&mut self, cx: &mut Context<Self>) {
-        if self.active_run.is_some() || self.pending_subagent_notifications.is_empty() {
+    /// Wake one conversation whose background children reported while it was
+    /// idle. The notification becomes a synthetic user turn and starts a run
+    /// for that same session — in front if it is active, otherwise parked.
+    fn maybe_flush_subagent_notifications_for(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.run_active_for(session_id) {
             return;
         }
-        let Some(active) = &self.active else {
+        let Some(shared) = self.shared_for_session(session_id) else {
             return;
         };
-        let notifications = std::mem::take(&mut self.pending_subagent_notifications);
+        let in_front = self.session_is_active(session_id);
+        let notifications = if in_front {
+            std::mem::take(&mut self.pending_subagent_notifications)
+        } else {
+            self.background_sessions
+                .get_mut(session_id)
+                .map(|state| std::mem::take(&mut state.pending_subagent_notifications))
+                .unwrap_or_default()
+        };
+        if notifications.is_empty() {
+            return;
+        }
         let text = notifications.join("\n\n");
         {
-            let mut session = lock_session(&active.shared);
+            let mut session = lock_session(&shared);
             session.push_message(Message::synthetic_user(text));
             session.touch();
         }
-        self.persist_active(cx);
-        self.chat_dirty = true;
-        self.notice = Some("正在汇总后台子代理的结果…".to_string());
-        self.start_run(None, cx);
+        if in_front {
+            self.persist_active(cx);
+            self.chat_dirty = true;
+            self.notice = Some("正在汇总后台子代理的结果…".to_string());
+        } else {
+            self.persist_session(session_id, &shared, cx);
+            self.mark_session_unread_live(session_id, &shared);
+        }
+        self.start_run_for(shared, None, cx);
     }
 
     /// Continuation after a successful turn: auto-drain the queue head (one
@@ -3709,43 +4486,72 @@ impl AppView {
     /// ahead of the queued user message. A held queue (interrupt/failure) is
     /// never resumed from here — not even by an unrelated notification run —
     /// only by the user acting on the queue bar.
-    fn resume_after_run(&mut self, cx: &mut Context<Self>) {
-        if self.active_run.is_some() {
+    fn resume_after_run_for(&mut self, session_id: &str, cx: &mut Context<Self>) {
+        if self.run_active_for(session_id) {
             return;
         }
-        let notifications = std::mem::take(&mut self.pending_subagent_notifications);
-        let head = if self.queue_held {
-            None
-        } else {
-            self.pending_inputs
-                .iter()
-                .position(|input| input.kind == PendingInputKind::Queue)
+        let Some(shared) = self.shared_for_session(session_id) else {
+            return;
         };
+        let in_front = self.session_is_active(session_id);
+        let notifications;
+        let mut head: Option<RunInput> = None;
+        if in_front {
+            notifications = std::mem::take(&mut self.pending_subagent_notifications);
+            if !self.queue_held
+                && let Some(index) = self
+                    .pending_inputs
+                    .iter()
+                    .position(|input| input.kind == PendingInputKind::Queue)
+            {
+                let input = self.pending_inputs.remove(index);
+                head = Some(RunInput {
+                    text: input.text,
+                    attachments: input.attachments,
+                });
+            }
+            if head.is_some() {
+                self.queue_held = false;
+            }
+        } else {
+            let state = self
+                .background_sessions
+                .entry(session_id.to_string())
+                .or_default();
+            notifications = std::mem::take(&mut state.pending_subagent_notifications);
+            if !state.queue_held
+                && let Some(index) = state
+                    .pending_inputs
+                    .iter()
+                    .position(|input| input.kind == PendingInputKind::Queue)
+            {
+                let input = state.pending_inputs.remove(index);
+                head = Some(RunInput {
+                    text: input.text,
+                    attachments: input.attachments,
+                });
+            }
+            if head.is_some() {
+                state.queue_held = false;
+            }
+        }
         if notifications.is_empty() && head.is_none() {
             return;
         }
-        let head = head
-            .map(|index| self.pending_inputs.remove(index))
-            .map(|input| RunInput {
-                text: input.text,
-                attachments: input.attachments,
-            });
-        if head.is_some() {
-            self.queue_held = false;
-        }
         if !notifications.is_empty() {
-            let Some(active) = &self.active else {
-                return;
-            };
             {
-                let mut session = lock_session(&active.shared);
+                let mut session = lock_session(&shared);
                 session.push_message(Message::synthetic_user(notifications.join("\n\n")));
                 session.touch();
             }
-            self.persist_active(cx);
-            self.chat_dirty = true;
+            if in_front {
+                self.persist_active(cx);
+                self.chat_dirty = true;
+            } else {
+                self.persist_session(session_id, &shared, cx);
+            }
         }
-        self.start_run(head, cx);
+        self.start_run_for(shared, head, cx);
     }
 
     fn ensure_agent_ticker(&mut self, cx: &mut Context<Self>) {
@@ -3983,15 +4789,27 @@ impl AppView {
         }
     }
 
-    /// Rebuild read-only agent tasks for the active session's children from
-    /// disk. Children without a terminal record are marked `Lost`: the process
-    /// exited before they finished, mirroring ZCode's rule that persisted
-    /// metadata is the only cross-restart terminal state.
+    /// Rebuild read-only agent tasks for the active session's whole subagent
+    /// tree from disk. Children without a terminal record are marked `Lost`:
+    /// the process exited before they finished, mirroring ZCode's rule that
+    /// persisted metadata is the only cross-restart terminal state.
+    ///
+    /// Descendants are restored too, not just direct children: the overview
+    /// accumulates consumption over every subagent, and a restart must not
+    /// silently drop the grandchildren of a nested run.
     fn restore_subagent_history(&mut self) {
         let Some(session_id) = self.active_id() else {
             return;
         };
-        for child in self.store.child_sessions(&session_id) {
+        let children = self.store.descendant_sessions_raw(&session_id);
+        // session id → (agent id, agent name, depth). Descendants come sorted
+        // by creation time, so a parent is always known before its child.
+        let mut owners: HashMap<String, (String, String, usize)> = HashMap::from([(
+            session_id.clone(),
+            ("main".to_string(), "main".to_string(), 0),
+        )]);
+        for mut child in children {
+            child.normalize_after_load();
             let record = child.child_run.clone();
             let status = record
                 .as_ref()
@@ -4019,10 +4837,11 @@ impl AppView {
                         .max(0) as u64
                 })
                 .unwrap_or(0);
-            let total_tokens = record
+            let usage = record
                 .as_ref()
-                .map(|record| record.usage.total_tokens)
-                .unwrap_or(child.usage.total_tokens);
+                .map(|record| record.usage.clone())
+                .unwrap_or_else(|| child.usage.clone());
+            let total_tokens = usage.total_tokens;
             let started_at = Instant::now()
                 - Duration::from_millis(
                     (Utc::now() - child.created_at).num_milliseconds().max(0) as u64
@@ -4043,9 +4862,25 @@ impl AppView {
                 .unwrap_or_else(|| "agent".to_string());
             let description = child.agent_description.clone().unwrap_or_default();
             let child_session_id = child.id.clone();
+            let parent_session_id = child
+                .parent_id
+                .clone()
+                .unwrap_or_else(|| session_id.clone());
+            let (parent_agent_id, parent_agent_name, parent_depth) = owners
+                .get(&parent_session_id)
+                .cloned()
+                .unwrap_or_else(|| ("main".to_string(), "main".to_string(), 0));
+            let depth = record
+                .as_ref()
+                .map(|record| record.depth)
+                .unwrap_or(parent_depth + 1);
             let model = child.model.clone();
             let provider_id = child.provider_id.clone();
             let shared = new_shared_session(child);
+            owners.insert(
+                child_session_id.clone(),
+                (agent_id.clone(), name.clone(), depth),
+            );
             self.push_subagent_task(AgentTask {
                 agent_id,
                 name,
@@ -4058,12 +4893,12 @@ impl AppView {
                 finished_at,
                 child_session_id,
                 parent_call_id: String::new(),
-                parent_session_id: session_id.clone(),
-                parent_agent_id: Some("main".to_string()),
-                parent_agent_name: Some("main".to_string()),
+                parent_session_id,
+                parent_agent_id: Some(parent_agent_id),
+                parent_agent_name: Some(parent_agent_name),
                 group_id: None,
                 group_name: None,
-                depth: record.as_ref().map(|record| record.depth).unwrap_or(1),
+                depth,
                 visibility: AgentVisibility::Public,
                 read_only: false,
                 can_spawn: false,
@@ -4076,6 +4911,7 @@ impl AppView {
                 error: None,
                 data: None,
                 tool_uses,
+                usage,
                 total_tokens,
                 duration_ms,
                 waiting_approval: false,
@@ -4084,41 +4920,65 @@ impl AppView {
         }
     }
 
-    fn reset_subagents(&mut self) {
-        for service in &self.subagent_services {
-            service.stop_all();
-        }
-        self.subagent_services.clear();
-        self.subagent_tasks.clear();
-        self.subagent_task_index.clear();
-        self.side.agent_views.clear();
-        let ids: Vec<String> = self
-            .side
-            .tabs
-            .iter()
-            .filter(|tab| matches!(tab.kind, SidePaneTabKind::Agent(_)))
-            .map(|tab| tab.id.clone())
-            .collect();
-        for id in ids {
-            self.side.close_tab(&id);
-        }
-        self.pending_subagent_notifications.clear();
-        self.pending_inputs.clear();
-        self.pending_approvals
-            .retain(|pending| pending.agent_id.is_none());
-    }
-
     /// Append a task and register its index. All task inserts go through
-    /// here so [`Self::subagent_task_mut`] stays O(1).
+    /// here so [`Self::subagent_task_mut_for`] stays O(1).
     fn push_subagent_task(&mut self, task: AgentTask) {
         self.subagent_task_index
             .insert(task.agent_id.clone(), self.subagent_tasks.len());
         self.subagent_tasks.push(task);
     }
 
-    fn subagent_task_mut(&mut self, agent_id: &str) -> Option<&mut AgentTask> {
-        let index = *self.subagent_task_index.get(agent_id)?;
-        self.subagent_tasks.get_mut(index)
+    /// Task lookup scoped by parent conversation: the active transcript keeps
+    /// its rows in `subagent_tasks`, parked conversations in their UI state.
+    fn subagent_task_mut_for(
+        &mut self,
+        parent_session_id: &str,
+        agent_id: &str,
+    ) -> Option<&mut AgentTask> {
+        if self.session_is_active(parent_session_id) {
+            let index = *self.subagent_task_index.get(agent_id)?;
+            self.subagent_tasks.get_mut(index)
+        } else {
+            let state = self.background_sessions.get_mut(parent_session_id)?;
+            let index = *state.subagent_task_index.get(agent_id)?;
+            state.subagent_tasks.get_mut(index)
+        }
+    }
+
+    fn subagent_task_for(&self, parent_session_id: &str, agent_id: &str) -> Option<&AgentTask> {
+        if self.session_is_active(parent_session_id) {
+            let index = *self.subagent_task_index.get(agent_id)?;
+            self.subagent_tasks.get(index)
+        } else {
+            let state = self.background_sessions.get(parent_session_id)?;
+            let index = *state.subagent_task_index.get(agent_id)?;
+            state.subagent_tasks.get(index)
+        }
+    }
+
+    /// 当前会话树里所有子智能体的累计消耗。`subagent_tasks` 属于当前会话，
+    /// 切换会话时随停放/恢复一起切换，因此这里直接全量汇总即可。
+    pub(crate) fn subagent_usage(&self) -> SubagentUsage {
+        let mut total = SubagentUsage::default();
+        for task in &self.subagent_tasks {
+            total.count += 1;
+            total.prompt_tokens += task.usage.prompt_tokens;
+            total.completion_tokens += task.usage.completion_tokens;
+            total.cached_tokens += task.usage.cached_tokens;
+            total.total_tokens += task.usage.total_tokens;
+        }
+        total
+    }
+
+    /// 输入框占用环与概览页共用的一次快照：主会话的上下文占用 +
+    /// 整棵子代理树的累计消耗。
+    pub(crate) fn context_usage(&self, context_window: usize) -> ContextUsage {
+        let mut usage = self
+            .active_shared()
+            .map(|shared| crate::context_meter::collect(&shared, context_window))
+            .unwrap_or_else(|| ContextUsage::empty(context_window));
+        usage.subagents = self.subagent_usage();
+        usage
     }
 
     fn agent_cards(&self) -> HashMap<String, AgentCard> {
@@ -4358,11 +5218,6 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.active_run.is_some() {
-            self.notice = Some("当前任务仍在运行，请先停止。".to_string());
-            cx.notify();
-            return;
-        }
         let (workspace, legacy_project, project_id) = match project_id {
             Some(id) => {
                 let primary = self
@@ -4437,7 +5292,17 @@ impl AppView {
         // own scope so its text and model come back later.
         self.remember_active_draft(cx);
         self.persist_active(cx);
-        self.retire_computer_session(cx);
+        self.close_computer_overlay(cx);
+        let children_running = self
+            .subagent_tasks
+            .iter()
+            .any(|task| task.status == SubagentStatus::Running);
+        if self.active_run.is_none() && !children_running {
+            self.retire_computer_session(cx);
+        }
+        // Opening a fresh conversation parks whatever is running; it keeps
+        // working in the background and the sidebar row shows it.
+        self.stash_active_session_ui();
         let mut session = self.models.new_session_state(workspace);
         session.permission_mode = self.config.effective_default_mode();
         session.project_id = project_id;
@@ -4453,7 +5318,9 @@ impl AppView {
         self.project_menu = ProjectMenuState::default();
         self.project_editor = None;
         self.settings_open = false;
-        self.reset_subagents();
+        self.clear_session_ui_views();
+        self.restore_session_ui(&id);
+        self.restore_subagent_history();
         self.sync_side_pane_workspace(cx);
         self.last_error = None;
         self.notice = None;
@@ -4683,30 +5550,49 @@ impl AppView {
             self.mark_session_read(id, cx);
             return;
         }
-        if self.active_run.is_some() {
-            self.notice = Some("任务运行中，先停止后再切换会话。".to_string());
-            cx.notify();
-            return;
-        }
         // Capture the outgoing composer text and unsent-draft binding before
         // the active session changes.
         self.remember_active_draft(cx);
         self.persist_active(cx);
-        self.retire_computer_session(cx);
-        let Some(mut state) = self.store.load(id) else {
-            self.last_error = Some("无法读取该会话。".to_string());
-            cx.notify();
-            return;
+        // Resolve the target first: a missing transcript must not park the
+        // outgoing session and leave the UI pointing at an empty run.
+        let shared = if let Some(run) = self.background_runs.get(id) {
+            run.shared.clone()
+        } else if let Some(shared) = self.session_shares.get(id) {
+            shared.clone()
+        } else {
+            let Some(mut state) = self.store.load(id) else {
+                self.last_error = Some("无法读取该会话。".to_string());
+                cx.notify();
+                return;
+            };
+            self.models.normalize_session(&mut state);
+            new_shared_session(state)
         };
-        self.models.normalize_session(&mut state);
-        self.active = Some(ActiveSession {
-            shared: new_shared_session(state),
-        });
+        let had_stash = self.background_sessions.contains_key(id);
+        // Leaving a conversation normally ends its computer session. A running
+        // turn must keep its consent and isolation until it finishes, though.
+        // The overlay belongs to the outgoing transcript either way: its stop
+        // button must never interrupt the newly active session.
+        self.close_computer_overlay(cx);
+        let children_running = self
+            .subagent_tasks
+            .iter()
+            .any(|task| task.status == SubagentStatus::Running);
+        if self.active_run.is_none() && !children_running {
+            self.retire_computer_session(cx);
+        }
+        // Park the outgoing run and its queue/approval/subagent state. It keeps
+        // streaming in the background and can be resumed by clicking its row.
+        self.stash_active_session_ui();
+        self.active = Some(ActiveSession { shared });
         self.settings_open = false;
-        self.reset_subagents();
-        self.restore_subagent_history();
+        self.clear_session_ui_views();
+        self.restore_session_ui(id);
+        if !had_stash {
+            self.restore_subagent_history();
+        }
         self.sync_side_pane_workspace(cx);
-        self.last_error = None;
         self.notice = None;
         self.expanded_reasoning.clear();
         self.expanded_tools.clear();
@@ -4722,6 +5608,19 @@ impl AppView {
         self.chat.pin_to_bottom();
         self.graph.invalidate();
         self.graph.clear_selection();
+        // A conversation that was running while in the background reopens on
+        // its partial answer; the typewriter resumes from the current text.
+        self.prime_active_chat_stream();
+        if self.active_run.is_some() {
+            self.ensure_run_ticker(cx);
+        }
+        if self
+            .subagent_tasks
+            .iter()
+            .any(|task| task.status == SubagentStatus::Running)
+        {
+            self.ensure_agent_ticker(cx);
+        }
         // Bring back whatever was typed here before the user switched away.
         self.restore_composer_draft(cx);
         self.remember_active_draft(cx);
@@ -4733,11 +5632,7 @@ impl AppView {
     /// Toggle a session's pinned flag. Pinned conversations move into the
     /// sidebar's 置顶 section and out of their project/task group.
     fn toggle_pin(&mut self, id: &str, cx: &mut Context<Self>) {
-        let is_active = self.active_id().as_deref() == Some(id);
-        let (result, pinned) = if is_active {
-            let Some(shared) = self.active.as_ref().map(|active| active.shared.clone()) else {
-                return;
-            };
+        let (result, pinned) = if let Some(shared) = self.shared_for_session(id) {
             let pinned = {
                 let mut session = lock_session(&shared);
                 session.pinned = !session.pinned;
@@ -4745,13 +5640,7 @@ impl AppView {
             };
             (self.save_active_metadata(&shared), pinned)
         } else {
-            match self.store.load_for_update(id) {
-                Some(mut session) => {
-                    session.pinned = !session.pinned;
-                    (self.store.save(&session), session.pinned)
-                }
-                None => (Err("无法读取该会话。".to_string()), false),
-            }
+            (Err("无法读取该会话。".to_string()), false)
         };
         if let Err(error) = result {
             self.last_error = Some(error);
@@ -4791,8 +5680,12 @@ impl AppView {
     /// is finished" action, so it replaces the old per-row delete button.
     fn archive_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let is_active = self.active_id().as_deref() == Some(id);
-        if is_active && self.active_run.is_some() {
-            self.notice = Some("任务运行中，不能归档当前会话。".to_string());
+        if self.session_row_status(id).running {
+            self.notice = Some(if is_active {
+                "任务运行中，不能归档当前会话。".to_string()
+            } else {
+                "该会话仍在后台运行，停止后才能归档。".to_string()
+            });
             cx.notify();
             return;
         }
@@ -4824,6 +5717,8 @@ impl AppView {
 
         if is_active {
             self.activate_session_after_removal(id, cx);
+        } else {
+            self.forget_session_runtime(id);
         }
 
         self.notice = Some("会话已归档，可在 设置 → 归档 中恢复。".to_string());
@@ -4837,21 +5732,31 @@ impl AppView {
     /// draft, else a fresh task draft — and restores that session's composer
     /// draft text so both removal paths behave like a normal switch.
     fn activate_session_after_removal(&mut self, removed_id: &str, cx: &mut Context<Self>) {
+        // The outgoing conversation is being archived/deleted: drop its parked
+        // state instead of keeping a ghost run around.
+        self.close_computer_overlay(cx);
+        self.discard_active_session_ui();
         self.active = None;
         self.settings_open = false;
-        if let Some(summary) = self
+        let next_id = self
             .sessions
             .iter()
             .find(|summary| summary.id != removed_id)
-            .cloned()
-            && let Some(mut state) = self.store.load(&summary.id)
+            .map(|summary| summary.id.clone());
+        let mut next_shared = next_id.as_deref().and_then(|id| {
+            self.background_runs
+                .get(id)
+                .map(|run| run.shared.clone())
+                .or_else(|| self.session_shares.get(id).cloned())
+        });
+        if next_shared.is_none()
+            && let Some(id) = next_id.as_deref()
+            && let Some(mut state) = self.store.load(id)
         {
             self.models.normalize_session(&mut state);
-            self.active = Some(ActiveSession {
-                shared: new_shared_session(state),
-            });
+            next_shared = Some(new_shared_session(state));
         }
-        if self.active.is_none() {
+        if next_shared.is_none() {
             let mut task_draft = self
                 .drafts
                 .scope_session(TASK_SCOPE)
@@ -4859,21 +5764,30 @@ impl AppView {
                 .filter(|session| session.messages.is_empty() && !session.archived);
             if let Some(state) = task_draft.as_mut() {
                 self.models.normalize_session(state);
-                self.active = Some(ActiveSession {
-                    shared: new_shared_session(state.clone()),
-                });
+                next_shared = Some(new_shared_session(state.clone()));
             } else {
                 let mut session = self.models.new_session_state(self.config.workspace());
                 session.permission_mode = self.config.effective_default_mode();
                 let id = session.id.clone();
                 let _ = self.store.save(&session);
                 self.drafts.bind_scope(TASK_SCOPE, &id);
-                self.active = Some(ActiveSession {
-                    shared: new_shared_session(session),
-                });
+                next_shared = Some(new_shared_session(session));
             }
         }
-        self.reset_subagents();
+        if let Some(shared) = next_shared {
+            self.active = Some(ActiveSession { shared });
+            let target_id = self.active_id();
+            let had_stash = target_id
+                .as_deref()
+                .is_some_and(|id| self.background_sessions.contains_key(id));
+            self.clear_session_ui_views();
+            if let Some(id) = target_id.as_deref() {
+                self.restore_session_ui(id);
+            }
+            if !had_stash {
+                self.restore_subagent_history();
+            }
+        }
         self.sync_side_pane_workspace(cx);
         self.expanded_reasoning.clear();
         self.expanded_tools.clear();
@@ -4889,6 +5803,17 @@ impl AppView {
         self.chat.pin_to_bottom();
         self.graph.invalidate();
         self.graph.clear_selection();
+        self.prime_active_chat_stream();
+        if self.active_run.is_some() {
+            self.ensure_run_ticker(cx);
+        }
+        if self
+            .subagent_tasks
+            .iter()
+            .any(|task| task.status == SubagentStatus::Running)
+        {
+            self.ensure_agent_ticker(cx);
+        }
         self.restore_composer_draft(cx);
         self.remember_active_draft(cx);
         if let Some(id) = self.active_id() {
@@ -4900,8 +5825,12 @@ impl AppView {
     /// menu arms the confirmation first; this performs the second click.
     fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let is_active = self.active_id().as_deref() == Some(id);
-        if is_active && self.active_run.is_some() {
-            self.notice = Some("任务运行中，不能删除当前会话。".to_string());
+        if self.session_row_status(id).running {
+            self.notice = Some(if is_active {
+                "任务运行中，不能删除当前会话。".to_string()
+            } else {
+                "该会话仍在后台运行，停止后才能删除。".to_string()
+            });
             self.session_menu = SessionMenuState::default();
             cx.notify();
             return;
@@ -4917,6 +5846,8 @@ impl AppView {
         self.save_drafts_now();
         if is_active {
             self.activate_session_after_removal(id, cx);
+        } else {
+            self.forget_session_runtime(id);
         }
         self.notice = Some("会话已删除。".to_string());
         self.refresh_sessions(cx);
@@ -4960,6 +5891,7 @@ impl AppView {
             Ok(()) => {
                 crate::checkpoint::remove_session_checkpoints(id);
                 self.drafts.remove_session(id);
+                self.forget_session_runtime(id);
                 self.save_drafts_now();
                 self.settings.status = Some((true, "已删除归档会话。".to_string()));
             }
@@ -5065,24 +5997,14 @@ impl AppView {
     /// never touches `updated_at` and never reorders the list.
     fn set_session_unread(&mut self, id: &str, unread: bool, cx: &mut Context<Self>) {
         self.session_menu = SessionMenuState::default();
-        let is_active = self.active_id().as_deref() == Some(id);
-        let result = if is_active {
-            let Some(shared) = self.active_shared() else {
-                return;
-            };
+        let result = if let Some(shared) = self.shared_for_session(id) {
             {
                 let mut session = lock_session(&shared);
                 session.unread = unread;
             }
             self.save_active_metadata(&shared)
         } else {
-            match self.store.load_for_update(id) {
-                Some(mut session) => {
-                    session.unread = unread;
-                    self.store.save(&session)
-                }
-                None => Err("无法读取该会话。".to_string()),
-            }
+            Err("无法读取该会话。".to_string())
         };
         match result {
             Ok(()) => {
@@ -5195,24 +6117,14 @@ impl AppView {
             cx.notify();
             return;
         }
-        let is_active = self.active_id().as_deref() == Some(rename.id.as_str());
-        let result = if is_active {
-            let Some(shared) = self.active_shared() else {
-                return;
-            };
+        let result = if let Some(shared) = self.shared_for_session(&rename.id) {
             {
                 let mut session = lock_session(&shared);
                 session.title = name.clone();
             }
             self.save_active_metadata(&shared)
         } else {
-            match self.store.load_for_update(&rename.id) {
-                Some(mut session) => {
-                    session.title = name.clone();
-                    self.store.save(&session)
-                }
-                None => Err("无法读取该会话。".to_string()),
-            }
+            Err("无法读取该会话。".to_string())
         };
         match result {
             Ok(()) => {
@@ -7016,6 +7928,7 @@ impl AppView {
                             active_id.as_deref() == Some(summary.id.as_str()),
                         ),
                         stagger_ix,
+                        self.session_row_status(&summary.id),
                         cx,
                     ));
                 }
@@ -7101,6 +8014,7 @@ impl AppView {
                                 active_id.as_deref() == Some(summary.id.as_str()),
                             ),
                             stagger_ix,
+                            self.session_row_status(&summary.id),
                             cx,
                         ));
                     }
@@ -7157,6 +8071,7 @@ impl AppView {
                             active_id.as_deref() == Some(summary.id.as_str()),
                         ),
                         stagger_ix,
+                        self.session_row_status(&summary.id),
                         cx,
                     ));
                 }
@@ -8013,10 +8928,7 @@ impl AppView {
         } else {
             resolved.context_window()
         };
-        let context_usage = self
-            .active_shared()
-            .map(|shared| crate::context_meter::collect(&shared, context_window))
-            .unwrap_or_else(|| crate::context_meter::ContextUsage::empty(context_window));
+        let context_usage = self.context_usage(context_window);
         let context_pct = context_usage.percent();
 
         let permission_mode = self.permission_mode();
@@ -9755,14 +10667,33 @@ impl Drop for AppView {
             run.handle.interrupt();
             run.approval.deny_all();
         }
+        for run in self.background_runs.values() {
+            run.handle.interrupt();
+            run.approval.deny_all();
+        }
         // Teardown path: no executor context here, so serialize inline — the
-        // process is exiting either way.
-        if !self.preview_mode
-            && let Some(active) = &self.active
-        {
-            let snapshot = lock_session(&active.shared).clone();
-            if let Ok(save) = self.store.stage(&snapshot) {
-                let _ = self.persist_tx.send(save);
+        // process is exiting either way. Background conversations persist too;
+        // their last throttled write may still be in flight.
+        if !self.preview_mode {
+            let active_id = self.active_id();
+            let mut written = std::collections::HashSet::new();
+            if let Some(active) = &self.active {
+                let snapshot = lock_session(&active.shared).clone();
+                written.insert(snapshot.id.clone());
+                if let Ok(save) = self.store.stage(&snapshot) {
+                    let _ = self.persist_tx.send(save);
+                }
+            }
+            for shared in self.session_shares.values() {
+                let snapshot = lock_session(shared).clone();
+                if snapshot.id == active_id.as_deref().unwrap_or_default()
+                    || !written.insert(snapshot.id.clone())
+                {
+                    continue;
+                }
+                if let Ok(save) = self.store.stage(&snapshot) {
+                    let _ = self.persist_tx.send(save);
+                }
             }
             // Flush the composer draft synchronously: the debounced writer may
             // not get another executor turn before the process exits.
@@ -10702,11 +11633,20 @@ fn motion_session_row(
     force_hover: bool,
     marquee: SessionMarqueeFrame,
     stagger: usize,
+    status: SessionRowStatus,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let motion_id = SharedString::from(summary.id.clone());
-    let mut row =
-        sidebar_session_row(theme, summary, active, pinned_group, force_hover, marquee, cx);
+    let mut row = sidebar_session_row(
+        theme,
+        summary,
+        active,
+        pinned_group,
+        force_hover,
+        marquee,
+        status,
+        cx,
+    );
     // 展开时新行按 50ms stagger 渐显。只延迟透明度：下方已存在的行仍然
     // 立刻位移（不延迟 FLIP），所以新行淡入时不会和滑动中的内容重叠；
     // stagger 封顶 10 行，长列表末行不会等太久。
@@ -10726,6 +11666,7 @@ fn sidebar_session_row(
     pinned_group: bool,
     force_hover: bool,
     marquee: SessionMarqueeFrame,
+    status: SessionRowStatus,
     cx: &mut Context<AppView>,
 ) -> Stateful<Div> {
     let id = summary.id.clone();
@@ -10815,7 +11756,28 @@ fn sidebar_session_row(
                         .justify_end()
                         .when(force_hover, |element| element.opacity(0.0))
                         .group_hover(row_group.clone(), |style| style.opacity(0.0))
-                        .child(if unread {
+                        .child(if status.waiting_approval {
+                            div()
+                                .id(SharedString::from(format!("approval-dot-{id}")))
+                                .size(px(7.0))
+                                .rounded(px(999.0))
+                                .bg(theme.warning)
+                                .tooltip(effibuddy_ui::tooltip(
+                                    theme,
+                                    "等待你的批准 · 点击切换",
+                                ))
+                                .into_any_element()
+                        } else if status.running {
+                            div()
+                                .id(SharedString::from(format!("running-dot-{id}")))
+                                .size(px(12.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Spinner::new(theme.accent, 12.0))
+                                .tooltip(effibuddy_ui::tooltip(theme, "会话正在运行 · 点击切换"))
+                                .into_any_element()
+                        } else if unread {
                             div()
                                 .id(SharedString::from(format!("unread-dot-{id}")))
                                 .size(px(7.0))

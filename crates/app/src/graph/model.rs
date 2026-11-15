@@ -797,6 +797,10 @@ mod tests {
             error: None,
             data: None,
             tool_uses: 1,
+            usage: effibuddy_agent_core::Usage {
+                total_tokens: 10,
+                ..Default::default()
+            },
             total_tokens: 10,
             duration_ms: 10,
             waiting_approval: false,

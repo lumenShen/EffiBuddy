@@ -66,7 +66,7 @@ async fn wait_for_finish(
 ) -> effibuddy_agent_core::SubagentReport {
     tokio::time::timeout(Duration::from_secs(3), async {
         while let Some(event) = rx.recv().await {
-            if let AppEvent::SubagentFinished(report) = event {
+            if let AppEvent::SubagentFinished { report, .. } = event {
                 return report;
             }
         }
@@ -104,13 +104,16 @@ async fn foreground_child_runs_persists_and_emits_lifecycle() {
     let mut finished = false;
     while let Ok(event) = rx.try_recv() {
         match event {
-            AppEvent::SubagentSpawned(info) => {
+            AppEvent::SubagentSpawned { info, .. } => {
                 spawned = true;
                 assert_eq!(info.name, report.name);
                 assert_eq!(info.depth, 1);
                 assert_eq!(info.visibility, AgentVisibility::Private);
             }
-            AppEvent::SubagentFinished(finished_report) => {
+            AppEvent::SubagentFinished {
+                report: finished_report,
+                ..
+            } => {
                 finished = true;
                 assert_eq!(finished_report.name, report.name);
             }
@@ -345,7 +348,7 @@ async fn messaging_to_main_is_forwarded_to_the_ui() {
     assert!(outcome.woke);
     let event = rx.try_recv().expect("event");
     match event {
-        AppEvent::AgentMessageToMain(message) => {
+        AppEvent::AgentMessageToMain { message, .. } => {
             assert_eq!(message.to_name, "main");
             assert_eq!(message.data, Some(serde_json::json!({"ok": true})));
         }

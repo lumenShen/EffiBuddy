@@ -122,6 +122,12 @@ impl SubagentService {
         }
     }
 
+    /// Main conversation this service belongs to. Runs from other sessions
+    /// stay untouched when the user stops the active one.
+    pub fn parent_session_id(&self) -> &str {
+        &self.parent_session_id
+    }
+
     /// Reload Markdown profiles from both scopes and publish the merged
     /// catalog. Runs on construction, on every spawn and before the catalog
     /// query, so file edits are picked up without a restart.
@@ -422,6 +428,7 @@ impl SubagentService {
         let forward_shared = prepared.shared.clone();
         let forward_store = self.store.clone();
         let forward_agent = agent_id.clone();
+        let forward_parent = self.parent_session_id.clone();
         let last_save = Arc::new(Mutex::new(None::<Instant>));
         let flush_scheduled = Arc::new(AtomicBool::new(false));
         let save_runtime = self.runtime.clone();
@@ -477,6 +484,7 @@ impl SubagentService {
                 }
                 if events
                     .send(AppEvent::SubagentHarness {
+                        parent_session_id: forward_parent.clone(),
                         agent_id: forward_agent.clone(),
                         event,
                     })
@@ -634,7 +642,10 @@ impl SubagentService {
         // the finish; the registry must already report it as idle so the
         // message wakes it instead of being queued behind a stale Running state.
         let needs_wake = self.registry.finish(&agent_id, status);
-        self.emit(AppEvent::SubagentFinished(report.clone()));
+        self.emit(AppEvent::SubagentFinished {
+            parent_session_id: self.parent_session_id.clone(),
+            report: report.clone(),
+        });
         if needs_wake {
             self.spawn_wake(&agent_id);
         }
@@ -695,7 +706,10 @@ impl SubagentService {
 
         // Main agent: the app owns its transcript and wake policy.
         if target_id.is_none() {
-            self.emit(AppEvent::AgentMessageToMain(message));
+            self.emit(AppEvent::AgentMessageToMain {
+                parent_session_id: self.parent_session_id.clone(),
+                message,
+            });
             return Ok(AgentSendOutcome {
                 to: target,
                 delivered: true,
@@ -723,12 +737,15 @@ impl SubagentService {
             queued: !woke,
             woke,
         };
-        self.emit(AppEvent::AgentMessageDelivered(AgentMessageDeliveredInfo {
-            message,
-            target_session_id,
-            queued: outcome.queued,
-            woke: outcome.woke,
-        }));
+        self.emit(AppEvent::AgentMessageDelivered {
+            parent_session_id: self.parent_session_id.clone(),
+            info: AgentMessageDeliveredInfo {
+                message,
+                target_session_id,
+                queued: outcome.queued,
+                woke: outcome.woke,
+            },
+        });
         Ok(outcome)
     }
 
@@ -763,11 +780,10 @@ impl SubagentSpawner for SubagentService {
         }
         self.registry
             .register(&agent_id, descriptor, &prepared, token.clone());
-        self.emit(AppEvent::SubagentSpawned(self.spawned_info(
-            &agent_id,
-            &prepared,
-            Instant::now(),
-        )));
+        self.emit(AppEvent::SubagentSpawned {
+            parent_session_id: self.parent_session_id.clone(),
+            info: self.spawned_info(&agent_id, &prepared, Instant::now()),
+        });
 
         // The parent's cancellation must reach the child even when the parent
         // tool future is dropped by the executor.
@@ -800,7 +816,10 @@ impl SubagentSpawner for SubagentService {
                 );
                 self.registry
                     .finish(&fallback_agent, SubagentStatus::Failed);
-                self.emit(AppEvent::SubagentFinished(report.clone()));
+                self.emit(AppEvent::SubagentFinished {
+                    parent_session_id: self.parent_session_id.clone(),
+                    report: report.clone(),
+                });
                 report
             }
         };
@@ -824,11 +843,10 @@ impl SubagentSpawner for SubagentService {
         }
         self.registry
             .register(&agent_id, descriptor, &prepared, token.clone());
-        self.emit(AppEvent::SubagentSpawned(self.spawned_info(
-            &agent_id,
-            &prepared,
-            Instant::now(),
-        )));
+        self.emit(AppEvent::SubagentSpawned {
+            parent_session_id: self.parent_session_id.clone(),
+            info: self.spawned_info(&agent_id, &prepared, Instant::now()),
+        });
 
         let this = self.clone();
         let spawn_agent = agent_id.clone();

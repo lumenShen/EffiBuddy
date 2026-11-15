@@ -2609,10 +2609,17 @@ struct TurnReveal<'a> {
 }
 
 impl TurnReveal<'_> {
-    /// 用 `with_animations` 两段式实现 stagger：第一段只是静默等待
-    /// `index × 50ms`，第二段 180ms ease-out 渐显。元素挂载期间动画状态
-    /// 由 GPUI 按元素路径持久保存，折叠后重新展开才会重放。
-    fn apply(self, element: impl IntoElement, index: usize) -> AnyElement {
+    /// 单段动画实现 stagger：整段时长 = 延迟 + 渐显，缓动把延迟窗口内的
+    /// 进度钳在 0。
+    ///
+    /// 不要退回 `with_animations` 的「零时长首段 hold + 第二段渐显」写法：
+    /// GPUI 在切换动画段的那一帧会以 `delta = 1.0` 渲染新段，内容先闪一帧
+    /// 全亮、下一帧又退回透明再渐显，看起来就是反复「弹入」。
+    ///
+    /// `key` 必须按内容块稳定（例如 `reasoning-{message_id}`），不能用位置
+    /// 序号：成员增长或分块渲染切换都会让序号漂移，元素 id 一变动画状态就
+    /// 从 0 重来。
+    fn apply(self, element: impl IntoElement, index: usize, key: &str) -> AnyElement {
         let element = element.into_any_element();
         if !self.fresh || reduce_motion() {
             return element;
@@ -2621,19 +2628,23 @@ impl TurnReveal<'_> {
         div()
             .w_full()
             .child(element)
-            .with_animations(
-                SharedString::from(format!("turn-reveal-{}-{index}", self.turn_id)),
-                vec![
-                    Animation::new(delay),
-                    Animation::new(TURN_EXPAND_FADE)
-                        .with_easing(|delta| 1.0 - (1.0 - delta).powi(3)),
-                ],
-                |element, animation_ix, delta| {
-                    element.opacity(if animation_ix == 0 { 0.0 } else { delta })
-                },
+            .with_animation(
+                SharedString::from(format!("turn-reveal-{}-{key}", self.turn_id)),
+                Animation::new(delay + TURN_EXPAND_FADE).with_easing(stagger_opacity(delay)),
+                |element, delta| element.opacity(delta),
             )
             .into_any_element()
     }
+}
+
+/// stagger 的透明度曲线：`delta` 是整段（延迟 + 渐显）的线性进度，延迟
+/// 窗口内固定 0，之后 180ms ease-out 到 1。首帧（`delta = 0`）也是 0，所以
+/// 块不会先闪一帧再消失。
+fn stagger_opacity(delay: Duration) -> impl Fn(f32) -> f32 + 'static {
+    let total = (delay + TURN_EXPAND_FADE).as_secs_f32().max(f32::EPSILON);
+    let hold = delay.as_secs_f32();
+    let fade = TURN_EXPAND_FADE.as_secs_f32().max(f32::EPSILON);
+    move |delta| ease_out_cubic(((delta * total - hold) / fade).clamp(0.0, 1.0))
 }
 
 /// 展开内容的高度渐显容器。
@@ -2882,7 +2893,11 @@ fn render_turn_member(
             theme,
             entity,
         );
-        column = column.child(reveal.apply(reasoning, *reveal_ix));
+        column = column.child(reveal.apply(
+            reasoning,
+            *reveal_ix,
+            &format!("reasoning-{}", member.message.id),
+        ));
         *reveal_ix += 1;
     }
     if !member.text.trim().is_empty() {
@@ -2893,7 +2908,11 @@ fn render_turn_member(
             hash_values(&(member.message.id.as_str(), "member")),
             Some(&view.markdown),
         ));
-        column = column.child(reveal.apply(text_element, *reveal_ix));
+        column = column.child(reveal.apply(
+            text_element,
+            *reveal_ix,
+            &format!("text-{}", member.message.id),
+        ));
         *reveal_ix += 1;
     }
     append_tool_rows(
@@ -2931,7 +2950,11 @@ fn render_turn_body_reasoning(
         theme,
         entity,
     );
-    let child = reveal.apply(reasoning, *reveal_ix);
+    let child = reveal.apply(
+        reasoning,
+        *reveal_ix,
+        &format!("reasoning-{}", body.message.id),
+    );
     *reveal_ix += 1;
     column.child(child)
 }
@@ -3176,10 +3199,16 @@ fn append_tool_rows(
         .gap(px(4.0))
         .children(rows);
     match reveal {
-        Some((reveal, index)) => column.child(reveal.apply(
-            reveal_height_block(group, reveal, "tools", &view.turn_block_heights),
-            index,
-        )),
+        // 每个成员的工具组各有自己的自然高度：挂到同一个缓存键会让后画的
+        // 组覆盖前一组，展开窗口内出现裁切/高度跳变。
+        Some((reveal, index)) => {
+            let key = format!("tools-{}", message.id);
+            column.child(reveal.apply(
+                reveal_height_block(group, reveal, &key, &view.turn_block_heights),
+                index,
+                &key,
+            ))
+        }
         None => column.child(group),
     }
 }
@@ -5003,6 +5032,102 @@ mod tests {
         chat.note_turn_expanded(&turn_id);
         let view = prepare(&mut chat);
         assert!(view.turn_expand_at.contains_key(&turn_id));
+    }
+
+    #[test]
+    fn auto_expand_reveal_is_not_rearmed_by_step_rebuilds() {
+        let mut session = SessionState::new(std::env::temp_dir(), "test");
+        session.push_message(Message::user("hello"));
+        let call = ToolCall::new("grep", serde_json::json!({"pattern": "x"}));
+        let mut first = Message::assistant();
+        first.set_text("working");
+        first.push_tool_call(call.clone());
+        session.push_message(first.clone());
+        session.push_message(Message::from_tool_result(ToolResult::success(&call, "ok")));
+
+        let mut chat = ChatList::new();
+        let run = RunSnapshot {
+            running: true,
+            ..RunSnapshot::default()
+        };
+        let entity = WeakEntity::<AppView>::new_invalid();
+        let none = HashSet::new();
+        let mut prepare = |chat: &mut ChatList| {
+            chat.prepare_frame(
+                true,
+                true,
+                &none,
+                &none,
+                &none,
+                &none,
+                &HashMap::new(),
+                &entity,
+            )
+        };
+
+        // First step: a lone assistant message is not a turn block yet.
+        chat.rebuild(&session, &run);
+        prepare(&mut chat);
+        assert!(chat.turn_expand_at.is_empty());
+
+        // Second step: the run merges into a turn block and arms the reveal.
+        let mut second = Message::assistant();
+        second.set_text("reading");
+        second.push_tool_call(call.clone());
+        session.push_message(second.clone());
+        chat.begin_message(&second.id);
+        chat.rebuild(&session, &run);
+        prepare(&mut chat);
+        let turn_id = chat.items[1].id.clone();
+        assert_eq!(turn_id, format!("turn:{}", first.id));
+        assert!(chat.turn_expand_at.contains_key(&turn_id));
+
+        // A long tool call lets the window expire; the next step rebuilds the
+        // same turn (new signature, same id) and must not re-arm the stagger.
+        chat.turn_expand_at
+            .insert(turn_id.clone(), Instant::now() - TURN_EXPAND_WINDOW * 3);
+        let mut third = Message::assistant();
+        third.set_text("done");
+        session.push_message(third.clone());
+        chat.begin_message(&third.id);
+        chat.rebuild(&session, &run);
+        let view = prepare(&mut chat);
+        assert_eq!(chat.items[1].id, turn_id);
+        assert!(chat.revealed_turns.contains(&turn_id));
+        assert!(!chat.turn_expand_at.contains_key(&turn_id));
+        assert!(!view.turn_expand_at.contains_key(&turn_id));
+    }
+
+    #[test]
+    fn stagger_holds_transparent_then_fades_without_a_flash() {
+        let delay = TURN_EXPAND_STAGGER * 2;
+        let total_ms = (delay + TURN_EXPAND_FADE).as_secs_f32() * 1000.0;
+        let opacity_at = |elapsed_ms: f32| (stagger_opacity(delay))(elapsed_ms / total_ms);
+
+        // Hold phase: transparent from the first frame until the delay ends.
+        assert_eq!(opacity_at(0.0), 0.0);
+        assert_eq!(opacity_at(1.0), 0.0);
+        assert_eq!(opacity_at(delay.as_secs_f32() * 1000.0), 0.0);
+        // The old two-phase `with_animations` hold rendered a full-brightness
+        // frame exactly at the boundary, then fell back to transparent.
+        assert!(opacity_at(delay.as_secs_f32() * 1000.0 + 1.0) < 0.05);
+        assert!((opacity_at(total_ms) - 1.0).abs() < 1e-6);
+
+        // No delay still starts from 0 instead of flashing on the first frame.
+        assert_eq!((stagger_opacity(Duration::ZERO))(0.0), 0.0);
+        assert!(((stagger_opacity(Duration::ZERO))(1.0) - 1.0).abs() < 1e-6);
+
+        // Monotonic, and no frame paints a near-full-opacity jump.
+        let mut previous = 0.0;
+        for step in 0..=total_ms as u32 {
+            let value = opacity_at(step as f32);
+            assert!(
+                value >= previous - 1e-6,
+                "opacity went backwards at {step}ms"
+            );
+            assert!(value - previous < 0.1, "opacity jumped at {step}ms");
+            previous = value;
+        }
     }
 
     #[test]

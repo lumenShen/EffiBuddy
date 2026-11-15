@@ -13,7 +13,7 @@
 //! compressed and the JSON barely benefits, so this avoids pulling a
 //! compression backend into the app.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -128,26 +128,9 @@ impl Category {
 }
 
 /// All subagent transcripts below `root_id`, oldest first. Runs on the
-/// background executor; `child_sessions` re-reads the session directory.
+/// background executor; the store parses the session directory in one pass.
 pub fn descendants(store: &SessionStore, root_id: &str) -> Vec<SessionState> {
-    let mut children = Vec::new();
-    let mut queue = VecDeque::from([root_id.to_string()]);
-    let mut seen: HashSet<String> = HashSet::from([root_id.to_string()]);
-    while let Some(parent) = queue.pop_front() {
-        for child in store.child_sessions_raw(&parent) {
-            if !seen.insert(child.id.clone()) {
-                continue;
-            }
-            queue.push_back(child.id.clone());
-            children.push(child);
-        }
-    }
-    children.sort_by(|left, right| {
-        left.created_at
-            .cmp(&right.created_at)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-    children
+    store.descendant_sessions_raw(root_id)
 }
 
 /// Write the zip. `project_roots` are the additional folders of the owning

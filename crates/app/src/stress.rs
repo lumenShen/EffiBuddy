@@ -712,7 +712,7 @@ impl AppView {
                 stress.observe_session_delta(*index, event);
                 true
             }
-            AppEvent::SubagentSpawned(info) => {
+            AppEvent::SubagentSpawned { info, .. } => {
                 stress
                     .metrics
                     .children_spawned
@@ -720,11 +720,13 @@ impl AppView {
                 stress.push_child_row(&info.agent_id, &info.name);
                 false
             }
-            AppEvent::SubagentHarness { agent_id, event } => {
+            AppEvent::SubagentHarness {
+                agent_id, event, ..
+            } => {
                 stress.observe_child_event(agent_id, event);
                 false
             }
-            AppEvent::SubagentFinished(_) => {
+            AppEvent::SubagentFinished { .. } => {
                 stress
                     .metrics
                     .children_finished

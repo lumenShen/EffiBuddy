@@ -1,6 +1,6 @@
 //! Session persistence: one JSON file per conversation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -174,23 +174,14 @@ impl SessionStore {
         })
     }
 
-    /// Subagent sessions whose `parent_id` matches. Used to restore the
-    /// agent catalog of a reopened parent session.
-    pub fn child_sessions(&self, parent_id: &str) -> Vec<SessionState> {
-        self.collect_child_sessions(parent_id, true)
-    }
-
-    /// Child transcripts exactly as saved, without the reopen-time
-    /// normalization that rewrites `updated_at` and repairs tool calls.
-    /// Session export uses this so the archive mirrors the transcript.
-    pub fn child_sessions_raw(&self, parent_id: &str) -> Vec<SessionState> {
-        self.collect_child_sessions(parent_id, false)
-    }
-
-    fn collect_child_sessions(&self, parent_id: &str, normalize: bool) -> Vec<SessionState> {
-        let mut children = Vec::new();
+    /// Every session below `root_id` — children, grandchildren and deeper —
+    /// parsed in a single directory pass. Callers that walk one parent at a
+    /// time would re-read the whole directory once per level; a deep tree
+    /// multiplies the cost of opening a parent session.
+    pub fn descendant_sessions_raw(&self, root_id: &str) -> Vec<SessionState> {
+        let mut by_parent: HashMap<String, Vec<SessionState>> = HashMap::new();
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
-            return children;
+            return Vec::new();
         };
         for entry in entries.flatten() {
             let path = entry.path();
@@ -200,19 +191,34 @@ impl SessionStore {
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Some(mut session) = session_from_json(&contents) else {
+            let Some(session) = session_from_json(&contents) else {
                 continue;
             };
-            if session.parent_id.as_deref() != Some(parent_id) {
-                continue;
+            if let Some(parent) = session.parent_id.clone() {
+                by_parent.entry(parent).or_default().push(session);
             }
-            if normalize {
-                session.normalize_after_load();
-            }
-            children.push(session);
         }
-        children.sort_by(|left, right| left.created_at.cmp(&right.created_at));
-        children
+        let mut descendants = Vec::new();
+        let mut seen: HashSet<String> = HashSet::from([root_id.to_string()]);
+        let mut queue: VecDeque<String> = VecDeque::from([root_id.to_string()]);
+        while let Some(parent) = queue.pop_front() {
+            let Some(children) = by_parent.remove(&parent) else {
+                continue;
+            };
+            for child in children {
+                if !seen.insert(child.id.clone()) {
+                    continue;
+                }
+                queue.push_back(child.id.clone());
+                descendants.push(child);
+            }
+        }
+        descendants.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        descendants
     }
 
     pub fn delete(&self, id: &str) -> Result<(), String> {

@@ -1,8 +1,10 @@
 //! Events flowing from the agent runtime into the GPUI thread.
 //!
 //! The main harness and every subagent share one foreground pump, so the UI
-//! observes a single serialized stream. Child events are tagged with the agent
-//! id and never enter the parent transcript.
+//! observes a single serialized stream. Every run is tagged with its owning
+//! conversation: several sessions may run concurrently, and the app routes
+//! each event to the active transcript or to a parked background state. Child
+//! events also carry the agent id and never enter the parent transcript.
 
 use std::time::Instant;
 
@@ -14,20 +16,44 @@ use effibuddy_computer::OverlayEvent;
 #[derive(Clone)]
 #[allow(dead_code)]
 pub enum AppEvent {
-    Main(HarnessEvent),
-    SubagentSpawned(SubagentSpawnedInfo),
+    /// A main-harness event. Several conversations may run at the same time,
+    /// so the owning session id rides along: the UI routes it to the active
+    /// transcript or to that session's parked background state.
+    Main {
+        session_id: String,
+        event: HarnessEvent,
+    },
+    SubagentSpawned {
+        /// Main conversation whose `SubagentService` launched the child. The
+        /// info's own `parent_session_id` is the immediate parent session,
+        /// which can be another child for nested agents.
+        parent_session_id: String,
+        info: SubagentSpawnedInfo,
+    },
     SubagentHarness {
+        /// Main conversation whose `SubagentService` owns the child. Child ids
+        /// alone are not enough once two sessions run concurrently.
+        parent_session_id: String,
         agent_id: String,
         event: HarnessEvent,
     },
-    SubagentFinished(SubagentReport),
+    SubagentFinished {
+        parent_session_id: String,
+        report: SubagentReport,
+    },
     /// A message addressed to the main agent. The app owns the main transcript
     /// and decides whether to wake it, so the runtime only forwards the
     /// envelope.
-    AgentMessageToMain(AgentMessage),
+    AgentMessageToMain {
+        parent_session_id: String,
+        message: AgentMessage,
+    },
     /// A message delivered to a child agent. Used by the graph to draw message
     /// edges and update the inspector.
-    AgentMessageDelivered(AgentMessageDeliveredInfo),
+    AgentMessageDelivered {
+        parent_session_id: String,
+        info: AgentMessageDeliveredInfo,
+    },
     /// Floating computer-use control bar state. Sent from the tool runtime on
     /// the same pump as harness events so consent/overlay updates stay ordered
     /// with tool results.

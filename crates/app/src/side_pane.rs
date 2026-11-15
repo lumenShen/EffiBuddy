@@ -1524,6 +1524,12 @@ impl AppView {
                     ContextUsage::empty(128_000),
                 )
             };
+        // 子智能体的累计消耗来自 UI 侧任务快照（运行中由 UsageUpdated 刷新），
+        // 与主会话的会话锁无关，放在锁外合并避免扩大临界区。
+        let context = ContextUsage {
+            subagents: self.subagent_usage(),
+            ..context
+        };
 
         let total = todos.len();
         let completed = todos
@@ -1827,12 +1833,19 @@ impl AppView {
             })
             .when(has_context, |block| block.child(context_legend));
 
-        let cache_hint = if context.prompt_total == 0 {
+        // 累计消耗按整棵会话树统计：主智能体 + 所有子智能体。上下文占用
+        // 仍只看主会话，子会话有各自的窗口。
+        let prompt_total = context.prompt_total_all();
+        let completion_total = context.completion_total_all();
+        let cached_total = context.cached_total_all();
+        let total_all = context.total_all();
+        let has_subagents = !context.subagents.is_empty();
+        let cache_hint = if prompt_total == 0 {
             "尚无请求".to_string()
-        } else if context.cached_total > 0 {
+        } else if cached_total > 0 {
             format!(
                 "{:.0}% 输入命中",
-                context.cached_total as f64 / context.prompt_total as f64 * 100.0
+                cached_total as f64 / prompt_total as f64 * 100.0
             )
         } else {
             "无命中".to_string()
@@ -1850,14 +1863,14 @@ impl AppView {
                     .child(usage_tile(
                         theme,
                         "输入",
-                        format_tokens(context.prompt_total),
+                        format_tokens(prompt_total),
                         None,
                         false,
                     ))
                     .child(usage_tile(
                         theme,
                         "输出",
-                        format_tokens(context.completion_total),
+                        format_tokens(completion_total),
                         None,
                         false,
                     )),
@@ -1869,18 +1882,35 @@ impl AppView {
                     .child(usage_tile(
                         theme,
                         "缓存命中",
-                        format_tokens(context.cached_total),
+                        format_tokens(cached_total),
                         Some(cache_hint),
                         false,
                     ))
                     .child(usage_tile(
                         theme,
                         "合计",
-                        format_tokens(context.total),
+                        format_tokens(total_all),
                         Some("输入 + 输出".to_string()),
                         true,
                     )),
-            );
+            )
+            .when(has_subagents, |block| {
+                block.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(10.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child(format!("子智能体 {} 个", context.subagents.count))
+                        .child(div().font_family(theme.mono_font()).child(format!(
+                            "输入 {} · 输出 {}",
+                            format_tokens(context.subagents.prompt_tokens),
+                            format_tokens(context.subagents.completion_tokens)
+                        ))),
+                )
+            });
 
         let mut meta = vec![
             format!("{} 条消息", context.message_count),
