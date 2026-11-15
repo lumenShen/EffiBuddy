@@ -123,12 +123,44 @@ jobs:
           EOF
           dpkg-deb --build --root-owner-group "$root" "effibuddy_${VERSION}_amd64.deb"
 
+      # rpm：系统 rpmbuild 直接装预编译二进制；依赖用与 deb Depends 对齐的
+      # soname（跨发行版可解析），关闭自动依赖扫描保持确定性。
+      - name: 打包 rpm
+        run: |
+          sudo apt-get install -y rpm
+          mkdir -p rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          cat > rpmbuild/SPECS/effibuddy.spec <<EOF
+          Name:           effibuddy
+          Version:        ${VERSION}
+          Release:        1%{?dist}
+          Summary:        EffiBuddy — local-first coding agent desktop app
+          License:        MIT
+          AutoReqProv:    no
+          BuildArch:      x86_64
+          Requires:       libxkbcommon.so.0()(64bit), libxkbcommon-x11.so.0()(64bit), libxcb.so.1()(64bit), libfontconfig.so.1()(64bit), libvulkan.so.1()(64bit)
+
+          %description
+          GPUI-based desktop shell for a local-first coding agent.
+
+          %install
+          install -Dm755 "$PWD/target/release/effibuddy" "%{buildroot}/usr/bin/effibuddy"
+          install -Dm644 "$PWD/dist/effibuddy_${VERSION}_amd64/usr/share/applications/effibuddy.desktop" "%{buildroot}/usr/share/applications/effibuddy.desktop"
+
+          %files
+          %defattr(-,root,root,-)
+          /usr/bin/effibuddy
+          /usr/share/applications/effibuddy.desktop
+          EOF
+          rpmbuild -bb --define "_topdir $PWD/rpmbuild" rpmbuild/SPECS/effibuddy.spec
+          cp rpmbuild/RPMS/x86_64/effibuddy-*.x86_64.rpm .
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-artifacts
           path: |
             EffiBuddy-*-linux-x86_64.tar.gz
             effibuddy_*_amd64.deb
+            effibuddy-*.x86_64.rpm
           if-no-files-found: error
 
   build-windows:
@@ -273,6 +305,7 @@ jobs:
           files: |
             dist/EffiBuddy-*-linux-x86_64.tar.gz
             dist/effibuddy_*_amd64.deb
+            dist/effibuddy-*.x86_64.rpm
             dist/EffiBuddy-*-windows-x86_64.zip
             dist/EffiBuddy-*-windows-x86_64-setup.exe
           generate_release_notes: true

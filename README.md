@@ -35,6 +35,7 @@
 
 - **原生桌面 UI（GPUI）**：无 WebView。自绘标题栏、可折叠（`Ctrl+B`）为图标栏的会话侧栏、聊天流、紧凑工具行、可关闭/重开/搜索的右侧页签侧栏、设置页、Markdown 渲染、多行输入框与 IME 支持。
 - **ZCode 风格的聊天流**：虚拟列表只布局可视区域；流式回答按帧平滑吐字并带光标；思考与工具调用以紧凑活动行呈现，连续工具调用自动分组；右上状态胶囊与上下文仪表；`Ctrl K` 命令面板；自动吸底，上滚时暂停跟随并浮出「回到底部」按钮。
+- **消息编辑与撤销（无 Git 检查点）**：hover 用户消息可复制、编辑或撤销。编辑会把原文放回输入框，发送时从该消息重开对话并还原本轮文件改动；撤销需要二级确认，逐项列出将还原 / 无法安全还原 / 无法追踪的文件，并明确提示操作不可恢复。检查点在工具写入前按用户轮次捕获，保存在本地数据目录，全程不读取或创建 Git 仓库状态。
 - **完整的 agent loop**：持久 transcript、step = 模型调用 + 工具调用、无步数上限（持续运行直到模型不再请求工具）、可中断、四档权限模式（Shift+Tab 循环：默认询问 / 自动编辑 / 计划模式 / 完全访问）与工具审批、超时/panic 隔离、输出截断、只在可见输出前重试、按用户轮次滚动压缩上下文、reasoning 与正文分离。
 - **Computer Use（桌面读图与键鼠）**：主代理可截图、找窗口、模拟鼠标键盘；窗口/全屏画面以 `frame_id` 绑定坐标，动作后重新观察。默认“会话内准许”授权，首次使用弹审批卡；运行时显示顶部悬浮条，可随时“接管操作 / 我帮你点好了 / 停止操作”。X11 支持窗口级读图与专用 EWMH 工作区，Windows 使用 PrintWindow + 后台停车位，Wayland 通过 portal 支持全屏读图与键鼠。
 - **代理网络**：子代理可命名、可自定义提示词/工具、可继续派生孙代理；`agent_send` / `agent_list` 支持代理间文本与结构化数据；每个代理对象可选私有（仅创建者）或公开（会话内可复用），只读父代理不会派生出可写子代理。
@@ -158,7 +159,7 @@ Wayland 首次截图会触发 xdg-desktop-portal 的屏幕读取授权；输入�
 
 | 平台 | 产物 |
 | --- | --- |
-| Linux x64 | `EffiBuddy-<版本>-linux-x86_64.tar.gz`（便携）+ `effibuddy_<版本>_amd64.deb` |
+| Linux x64 | `EffiBuddy-<版本>-linux-x86_64.tar.gz`（便携）+ `effibuddy_<版本>_amd64.deb`（Debian/Ubuntu）+ `effibuddy-<版本>-1*.x86_64.rpm`（Fedora/RHEL/SUSE） |
 | Windows x64 | `EffiBuddy-<版本>-windows-x86_64.zip`（便携）+ `EffiBuddy-<版本>-windows-x86_64-setup.exe`（NSIS 安装包，含开始菜单/桌面快捷方式与卸载器） |
 
 tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败（单一版本源）：
@@ -167,7 +168,7 @@ tag 必须与 `Cargo.toml` 的 workspace 版本一致，否则构建直接失败
 git tag v0.1.0 && git push origin v0.1.0   # 触发发布
 ```
 
-应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
+应用内更新检查（`crates/app/src/update.rs`）：启动时和「设置 → 关于」手动查询 GitHub `releases/latest`；发现更新时聊天区顶部显示提示条（可跳过该版本或仅本次隐藏），「关于」页展示当前/最新版本并可直达发布页。安装包资产按平台匹配：Linux 读 `/etc/os-release` 判断 rpm/deb 偏好（识别不到时 deb 优先，退而求其次是便携压缩包）。自动检查可在配置里关（`update_check_enabled`），已跳过的版本记录在 `update_skip_version`。仓库未发布 release 时静默不做任何提示。
 
 ## 工作区结构
 
@@ -184,6 +185,7 @@ crates/
   ui/            中性白灰黑设计系统：theme tokens、Button、TextInput、
                  Markdown、Spinner、Card、Badge 等
   app/           GPUI 应用壳：窗口、侧边栏、虚拟化聊天流（chat.rs）、
+                 消息编辑/撤销的检查点与恢复预检（checkpoint.rs）、
                  子代理运行时（agents/）、关系图（graph/：模型/布局/画布/检查器）、
                  代理消息卡片（chat_agent.rs）、侧页签、设置页、事件泵、本地持久化
 ```
@@ -214,6 +216,16 @@ user message
 - 中断会取消流式请求与正在执行的工具（shell 会 kill 子进程），已产生的内容保留。
 
 更多设计细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+
+## 消息编辑与撤销（无 Git 检查点）
+
+用户消息 hover 后出现「复制 / 编辑 / 撤销」：
+
+- **编辑**：原文回到输入框，发送时从这条消息重新开始（移除其后的消息），并在预检通过后把本轮文件改动还原到发送前。输入框上方的编辑条会显示将移除多少条消息、多少轮对话，以及是否同时还原文件。
+- **撤销**：只打开二级确认，不直接删除。确认框逐项列出将还原、无法安全还原（被其他程序改过 / 快照缺失 / 写入未完成）、无法追踪（shell 命令）的文件，并用红色提示操作不可通过 EffiBuddy 恢复。
+- 存在冲突文件时**一个文件都不写**；编辑流程只提供「仅重置对话并发送」，撤销流程只提供「仅撤销对话」。
+- 检查点由 `write_file` / `edit_file` 在真正写入前捕获，按用户消息分组，子代理与后台任务共享父 turn；`shell` 只记录命令并标注为不可追踪。快照保存在 `<数据目录>/checkpoints/`，不读取、不创建任何 Git 状态，因此也不需要工作区干净。
+- 主任务或后台子代理仍在运行时拒绝编辑/撤销；每个会话保留最近 64 个 turn 的检查点。
 
 ## PTC：让模型写程序调工具
 
@@ -405,18 +417,18 @@ return g.spec;
 ## 测试
 
 ```bash
-cargo test --workspace   # 242 个离线测试
+cargo test --workspace   # 276 个离线测试
 cargo build --workspace  # 构建通过（gpui 自带 future-incompat 提示）
 ```
 
 | 层 | 数量 | 覆盖 |
 | --- | --- | --- |
-| `agent-core` | 81 | loop、压缩、provider 请求体/SSE、图片附件 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返 |
+| `agent-core` | 88 | loop、压缩、provider 请求体/SSE、图片附件 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵、回合中插入（steer）、会话截断与检查点元数据 serde |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 `run_js` 禁止 |
-| `agent-tools` | 32 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `agent-tools` | 33 | 文件读写、路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具、文件检查点回调 |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
-| `ui` | 35 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
-| `app` | 70 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门 |
+| `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
+| `app` | 89 | 流式 reveal、聊天项构建、子代理生命周期、消息唤醒、可见性、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、电脑授权门、消息编辑/撤销的恢复预检与冲突检测 |
 
 真实 DeepSeek 测试默认忽略，需要 Key：
 
