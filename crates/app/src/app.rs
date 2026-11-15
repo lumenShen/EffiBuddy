@@ -12046,8 +12046,23 @@ unless it is directly relevant to what the user asked.</note>\n\
     )
 }
 
+/// Spawn a console program without flashing a console window on Windows.
+/// The app itself is a GUI binary, so a console child would otherwise get its
+/// own window for every `git status` / `git diff`.
+fn hidden_command(program: &str) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut command = std::process::Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
 fn git_status(workspace: &std::path::Path) -> Result<(Option<String>, Vec<GitFile>), String> {
-    let output = std::process::Command::new("git")
+    let output = hidden_command("git")
         .arg("-C")
         .arg(workspace)
         .args(["status", "--porcelain=v1", "-b", "--untracked-files=all"])
@@ -12073,7 +12088,7 @@ fn git_diff(workspace: &std::path::Path, file: &GitFile) -> String {
         return format_untracked_file(&file.path, workspace);
     }
     let run = |cached: bool| -> Result<String, String> {
-        let mut command = std::process::Command::new("git");
+        let mut command = hidden_command("git");
         command
             .arg("-C")
             .arg(workspace)

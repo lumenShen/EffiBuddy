@@ -301,6 +301,13 @@ impl Tool for ShellTool {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // The host is a GUI process on Windows, so a console child would open
+        // its own window. Output is captured through pipes; no console needed.
+        #[cfg(target_os = "windows")]
+        {
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let child = command
             .spawn()

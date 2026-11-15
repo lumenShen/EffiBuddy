@@ -1,5 +1,10 @@
 //! EffiBuddy desktop entry point.
 
+// A console-subsystem binary gets a console window when launched from
+// Explorer. Run as a GUI binary on Windows instead. Standard handles are
+// still inherited, so `--version` and terminal-launched logging keep working.
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 mod agents;
 mod app;
 mod attachments;
