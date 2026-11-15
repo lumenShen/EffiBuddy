@@ -17,7 +17,7 @@ deepseekAPIKey.env
 !.env.example
 
 # ---------- 项目工具缓存 ----------
-/.mimosa/
+.mimosa/
 /.v2c/
 /.zcode/
 
