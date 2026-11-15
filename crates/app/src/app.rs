@@ -4898,6 +4898,14 @@ impl AppView {
         let scroll_entity = cx.entity().downgrade();
         let active_id = self.active_id();
         let running = self.active_run.is_some();
+        let workspace = self.config.workspace();
+        let workspace_label = workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| workspace.display().to_string());
+        let workspace_path = workspace.display().to_string();
         // Partition once; each group keeps the store's updated-at order, and
         // projects appear in order of their most recent conversation.
         let mut pinned: Vec<&SessionSummary> = Vec::new();
@@ -5215,6 +5223,24 @@ impl AppView {
             .child(divider(theme))
             .child(
                 div().px_4().py_3().flex().flex_col().child(
+                    div()
+                        .id("sidebar-workspace")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .h(px(26.0))
+                        .text_size(px(11.5))
+                        .text_color(theme.text_muted)
+                        .tooltip(effibuddy_ui::tooltip(theme, workspace_path))
+                        .child(
+                            svg()
+                                .path(icons::FOLDER)
+                                .size(px(13.0))
+                                .text_color(theme.text_faint),
+                        )
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(workspace_label)),
+                )
+                .child(
                     div()
                         .flex()
                         .items_center()
