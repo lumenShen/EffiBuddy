@@ -148,7 +148,18 @@ impl ModelProvider for OpenAiResponsesProvider {
         }
 
         if !done && !buffer.trim().is_empty() {
-            let _ = apply_sse_event(&buffer, &mut partial, &events)?;
+            if let SseOutcome::Done = apply_sse_event(&buffer, &mut partial, &events)? {
+                done = true;
+            }
+        }
+
+        // The Responses API terminates a successful stream with
+        // `response.completed`/`response.incomplete`. A socket that closes
+        // earlier is a truncated answer, not a finished turn.
+        if !done && partial.finish_reason.is_none() {
+            return Err(ProviderError::Network(
+                "stream ended before the response completed".to_string(),
+            ));
         }
 
         let mut usage = partial.usage.clone();

@@ -290,18 +290,34 @@ impl ListState {
         let mut old_items = state.items.cursor::<Count>(());
         let mut new_items = old_items.slice(&Count(old_range.start), Bias::Right);
 
-        // Preserve each replaced item's measured height: the replacement only
+        // Preserve each replaced item's last known height (measured, or the
+        // estimate an earlier splice left behind): the replacement only
         // re-measures once it is painted, and without this the summary height
         // (and therefore the scroll range) would collapse in the meantime.
+        //
+        // Appended rows (a pure append has an empty range) inherit the height
+        // of the row before them. Streaming transcripts grow new chunks at the
+        // tail every few frames; without an estimate those rows would account
+        // for zero height until painted, so the scroll range would never reach
+        // them and the wheel could not scroll to the real bottom.
+        let mut fallback_height = px(0.);
+        if old_range.start > 0 {
+            let mut preceding = state.items.cursor::<Count>(());
+            preceding.seek(&Count(old_range.start - 1), Bias::Right);
+            fallback_height = preceding
+                .item()
+                .map(|item| item.estimated_height())
+                .unwrap_or_default();
+        }
         let mut replaced_heights = VecDeque::new();
         let mut position = old_items.start().0;
         while position < old_range.end {
             let height = old_items
                 .item()
-                .and_then(|item| item.size())
-                .map(|size| size.height)
+                .map(|item| item.estimated_height())
                 .unwrap_or_default();
             replaced_heights.push_back(height);
+            fallback_height = height;
             old_items.next();
             let advanced = old_items.start().0;
             if advanced == position {
@@ -317,9 +333,7 @@ impl ListState {
                 spliced_count += 1;
                 ListItem::Unmeasured {
                     focus_handle,
-                    estimated_height: replaced_heights
-                        .pop_front()
-                        .unwrap_or_default(),
+                    estimated_height: replaced_heights.pop_front().unwrap_or(fallback_height),
                 }
             }),
             (),
@@ -1232,6 +1246,46 @@ mod test {
     use gpui::{ScrollDelta, ScrollWheelEvent};
 
     use crate::{self as gpui, TestAppContext};
+
+    #[gpui::test]
+    fn test_splice_estimates_unmeasured_rows(cx: &mut TestAppContext) {
+        use crate::{
+            AppContext, Context, Element, IntoElement, ListState, Render, Styled, Window, div,
+            list, point, px, size,
+        };
+
+        let cx = cx.add_empty_window();
+
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.));
+
+        struct TestView(ListState);
+        impl Render for TestView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                list(self.0.clone(), |_, _, _| {
+                    div().h(px(20.)).w_full().into_any()
+                })
+                .w_full()
+                .h_full()
+            }
+        }
+
+        // Paint all five rows (5 × 20px fills the 100px viewport).
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(100.)), |_, cx| {
+            cx.new(|_| TestView(state.clone()))
+        });
+        assert_eq!(state.max_offset_for_scrollbar().height, px(0.));
+
+        // Appending rows (streaming chunks) cannot paint them before the next
+        // frame. They must inherit an estimate from their predecessor instead
+        // of collapsing the scroll range to zero.
+        state.splice(5..5, 3);
+        assert_eq!(state.max_offset_for_scrollbar().height, px(60.));
+
+        // Replacing never-painted rows must keep the estimate the previous
+        // splice assigned, not reset them to zero.
+        state.splice(5..8, 3);
+        assert_eq!(state.max_offset_for_scrollbar().height, px(60.));
+    }
 
     #[gpui::test]
     fn test_reset_after_paint_before_scroll(cx: &mut TestAppContext) {

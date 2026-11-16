@@ -1038,6 +1038,9 @@ impl Platform for MacPlatform {
                         ClipboardEntry::Image(image) => {
                             self.write_image_to_clipboard(image);
                         }
+                        ClipboardEntry::Paths(paths) => {
+                            self.write_paths_to_clipboard(paths);
+                        }
                     },
                     None => {
                         // Writing an empty list of entries just clears the clipboard.
@@ -1129,6 +1132,12 @@ impl Platform for MacPlatform {
                 if let Some(item) = try_clipboard_image(pasteboard, format) {
                     return Some(item);
                 }
+            }
+
+            // Finally, a file list (copy in Finder). Handled last so a text
+            // copy that also advertises paths still pastes as text.
+            if let Some(item) = try_clipboard_paths(pasteboard) {
+                return Some(item);
             }
         }
 
@@ -1324,6 +1333,25 @@ impl MacPlatform {
                 .setData_forType(bytes, Into::<UTType>::into(image.format).inner_mut());
         }
     }
+
+    /// Publish a file list so other apps can paste the paths as files.
+    unsafe fn write_paths_to_clipboard(&self, paths: &crate::ClipboardPaths) {
+        unsafe {
+            use cocoa::foundation::NSArray;
+
+            let state = self.0.lock();
+            state.pasteboard.clearContents();
+
+            let urls = NSArray::array(nil);
+            for path in paths.paths() {
+                let url = NSURL::fileURLWithPath_(nil, ns_string(&path.to_string_lossy()));
+                let _: () = msg_send![urls, addObject: url];
+            }
+            state
+                .pasteboard
+                .setPropertyList_forType(urls, ns_string("NSFilenamesPboardType"));
+        }
+    }
 }
 
 fn try_clipboard_image(pasteboard: id, format: ImageFormat) -> Option<ClipboardItem> {
@@ -1349,6 +1377,54 @@ fn try_clipboard_image(pasteboard: id, format: ImageFormat) -> Option<ClipboardI
         } else {
             None
         }
+    }
+}
+
+/// Read a file list from the pasteboard ("copy" in Finder).
+///
+/// Finder advertises `public.file-url`; older writers use
+/// `NSFilenamesPboardType`. Both are converted to a [`ClipboardEntry::Paths`]
+/// so the paste target can stage them as attachments instead of inserting a
+/// useless string.
+unsafe fn try_clipboard_paths(pasteboard: id) -> Option<ClipboardItem> {
+    unsafe {
+        use cocoa::foundation::NSArray;
+
+        let types: id = pasteboard.types();
+        let url_type = ns_string("public.file-url");
+        let legacy_type = ns_string("NSFilenamesPboardType");
+
+        let mut paths: Vec<PathBuf> = Vec::new();
+        if msg_send![types, containsObject: url_type] {
+            let urls: id = pasteboard.propertyListForType(url_type);
+            if urls != nil {
+                let count = NSArray::count(urls);
+                for index in 0..count {
+                    let url = NSArray::objectAtIndex(urls, index);
+                    if let Ok(path) = ns_url_to_path(url) {
+                        paths.push(path);
+                    }
+                }
+            }
+        } else if msg_send![types, containsObject: legacy_type] {
+            let names: id = pasteboard.propertyListForType(legacy_type);
+            if names != nil {
+                let count = NSArray::count(names);
+                for index in 0..count {
+                    let name = NSArray::objectAtIndex(names, index);
+                    paths.push(path_from_objc(name));
+                }
+            }
+        }
+
+        let mut paths: Vec<PathBuf> = paths.into_iter().filter(|path| path.is_file()).collect();
+        paths.dedup();
+        if paths.is_empty() {
+            return None;
+        }
+        Some(ClipboardItem {
+            entries: vec![ClipboardEntry::Paths(crate::ClipboardPaths::new(paths))],
+        })
     }
 }
 

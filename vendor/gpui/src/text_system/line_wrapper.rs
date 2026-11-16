@@ -2,6 +2,16 @@ use crate::{FontId, FontRun, Pixels, PlatformTextSystem, SharedString, TextRun, 
 use collections::HashMap;
 use std::{iter, sync::Arc};
 
+/// Slack when deciding whether a glyph still fits on the line.
+///
+/// Layout runs in device pixels and converts back to logical pixels for text
+/// measurement (`width * scale_factor / scale_factor`). With a fractional
+/// scale that round trip can return a value a few ulps *below* the width the
+/// text itself reported, which used to push the last glyph of an exactly
+/// fitting label onto a second line. The slack is orders of magnitude smaller
+/// than any real glyph advance, so it cannot hide a genuine overflow.
+pub(crate) const WRAP_TOLERANCE: Pixels = px(0.01);
+
 /// The GPUI line wrapper, used to wrap lines of text to a given width.
 pub struct LineWrapper {
     platform_text_system: Arc<dyn PlatformTextSystem>,
@@ -97,7 +107,7 @@ impl LineWrapper {
                 };
 
                 width += item_width;
-                if width > wrap_width && ix > last_wrap_ix {
+                if width > wrap_width + WRAP_TOLERANCE && ix > last_wrap_ix {
                     if let (None, Some(first_non_whitespace_ix)) = (indent, first_non_whitespace_ix)
                     {
                         indent = Some(

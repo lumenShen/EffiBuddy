@@ -50,6 +50,7 @@ pub mod icons {
     pub const HEART: &str = "icons/heart.svg";
     pub const EXTERNAL_LINK: &str = "icons/external-link.svg";
     pub const IMAGE: &str = "icons/image.svg";
+    pub const MEMORY: &str = "icons/memory.svg";
 }
 
 /// Raster assets served through the same `AssetSource`, so `img()` can load
@@ -101,6 +102,7 @@ const MAIL: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24
 const HEART: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>"#;
 const EXTERNAL_LINK: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>"#;
 const IMAGE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>"#;
+const MEMORY: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="9.5" y="9.5" width="5" height="5" rx="1"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/></svg>"#;
 
 /// The reward code is embedded rather than strung inline: it is the only
 /// raster asset and keeps the binary self-contained like the icons. Lossless
@@ -151,6 +153,7 @@ fn svg_for(path: &str) -> Option<&'static str> {
         icons::HEART => HEART,
         icons::EXTERNAL_LINK => EXTERNAL_LINK,
         icons::IMAGE => IMAGE,
+        icons::MEMORY => MEMORY,
         _ => return None,
     })
 }

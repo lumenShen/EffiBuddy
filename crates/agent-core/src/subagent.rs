@@ -22,9 +22,9 @@ use crate::network::{AgentDescriptor, AgentMessageKind, AgentSendOutcome, AgentV
 use crate::tool::ApprovalDecision;
 
 /// Absolute recursion limit for agent trees. A direct child of the main agent
-/// has depth 1; the deepest allowed agent has depth 3. The host enforces this
+/// has depth 1; the deepest allowed agent has depth 256. The host enforces this
 /// independently of prompt text and tool arguments.
-pub const MAX_AGENT_DEPTH: usize = 3;
+pub const MAX_AGENT_DEPTH: usize = 256;
 
 /// Accent color used by the UI for an agent type. Mirrors the idea that each
 /// profile has a stable visual identity instead of a user-chosen color.

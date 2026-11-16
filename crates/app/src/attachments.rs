@@ -27,6 +27,63 @@ const ATTACHMENT_DIR: &str = ".effibuddy/attachments";
 
 const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
+/// Convert clipboard image bytes (a screenshot, a copied picture) into a
+/// model-visible attachment.
+///
+/// The bytes arrive already encoded, so this takes the same path as a dropped
+/// file: bound the size, base64 what the provider needs, and keep a durable
+/// copy under the workspace for later steps. No source path exists, so the
+/// durable copy is always written (named from the format).
+pub(crate) fn attachment_from_image_bytes(
+    mime_type: &str,
+    bytes: Vec<u8>,
+    workspace: &Path,
+) -> Result<UserAttachment, String> {
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "剪贴板图片超过 {}，未添加。",
+            format_bytes(MAX_IMAGE_BYTES)
+        ));
+    }
+    if bytes.is_empty() {
+        return Err("剪贴板图片为空，未添加。".to_string());
+    }
+    let extension = match mime_type {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        _ => "png",
+    };
+    let name = format!("pasted-{}.{extension}", short_content_tag(&bytes));
+    let path = match write_image_copy(workspace, &name, &bytes) {
+        Ok(path) => display_path(&path, workspace),
+        Err(_) => name.clone(),
+    };
+    Ok(UserAttachment {
+        name,
+        path,
+        kind: AttachmentKind::Image,
+        mime_type: mime_type.to_string(),
+        size: bytes.len() as u64,
+        text: None,
+        image: Some(ImageAttachment {
+            mime_type: mime_type.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            width: 0,
+            height: 0,
+        }),
+        truncated: false,
+    })
+}
+
+/// Short stable tag for a pasted image's file name, so pasting the same
+/// screenshot twice reuses one copy instead of piling up duplicates.
+fn short_content_tag(bytes: &[u8]) -> String {
+    format!("{:08x}", (fnv1a(bytes) >> 32) as u32)
+}
+
 /// Convert one filesystem path into an attachment. Directories and unreadable
 /// files return an explanation for the composer's notice line.
 pub(crate) fn attachment_from_path(
@@ -352,6 +409,54 @@ mod tests {
         assert_eq!(attachment.kind, AttachmentKind::File);
         assert!(attachment.text.is_none());
         assert_eq!(attachment.size, 4);
+    }
+
+    /// A screenshot on the clipboard has no source path, so it must become a
+    /// durable content-addressed copy and still ride along as an image part.
+    #[test]
+    fn pasted_image_bytes_become_a_durable_attachment() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let bytes = vec![137u8, 80, 78, 71, 13, 10, 26, 10];
+
+        let attachment = attachment_from_image_bytes("image/png", bytes.clone(), root).unwrap();
+        assert_eq!(attachment.kind, AttachmentKind::Image);
+        assert_eq!(attachment.mime_type, "image/png");
+        assert_eq!(attachment.size as usize, bytes.len());
+        assert!(attachment.name.starts_with("pasted-") && attachment.name.ends_with(".png"));
+        assert!(attachment.path.starts_with(".effibuddy/attachments/"));
+        let image = attachment.image.expect("image part");
+        assert_eq!(image.mime_type, "image/png");
+        assert_eq!(
+            image.data,
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
+
+        // The bytes really landed on disk, so a later step can re-read them.
+        let written = root.join(&attachment.path);
+        assert_eq!(std::fs::read(&written).unwrap(), bytes);
+
+        // Pasting the same screenshot again reuses one copy.
+        let again = attachment_from_image_bytes("image/png", bytes, root).unwrap();
+        assert_eq!(again.path, attachment.path);
+        let entries = std::fs::read_dir(root.join(ATTACHMENT_DIR))
+            .unwrap()
+            .count();
+        // `.gitignore` plus the single image copy.
+        assert_eq!(entries, 2);
+    }
+
+    #[test]
+    fn pasted_image_uses_its_own_extension_and_rejects_oversized_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let jpeg = attachment_from_image_bytes("image/jpeg", vec![0xFF, 0xD8, 0xFF], root).unwrap();
+        assert!(jpeg.name.ends_with(".jpg"));
+        assert_eq!(jpeg.mime_type, "image/jpeg");
+
+        let huge = vec![0u8; (MAX_IMAGE_BYTES + 1) as usize];
+        assert!(attachment_from_image_bytes("image/png", huge, root).is_err());
+        assert!(attachment_from_image_bytes("image/png", Vec::new(), root).is_err());
     }
 
     #[test]

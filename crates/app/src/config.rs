@@ -46,8 +46,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub workspace: Option<PathBuf>,
     #[serde(default)]
-    pub max_tokens: Option<u32>,
-    #[serde(default)]
     pub temperature: Option<f32>,
     /// Right side pane visibility and geometry. Persisted app-wide, like
     /// ZCode's side pane layout, because tabs are part of the shell chrome.
@@ -152,7 +150,6 @@ impl Default for AppConfig {
             palette_recent: Vec::new(),
             theme: default_theme(),
             workspace: None,
-            max_tokens: Some(8192),
             temperature: Some(0.2),
             side_bar_open: default_side_bar_open(),
             side_bar_width: default_side_bar_width(),

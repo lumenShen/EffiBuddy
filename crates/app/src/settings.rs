@@ -34,6 +34,7 @@ pub(crate) enum SettingsSection {
     Agents,
     Archived,
     Appearance,
+    Memory,
     About,
 }
 
@@ -46,6 +47,7 @@ impl SettingsSection {
             SettingsSection::Agents => "子代理",
             SettingsSection::Archived => "归档",
             SettingsSection::Appearance => "外观",
+            SettingsSection::Memory => "内存",
             SettingsSection::About => "关于",
         }
     }
@@ -58,6 +60,7 @@ impl SettingsSection {
             SettingsSection::Agents => icons::CODE,
             SettingsSection::Archived => icons::ARCHIVE,
             SettingsSection::Appearance => icons::SUN,
+            SettingsSection::Memory => icons::MEMORY,
             SettingsSection::About => icons::CHAT,
         }
     }
@@ -967,6 +970,7 @@ impl AppView {
             SettingsSection::Agents => self.render_settings_agents(&theme),
             SettingsSection::Archived => self.render_settings_archived(&theme, cx),
             SettingsSection::Appearance => self.render_settings_appearance(&theme, cx),
+            SettingsSection::Memory => crate::memory::render_panel(self, &theme, cx),
             SettingsSection::About => self.render_settings_about(&theme, cx),
         };
 
@@ -1049,6 +1053,7 @@ impl AppView {
             SettingsSection::Agents,
             SettingsSection::Archived,
             SettingsSection::Appearance,
+            SettingsSection::Memory,
             SettingsSection::About,
         ]
         .into_iter()
@@ -1167,6 +1172,18 @@ impl AppView {
     /// 上下文压缩：所有阈值都以当前模型上下文窗口的百分比表示。
     fn render_settings_context(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let status = self.settings.status.clone();
+        let (window, max_output) = self
+            .active
+            .as_ref()
+            .map(|active| {
+                let session = effibuddy_agent_core::lock_session(&active.shared);
+                let resolved = self.models.resolve_session(&session);
+                (
+                    resolved.context_window(),
+                    resolved.max_output_tokens() as usize,
+                )
+            })
+            .unwrap_or((128_000, 8_192));
         centered_settings_column(
             div()
                 .child(settings_page_header(
@@ -1228,16 +1245,6 @@ impl AppView {
                             ))
                         })
                         .child({
-                            let (window, max_output) = self
-                                .active
-                                .as_ref()
-                                .map(|active| {
-                                    let session =
-                                        effibuddy_agent_core::lock_session(&active.shared);
-                                    let resolved = self.models.resolve_session(&session);
-                                    (resolved.context_window(), resolved.max_output_tokens() as usize)
-                                })
-                                .unwrap_or((128_000, 8_192));
                             let trigger = self
                                 .settings
                                 .compact_trigger
@@ -1278,8 +1285,9 @@ impl AppView {
                                 .text_size(px(10.5))
                                 .text_color(theme.text_faint)
                                 .child(format!(
-                                    "当前模型窗口 {} · 约 {} tokens 触发（已扣输出预留）{background_hint}",
+                                    "当前模型窗口 {} · 输出预留 {} · 约 {} tokens 触发{background_hint}",
                                     format_context_window(window),
+                                    format_context_window(max_output),
                                     format_context_window(trigger_tokens)
                                 ))
                         }),
@@ -2549,7 +2557,11 @@ impl AppView {
                                                 .flex()
                                                 .flex_col()
                                                 .gap_1()
-                                                .child(field_label(&theme, "最大输出", ""))
+                                                .child(field_label(
+                                                    &theme,
+                                                    "最大输出",
+                                                    "单次请求上限（每模型）",
+                                                ))
                                                 .child(editor.max_output_view.clone()),
                                         ),
                                 )

@@ -47,7 +47,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::{ClipboardItem, Image, ImageFormat, hash};
+use crate::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash, parse_uri_list_paths};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -77,7 +77,7 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        URI_LIST: b"text/uri-list",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -1042,16 +1042,25 @@ impl Clipboard {
             self.inner.atoms.TEXT_MIME_UNKNOWN,
         ];
 
+        // A file manager's "copy" advertises `text/uri-list`, and most file
+        // managers also advertise `text/plain` (the bare file name). The URI
+        // list therefore comes before the text targets: pasting a copied file
+        // should stage the file, not insert its name as characters. When the
+        // list turns out to hold no readable file, the read falls back to text
+        // below.
+        let uri_list_atom = self.inner.atoms.URI_LIST;
+
         let atom_none: Atom = AtomEnum::NONE.into();
 
-        const FORMAT_ATOM_COUNT: usize = TEXT_FORMAT_COUNT + IMAGE_FORMAT_COUNT;
+        const FORMAT_ATOM_COUNT: usize = TEXT_FORMAT_COUNT + IMAGE_FORMAT_COUNT + 1;
 
         let mut format_atoms: [Atom; FORMAT_ATOM_COUNT] = [atom_none; FORMAT_ATOM_COUNT];
 
         // image formats first, as they are more specific, and read will return the first
         // format that the contents can be converted to
         format_atoms[0..IMAGE_FORMAT_COUNT].copy_from_slice(&image_format_atoms);
-        format_atoms[IMAGE_FORMAT_COUNT..].copy_from_slice(&text_format_atoms);
+        format_atoms[IMAGE_FORMAT_COUNT] = uri_list_atom;
+        format_atoms[IMAGE_FORMAT_COUNT + 1..].copy_from_slice(&text_format_atoms);
         debug_assert!(!format_atoms.contains(&atom_none));
 
         let result = self.inner.read(&format_atoms, selection)?;
@@ -1073,6 +1082,25 @@ impl Clipboard {
             }
         }
 
+        if result.format == uri_list_atom {
+            let paths = parse_uri_list_paths(&result.bytes);
+            if !paths.is_empty() {
+                return Ok(ClipboardItem {
+                    entries: vec![ClipboardEntry::Paths(crate::ClipboardPaths::new(paths))],
+                });
+            }
+            // Not a usable file list (an `http://` drag payload, say): read
+            // the same selection again as text.
+            let text_result = self.inner.read(&text_format_atoms, selection)?;
+            return self.text_item_from_data(text_result);
+        }
+
+        self.text_item_from_data(result)
+    }
+
+    /// Turn raw clipboard bytes into a text item, honouring the ISO Latin-1
+    /// `STRING` target.
+    fn text_item_from_data(&self, result: ClipboardData) -> Result<ClipboardItem> {
         let text = if result.format == self.inner.atoms.STRING {
             // ISO Latin-1
             // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8

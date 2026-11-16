@@ -152,7 +152,18 @@ impl ModelProvider for AnthropicMessagesProvider {
         }
 
         if !done && !buffer.trim().is_empty() {
-            let _ = apply_sse_event(&buffer, &mut partial, &events)?;
+            if let SseOutcome::Done = apply_sse_event(&buffer, &mut partial, &events)? {
+                done = true;
+            }
+        }
+
+        // A closed socket without `message_stop` is a truncated response.
+        // Accepting it as `stop` turned a dropped connection into a silently
+        // finished turn; make it a retryable network error the UI can show.
+        if !done && partial.finish_reason().is_none() {
+            return Err(ProviderError::Network(
+                "stream ended before the response completed (missing message_stop)".to_string(),
+            ));
         }
 
         let mut usage = partial.usage.clone();

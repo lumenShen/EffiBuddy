@@ -134,6 +134,6 @@ mod tests {
         assert!(prompt.contains("You may create your own child agents"));
         assert!(prompt.contains("Required output"));
         assert!(prompt.contains("\"facts\""));
-        assert!(prompt.contains("Tree depth: 2 / 3"));
+        assert!(prompt.contains(&format!("Tree depth: 2 / {MAX_AGENT_DEPTH}")));
     }
 }

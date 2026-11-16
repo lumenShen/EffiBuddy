@@ -67,7 +67,13 @@ cargo run -p effibuddy-app
 
 ### 输入框
 
-输入 `/` 打开技能、工具与子智能体菜单（`$` 只看技能），`@` 引用工作区文件；文件拖进窗口或点左下角 `+` 会变成附件，文本内联、图片作为图片块发送。
+输入 `/` 打开技能、工具与子智能体菜单（`$` 只看技能），`@` 引用工作区文件；文件拖进窗口或点左下角 `+` 会变成附件，文本内联、图片作为图片块发送。`Ctrl+V` 同理：剪贴板里是截图或文件管理器复制的文件时，直接变成附件而不是一段文字。
+
+想确认剪贴板会被怎么识别，可以跑一次探针（会开一个空白窗口，因为 Wayland 只向聚焦的窗口下发剪贴板内容）：
+
+```bash
+cargo run -p effibuddy-app -- --clipboard-probe   # 输出 kind: text / image / paths
+```
 
 ### 预览
 
@@ -82,6 +88,7 @@ cargo run -p effibuddy-app -- --preview --preview-palette   # 命令面板
 cargo run -p effibuddy-app -- --preview --preview-approval  # 待审批卡片
 cargo run -p effibuddy-app -- --preview-graph               # 智能体关系图
 cargo run -p effibuddy-app -- --preview --preview-models    # 模型设置
+cargo run -p effibuddy-app -- --settings                    # 设置 → 通用
 ```
 
 ## 截图
@@ -149,7 +156,7 @@ cargo build --workspace
 - 写文件、改文件、shell 与电脑操作默认需要显式批准；审批超时按拒绝处理。
 - Wayland 仅支持全屏读图/输入；macOS 发布包未签名，且暂不支持 Computer Use。
 - 默认 DeepSeek 模型不支持视觉输入，使用 Computer Use 截图前需要切换到支持图片的模型。
-- 项目仍在早期（0.2.4），接口与数据格式可能变化。
+- 项目仍在早期（0.2.5），接口与数据格式可能变化。
 
 ## 许可证
 

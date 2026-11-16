@@ -196,7 +196,21 @@ impl ModelProvider for OpenAiCompatProvider {
         // A well-behaved server ends events with a blank line, but tolerate a
         // final event without one.
         if !done && !buffer.trim().is_empty() {
-            let _ = apply_sse_event(&buffer, &mut partial, &events)?;
+            if let SseOutcome::Done = apply_sse_event(&buffer, &mut partial, &events)? {
+                done = true;
+            }
+        }
+
+        // A socket that closes without a terminal chunk is a truncated
+        // response, not a finished turn: OpenAI-compatible servers send the
+        // finish reason in a final event (and usually `[DONE]`). Defaulting
+        // the missing finish to `stop` made a dropped connection look like a
+        // successful completion, so the transcript simply stopped mid-word
+        // with no error. Surface it as a retryable network error instead.
+        if !done && partial.finish_reason.is_none() {
+            return Err(ProviderError::Network(
+                "stream ended before the response completed (missing finish reason)".to_string(),
+            ));
         }
 
         let mut usage = partial.usage.clone();
@@ -589,5 +603,95 @@ mod tests {
             wire[0]["content"][1]["image_url"]["url"],
             "data:image/png;base64,YWJj"
         );
+    }
+
+    /// Serve one complete HTTP response whose SSE body is exactly `body`, then
+    /// close the connection. This is a well-formed HTTP exchange that ends the
+    /// stream without a terminal SSE marker — the shape a dropped provider
+    /// connection can also take after the last delta.
+    fn serve_sse_once(body: &'static str) -> String {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.flush();
+        });
+        format!("http://{addr}")
+    }
+
+    fn test_provider(base_url: String) -> OpenAiCompatProvider {
+        OpenAiCompatProvider::new(OpenAiCompatConfig {
+            base_url,
+            api_key: "test-key".to_string(),
+            context_window: 8_192,
+            extra_headers: Vec::new(),
+            include_usage: false,
+            request_timeout: Duration::from_secs(5),
+            connect_timeout: Duration::from_secs(2),
+        })
+        .unwrap()
+    }
+
+    fn test_request() -> ChatRequest {
+        ChatRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::user("hello")],
+            tools: Vec::new(),
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// A stream that closes before any finish reason must be an error, not a
+    /// silently completed turn (that is what made the transcript stop
+    /// mid-reasoning with no message in the UI).
+    #[tokio::test]
+    async fn stream_without_a_finish_reason_is_a_network_error() {
+        let base_url = serve_sse_once(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"half a thought\"}}]}\n\n",
+        );
+        let provider = test_provider(base_url);
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let result = provider
+            .stream(test_request(), CancellationToken::new(), sender)
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::Network(_))),
+            "expected a network error, got {result:?}"
+        );
+    }
+
+    /// Servers that omit `[DONE]` but do send the terminal finish-reason chunk
+    /// are still accepted; otherwise the stricter EOF check would break them.
+    #[tokio::test]
+    async fn stream_with_a_finish_reason_is_accepted_without_done() {
+        let base_url = serve_sse_once(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let provider = test_provider(base_url);
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let completion = provider
+            .stream(test_request(), CancellationToken::new(), sender)
+            .await
+            .unwrap();
+        assert_eq!(completion.text, "answer");
+        assert_eq!(completion.finish_reason, Some(FinishReason::Stop));
+        while let Ok(event) = events.try_recv() {
+            if let ProviderEvent::TextDelta(delta) = event {
+                assert_eq!(delta, "answer");
+            }
+        }
     }
 }

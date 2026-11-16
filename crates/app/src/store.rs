@@ -178,22 +178,77 @@ impl SessionStore {
     /// parsed in a single directory pass. Callers that walk one parent at a
     /// time would re-read the whole directory once per level; a deep tree
     /// multiplies the cost of opening a parent session.
+    ///
+    /// The sidebar summary cache already knows each file's `parent_id`
+    /// (recorded by [`Self::collect_summaries`]), so files without a parent are
+    /// skipped without opening them. Only real child transcripts are read and
+    /// parsed — opening a conversation used to parse every transcript in the
+    /// directory (tens of megabytes once a few long sessions exist), which
+    /// dominated the open latency even when the conversation had no children.
     pub fn descendant_sessions_raw(&self, root_id: &str) -> Vec<SessionState> {
-        let mut by_parent: HashMap<String, Vec<SessionState>> = HashMap::new();
+        let mut children = Vec::new();
         let Ok(entries) = std::fs::read_dir(&self.directory) else {
             return Vec::new();
         };
+        let cache = self
+            .summary_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
+            // A cached row with `parent_id: None` is a top-level conversation;
+            // skip the read entirely. Unknown files (written since the last
+            // scan, or unparsable) still get a cheap byte probe below.
+            match cache.get(&path) {
+                Some(cached) if cached.parent_id.is_none() => continue,
+                Some(_) => {}
+                None => {
+                    let Ok(contents) = std::fs::read_to_string(&path) else {
+                        continue;
+                    };
+                    // A child transcript always serializes a non-null
+                    // `parent_id`, so the raw bytes reject non-children before
+                    // any JSON work.
+                    if !contents.contains("\"parent_id\":\"")
+                        && !contents.contains("\"parent_id\": \"")
+                    {
+                        continue;
+                    }
+                    if let Some(session) = session_from_json(&contents)
+                        && session.parent_id.is_some()
+                    {
+                        children.push(session);
+                    }
+                    continue;
+                }
+            }
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let Some(session) = session_from_json(&contents) else {
-                continue;
-            };
+            if let Some(session) = session_from_json(&contents)
+                && session.parent_id.is_some()
+            {
+                children.push(session);
+            }
+        }
+        self.assemble_descendants(root_id, children)
+    }
+
+    /// Link a flat, already-parsed set of child transcripts into the tree below
+    /// `root_id`, sorted by creation time. Split out of
+    /// [`Self::descendant_sessions_raw`] so the ordering and cycle handling can
+    /// be tested without a filesystem.
+    pub fn assemble_descendants(
+        &self,
+        root_id: &str,
+        children: Vec<SessionState>,
+    ) -> Vec<SessionState> {
+        let mut by_parent: HashMap<String, Vec<SessionState>> = HashMap::new();
+        for session in children {
             if let Some(parent) = session.parent_id.clone() {
                 by_parent.entry(parent).or_default().push(session);
             }
@@ -338,10 +393,15 @@ impl SessionStore {
 /// written before the `project` field existed belonged to its `cwd` project.
 /// New files always carry `project` (possibly `null`), so `None` is preserved
 /// for tasks.
+///
+/// Parses straight into [`SessionState`] instead of round-tripping through a
+/// `serde_json::Value`: transcripts reach tens of megabytes, and building an
+/// intermediate tree first roughly doubles the cost of every load. The
+/// legacy `project` key is detected with a byte scan of the raw JSON, which
+/// also avoids materializing it as a value.
 fn session_from_json(contents: &str) -> Option<SessionState> {
-    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
-    let needs_project_migration = value.get("project").is_none();
-    let mut session: SessionState = serde_json::from_value(value).ok()?;
+    let needs_project_migration = !contents.contains("\"project\":");
+    let mut session: SessionState = serde_json::from_str(contents).ok()?;
     if needs_project_migration && session.parent_id.is_none() {
         session.project = Some(session.cwd.clone());
     }
@@ -364,7 +424,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = SessionStore::with_directory(directory.path());
         store
-            .save(&SessionState::new(PathBuf::from("/tmp/workspace"), "test-model"))
+            .save(&SessionState::new(
+                PathBuf::from("/tmp/workspace"),
+                "test-model",
+            ))
             .unwrap();
 
         assert!(store.summaries().is_empty());
@@ -455,6 +518,53 @@ mod tests {
         let summaries = store.summaries();
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].unread);
+    }
+
+    #[test]
+    fn descendants_skip_top_level_transcripts() {
+        // `descendant_sessions_raw` is on the transcript-open path: it must not
+        // hand back parents, siblings or plain tasks, only the tree below the
+        // requested root.
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let parent = session("parent", "/tmp/project");
+        store.save(&parent).unwrap();
+
+        let mut child = session("child", "/tmp/project");
+        child.parent_id = Some(parent.id.clone());
+        store.save(&child).unwrap();
+
+        let mut grandchild = session("grandchild", "/tmp/project");
+        grandchild.parent_id = Some(child.id.clone());
+        store.save(&grandchild).unwrap();
+
+        let sibling = session("sibling", "/tmp/project");
+        store.save(&sibling).unwrap();
+
+        // Warm the summary cache so the parent_id fast path (the one that
+        // avoids reading non-child files) is what the assertion exercises.
+        let _ = store.summaries();
+
+        let descendants = store.descendant_sessions_raw(&parent.id);
+        let ids: Vec<&str> = descendants.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec![child.id.as_str(), grandchild.id.as_str()]);
+    }
+
+    #[test]
+    fn descendants_of_a_leaf_conversation_are_empty() {
+        // The common case: opening a conversation with no children must not
+        // report unrelated transcripts, and must stay cheap (no parsing of
+        // sibling files).
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let root = session("root", "/tmp/project");
+        store.save(&root).unwrap();
+        let mut other_child = session("other-child", "/tmp/project");
+        other_child.parent_id = Some("someone-else".to_string());
+        store.save(&other_child).unwrap();
+
+        let _ = store.summaries();
+        assert!(store.descendant_sessions_raw(&root.id).is_empty());
     }
 
     #[test]

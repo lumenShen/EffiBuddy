@@ -51,6 +51,7 @@ pub mod testing;
 pub use checkpoint::{
     ContentDigest, FileCheckpoint, FileCheckpointSink, SharedFileCheckpointSink, TurnCheckpoint,
 };
+pub use context::CompactionConfig;
 pub use contract::{extract_json_value, validate_json};
 pub use error::{AgentError, ProviderError, ToolError};
 pub use harness::{AgentHandle, AgentHarness, HarnessConfig, HarnessEvent};
@@ -81,7 +82,6 @@ pub use providers::{
 pub use providers::{StressProvider, stress::user_prompt as stress_user_prompt};
 #[cfg(feature = "stress")]
 pub use ramfs::RamDir;
-pub use context::CompactionConfig;
 pub use session::{
     ChildRunRecord, CompactionRecord, CompactionTrigger, HeldCompaction, HeldCompactionStatus,
     RunOutcome, RunStatus, SessionState, SharedSession, SummarySource, lock_session,

@@ -22,6 +22,8 @@ effibuddy-agent-tools.workspace = true
 effibuddy-computer.workspace = true
 effibuddy-ui.workspace = true
 gpui.workspace = true
+# glibc allocator tuning + malloc stats for the Settings → 内存 panel.
+libc = "0.2"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

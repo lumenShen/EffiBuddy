@@ -78,17 +78,30 @@ impl ScrollGlide {
             self.last_tick = None;
             self.active = true;
         }
-        // A manual wheel always owns the viewport; without this the next tick
-        // of a `glide_to_bottom` would yank it back to the bottom. The chase
-        // kept `target` pinned at `f32::MAX`, so re-base it on the live offset
-        // before applying the notch.
-        if self.goal_bottom {
+        // A wheel toward the start always owns the viewport; without this the
+        // next tick of a `glide_to_bottom` would yank it back to the bottom.
+        // The chase kept `target` pinned at `f32::MAX`, so re-base it on the
+        // live offset before applying the notch. Wheeling further toward the
+        // end keeps the chase: the user already asked for the bottom and the
+        // content may still be growing.
+        if self.goal_bottom && pixel_y > 0.0 {
             self.goal_bottom = false;
             self.target = offset;
         }
         let previous = self.target;
         self.target = (self.target - pixel_y).clamp(0.0, max);
+        // Landing on the maximum offset means the user wheeled all the way to
+        // the bottom. Keep chasing it so growth (streaming text) is followed
+        // and the owner can re-pin once the glide settles.
+        if pixel_y < 0.0 && self.target >= max {
+            self.goal_bottom = true;
+        }
         self.target != previous
+    }
+
+    /// Whether the glide is currently chasing the end of the scrollable.
+    pub fn goal_bottom(&self) -> bool {
+        self.goal_bottom
     }
 
     /// Start an animated glide to the bottom (scroll-to-bottom button).
@@ -369,5 +382,75 @@ mod tests {
             panic!("expected the wheel target to win");
         };
         assert!(reversed < 0.0, "delta = {reversed}");
+    }
+
+    #[test]
+    fn wheeling_down_to_the_end_reports_arrival_at_the_bottom() {
+        let start = Instant::now();
+        let mut glide = ScrollGlide::new();
+        // One notch overshoots the short scrollable and clamps to its end.
+        assert!(glide.wheel(-120.0, 0.0, 100.0));
+        assert!(glide.goal_bottom());
+        assert!(matches!(
+            glide.tick_at(start, 0.0, 100.0),
+            GlideTick::Continue
+        ));
+        let mut offset = 0.0;
+        let mut settled = None;
+        for frame in 1..=600 {
+            let now = start + Duration::from_millis(16 * frame);
+            // Content grows while the user is on the way down (streaming).
+            let max = if frame < 5 { 100.0 } else { 140.0 };
+            match glide.tick_at(now, offset, max) {
+                GlideTick::Step(delta) => offset += delta,
+                GlideTick::Done { delta, at_bottom } => {
+                    offset += delta;
+                    settled = Some(at_bottom);
+                    break;
+                }
+                other => panic!("glide ended unexpectedly: {other:?}"),
+            }
+        }
+        assert_eq!(
+            settled,
+            Some(true),
+            "a wheel landing on the end must report `at_bottom` so the caller can re-pin"
+        );
+        assert!((offset - 140.0).abs() < 1.0, "offset = {offset}");
+    }
+
+    #[test]
+    fn a_downward_wheel_keeps_the_bottom_chase() {
+        let start = Instant::now();
+        let mut glide = ScrollGlide::new();
+        glide.glide_to_bottom(0.0, 1_000.0);
+        assert!(matches!(
+            glide.tick_at(start, 0.0, 1_000.0),
+            GlideTick::Continue
+        ));
+        let GlideTick::Step(chasing) =
+            glide.tick_at(start + Duration::from_millis(16), 0.0, 1_000.0)
+        else {
+            panic!("expected the bottom chase to move");
+        };
+        // The user keeps wheeling toward the end mid-chase: stay on the chase
+        // instead of re-basing on the lagging offset.
+        glide.wheel(-40.0, chasing, 1_000.0);
+        assert!(glide.goal_bottom());
+        let GlideTick::Step(next) =
+            glide.tick_at(start + Duration::from_millis(32), chasing, 1_000.0)
+        else {
+            panic!("expected the chase to continue");
+        };
+        assert!(next > 0.0, "delta = {next}");
+    }
+
+    #[test]
+    fn wheeling_up_with_nothing_above_does_not_move_or_chase() {
+        let mut glide = ScrollGlide::new();
+        // At the top there is nowhere to go; the flag must stay unset so the
+        // caller keeps its pin state.
+        assert!(!glide.wheel(40.0, 0.0, 0.0));
+        assert!(!glide.goal_bottom());
     }
 }

@@ -36,8 +36,8 @@ use effibuddy_agent_core::{
 use effibuddy_ui::{
     BadgeTone, GlideTick, IconButton, MarkdownInteraction, ScrollGlide, Spinner, Theme, badge,
     chunk_ranges, disclosure_chevron, ease_out_cubic, icons, markdown_source_key, reduce_motion,
-    render_markdown_chunk_with, render_markdown_keyed_with,
-    render_markdown_streaming_with, shadow_float, wheel_capture_overlay,
+    render_markdown_chunk_with, render_markdown_keyed_with, render_markdown_streaming_with,
+    shadow_float, wheel_capture_overlay,
 };
 use gpui::prelude::*;
 use gpui::{
@@ -95,6 +95,9 @@ pub(crate) struct RunSnapshot {
     pub approval_tool: Option<String>,
     pub last_error: Option<String>,
     pub notice: Option<String>,
+    /// "正在重试（n/m）…" while a retryable provider failure is recovering.
+    /// Replaces the generic "正在思考…" line; never rendered as an error.
+    pub retry: Option<String>,
 }
 
 /// Everything a list item needs at layout time. Cheap to clone (the item,
@@ -341,6 +344,21 @@ pub(crate) enum ChatItemKind {
         text: String,
     },
     Empty,
+}
+
+/// Approximate memory held by the virtual chat snapshot.
+///
+/// The list keeps its own clones of assistant messages and every tool result,
+/// so on a long conversation this can be a significant fraction of the
+/// transcript — and unlike the session it is rebuilt on structural changes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ChatMemory {
+    pub items: usize,
+    pub text_bytes: u64,
+    pub tool_results: usize,
+    pub tool_result_bytes: u64,
+    pub image_cache_entries: usize,
+    pub image_cache_bytes: u64,
 }
 
 pub(crate) struct AssistantItem {
@@ -691,7 +709,9 @@ impl ChatList {
         let mut extras: Vec<(String, ChatItemKind, u64)> = Vec::new();
         if run.running {
             let waiting = run.waiting_approval || session.status == RunStatus::WaitingApproval;
-            let (activity, detail) = if waiting {
+            let (activity, detail) = if let Some(retry) = &run.retry {
+                (retry.clone(), None)
+            } else if waiting {
                 ("等待你的批准".to_string(), run.approval_tool.clone())
             } else if let Some(call) = unresolved_call(session, &results) {
                 (format!("正在执行 {}", call.name), Some(tool_detail(call)))
@@ -887,10 +907,10 @@ impl ChatList {
                     ChatItemKind::Assistant(assistant) => {
                         assistant.chunks.as_deref().map(Vec::as_slice)
                     }
-                    ChatItemKind::Turn(turn) => turn
-                        .members
-                        .last()
-                        .and_then(|member| member.chunks.as_deref().map(Vec::as_slice)),
+                    ChatItemKind::Turn(turn) => {
+                        let body_ix = turn_body_index(turn, streaming_id.as_deref());
+                        turn.members[body_ix].chunks.as_deref().map(Vec::as_slice)
+                    }
                     _ => None,
                 }
             };
@@ -906,10 +926,7 @@ impl ChatList {
                             item_ix,
                             part: SlotPart::Chunk(index),
                         });
-                        keys.push((
-                            signature,
-                            hash_values(&(chunks[index].key, presentation)),
-                        ));
+                        keys.push((signature, hash_values(&(chunks[index].key, presentation))));
                     }
                     slots.push(ChatSlot {
                         item_ix,
@@ -979,6 +996,75 @@ impl ChatList {
     }
 
     /// turn 高度渐显期间需要逐帧重绘（进度在渲染期计算）。
+    /// trace helper: how many logical rows the transcript has.
+    pub fn trace_counts(&self) -> (usize, usize) {
+        (self.items.len(), self.slots.len())
+    }
+
+    /// Approximate footprint of this snapshot for the memory diagnostics
+    /// panel. O(items + results), only called while the panel is open.
+    pub fn memory_stats(&self) -> ChatMemory {
+        let mut stats = ChatMemory {
+            items: self.items.len(),
+            ..ChatMemory::default()
+        };
+        for item in self.items.iter() {
+            match &item.kind {
+                ChatItemKind::User {
+                    text, attachments, ..
+                } => {
+                    stats.text_bytes += text.len() as u64;
+                    for attachment in attachments {
+                        stats.text_bytes += attachment.text.as_ref().map_or(0, String::len) as u64;
+                        stats.text_bytes += attachment
+                            .image
+                            .as_ref()
+                            .map_or(0, |image| image.data.len())
+                            as u64;
+                    }
+                }
+                ChatItemKind::Assistant(assistant) => {
+                    // The item owns a cloned `Message` plus flattened
+                    // text/reasoning SharedStrings derived from it.
+                    stats.text_bytes += crate::memory::message_bytes(&assistant.message);
+                    stats.text_bytes +=
+                        assistant.text.len() as u64 + assistant.reasoning.len() as u64;
+                }
+                ChatItemKind::Turn(turn) => {
+                    for member in &turn.members {
+                        stats.text_bytes += crate::memory::message_bytes(&member.message);
+                        stats.text_bytes +=
+                            member.text.len() as u64 + member.reasoning.len() as u64;
+                    }
+                }
+                ChatItemKind::System { text }
+                | ChatItemKind::Error { text }
+                | ChatItemKind::Notice { text } => stats.text_bytes += text.len() as u64,
+                ChatItemKind::TaskNotification { summary } => {
+                    stats.text_bytes += summary.len() as u64;
+                }
+                ChatItemKind::AgentMessage { meta, text } => {
+                    stats.text_bytes += (meta.text.len() + text.len()) as u64;
+                }
+                ChatItemKind::RunStatus(_) | ChatItemKind::Empty => {}
+            }
+        }
+        for result in self.results.values() {
+            stats.tool_results += 1;
+            stats.tool_result_bytes += result.content.len() as u64
+                + result
+                    .images
+                    .iter()
+                    .map(|image| image.data.len() as u64)
+                    .sum::<u64>();
+        }
+        for image in self.tool_images.borrow().values().flatten() {
+            stats.image_cache_entries += 1;
+            stats.image_cache_bytes += image.bytes.len() as u64;
+        }
+        stats
+    }
+
     pub fn turn_height_animating(&self) -> bool {
         self.turn_expand_at
             .values()
@@ -1064,6 +1150,17 @@ impl ChatList {
         self.reveal.active = false;
     }
 
+    /// Drop every local trace of a partially streamed message that the
+    /// harness rolled back before retrying. The next attempt opens a new
+    /// message id, so the reveal would reset anyway; clearing it here also
+    /// stops the old buffer from surviving on the frame in between.
+    pub fn discard_message(&mut self, message_id: &str) {
+        if self.reveal.message_id.as_deref() == Some(message_id) {
+            self.end_stream();
+        }
+        self.durations.remove(message_id);
+    }
+
     /// Advance the typewriter. Returns true while text is still hidden.
     pub fn tick(&mut self) -> bool {
         self.reveal.advance()
@@ -1129,15 +1226,18 @@ impl ChatList {
         if pixel_y == 0.0 {
             return;
         }
-        if pixel_y > 0.0 {
-            // Scrolling up always unpins, even before the first glide tick
-            // moves the list: `sync_scroll` would otherwise force the viewport
-            // back to the bottom with a stale `pinned` flag.
-            self.pinned = false;
-        }
         let max = f32::from(self.list_state.max_offset_for_scrollbar().height);
         let current = -f32::from(self.list_state.scroll_px_offset_for_scrollbar().y);
-        self.glide.wheel(pixel_y, current, max);
+        let moved = self.glide.wheel(pixel_y, current, max);
+        if pixel_y > 0.0 && moved {
+            // Scrolling up always unpins, even before the first glide tick
+            // moves the list: `sync_scroll` would otherwise force the viewport
+            // back to the bottom with a stale `pinned` flag. When there is
+            // nothing above (`moved == false`) the transcript stays pinned.
+            self.pinned = false;
+        }
+        // Wheeling down to the very bottom re-arms the bottom chase inside the
+        // glide; `tick_scroll` pins again once it settles there.
     }
 
     /// Start an animated glide to the bottom (scroll-to-bottom button).
@@ -1194,11 +1294,16 @@ impl ChatList {
     /// Scroll a nested tracked region (reasoning body, code panel) by a raw
     /// wheel delta. Called from its claim overlay, which has already won the
     /// capture phase against the chat-level interceptor.
+    ///
+    /// GPUI's wheel convention is `positive = up`; a `ScrollHandle` offset is
+    /// negative while scrolled down, so the deltas add directly. (The previous
+    /// subtraction happened to be unreachable: the overlay was laid out with
+    /// zero height and never received the wheel.)
     fn apply_nested_scroll(&mut self, handle: &ScrollHandle, pixel_y: f32) {
         let max = handle.max_offset();
         let offset = handle.offset();
-        let next_y = (offset.y - px(pixel_y)).clamp(-max.height, px(0.0));
-        handle.set_offset(gpui::point(offset.x, next_y));
+        let next_y = nested_scroll_y(f32::from(offset.y), pixel_y, f32::from(max.height));
+        handle.set_offset(gpui::point(offset.x, px(next_y)));
     }
 
     // --- scrollbar ---------------------------------------------------------
@@ -1956,7 +2061,7 @@ pub(crate) fn render_chat_item(
         }
         (ChatItemKind::Turn(turn), SlotPart::Lead) => render_turn_lead(turn, view, theme, entity),
         (ChatItemKind::Turn(turn), SlotPart::Chunk(chunk_ix)) => {
-            render_assistant_chunk(turn_body(turn), view, chunk_ix, theme)
+            render_assistant_chunk(turn_body(turn, view), view, chunk_ix, theme)
         }
         (ChatItemKind::Turn(turn), SlotPart::Tail) => render_turn_tail(turn, view, theme, entity),
         _ => div().into_any_element(),
@@ -2552,10 +2657,40 @@ fn render_assistant_tail(
 
 // --- turn blocks -----------------------------------------------------------
 
-/// The turn's body member: the last assistant message, whose text renders as
-/// the answer below the activity stack.
-fn turn_body(turn: &TurnItem) -> &AssistantItem {
-    turn.members.last().expect("turn has at least one member")
+/// Which member renders as the turn's answer.
+///
+/// Normally the last member is the answer. But a turn often ends on a
+/// tool-only step (or a reasoning-only step cut by the output limit), and the
+/// model's last *text* is in an earlier member. Using the literal last member
+/// then produces a header followed by nothing — the answer looks like it
+/// vanished when the turn grew. Fall back to the last member that has text.
+/// A live stream always owns the last member: its text is still arriving and
+/// the typewriter snapshot is keyed by that message id.
+fn turn_body_index(turn: &TurnItem, streaming_id: Option<&str>) -> usize {
+    let last = turn.members.len() - 1;
+    if streaming_id.is_some_and(|id| turn.members[last].message.id == id) {
+        return last;
+    }
+    turn.members
+        .iter()
+        .rposition(|member| !member.text.trim().is_empty())
+        .unwrap_or(last)
+}
+
+fn turn_body<'a>(turn: &'a TurnItem, view: &ChatViewState) -> &'a AssistantItem {
+    let streaming_id = view
+        .stream
+        .as_ref()
+        .map(|stream| stream.message_id.as_str());
+    &turn.members[turn_body_index(turn, streaming_id)]
+}
+
+fn turn_body_index_in_view(turn: &TurnItem, view: &ChatViewState) -> usize {
+    let streaming_id = view
+        .stream
+        .as_ref()
+        .map(|stream| stream.message_id.as_str());
+    turn_body_index(turn, streaming_id)
 }
 
 fn turn_message_group(turn: &TurnItem) -> SharedString {
@@ -2580,7 +2715,9 @@ fn turn_expanded(turn: &TurnItem, view: &ChatViewState) -> bool {
         &view.collapsed_turns,
         &view.expanded_turns,
         view.running,
-        view.stream.as_ref().map(|stream| stream.message_id.as_str()),
+        view.stream
+            .as_ref()
+            .map(|stream| stream.message_id.as_str()),
     )
 }
 
@@ -2724,23 +2861,18 @@ fn reveal_height_block(
         .h(px(visible_height))
         .overflow_hidden()
         .child(
-            div()
-                .relative()
-                .w_full()
-                .flex_none()
-                .child(block)
-                .child(
-                    canvas(
-                        move |bounds, _window, _cx| {
-                            heights
-                                .borrow_mut()
-                                .insert(key.clone(), f32::from(bounds.size.height));
-                        },
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .inset_0(),
-                ),
+            div().relative().w_full().flex_none().child(block).child(
+                canvas(
+                    move |bounds, _window, _cx| {
+                        heights
+                            .borrow_mut()
+                            .insert(key.clone(), f32::from(bounds.size.height));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            ),
         )
         .into_any_element()
 }
@@ -3019,7 +3151,8 @@ fn render_turn(
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let expanded = turn_expanded(turn, view);
-    let body = turn_body(turn);
+    let body_ix = turn_body_index_in_view(turn, view);
+    let body = &turn.members[body_ix];
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
@@ -3031,19 +3164,22 @@ fn render_turn(
         // 活动栈整体放进高度渐显容器：展开时高度逐帧长高，答案文字与下方
         // 内容随真实布局平滑下移，而不是被瞬间撑开的一大截顶飞。
         let mut activity = div().w_full().flex().flex_col().gap(px(12.0));
-        for member in &turn.members[..turn.members.len() - 1] {
-            activity =
-                render_turn_member(activity, member, view, theme, entity, reveal, &mut reveal_ix);
+        for (index, member) in turn.members.iter().enumerate() {
+            if index == body_ix {
+                continue;
+            }
+            activity = render_turn_member(
+                activity,
+                member,
+                view,
+                theme,
+                entity,
+                reveal,
+                &mut reveal_ix,
+            );
         }
-        activity = render_turn_body_reasoning(
-            activity,
-            body,
-            view,
-            theme,
-            entity,
-            reveal,
-            &mut reveal_ix,
-        );
+        activity =
+            render_turn_body_reasoning(activity, body, view, theme, entity, reveal, &mut reveal_ix);
         column = column.child(reveal_height_block(
             activity,
             reveal,
@@ -3075,14 +3211,7 @@ fn render_turn(
     }
 
     if expanded {
-        column = append_tool_rows(
-            column,
-            body,
-            view,
-            theme,
-            entity,
-            Some((reveal, reveal_ix)),
-        );
+        column = append_tool_rows(column, body, view, theme, entity, Some((reveal, reveal_ix)));
     }
     if !texts.active() && has_text {
         column = column.child(render_copy_footer(body, &message_group, theme));
@@ -3099,7 +3228,8 @@ fn render_turn_lead(
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let expanded = turn_expanded(turn, view);
-    let body = turn_body(turn);
+    let body_ix = turn_body_index_in_view(turn, view);
+    let body = &turn.members[body_ix];
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
@@ -3109,19 +3239,22 @@ fn render_turn_lead(
     column = column.child(render_turn_header(turn, expanded, view, theme, entity));
     if expanded {
         let mut activity = div().w_full().flex().flex_col().gap(px(12.0));
-        for member in &turn.members[..turn.members.len() - 1] {
-            activity =
-                render_turn_member(activity, member, view, theme, entity, reveal, &mut reveal_ix);
+        for (index, member) in turn.members.iter().enumerate() {
+            if index == body_ix {
+                continue;
+            }
+            activity = render_turn_member(
+                activity,
+                member,
+                view,
+                theme,
+                entity,
+                reveal,
+                &mut reveal_ix,
+            );
         }
-        activity = render_turn_body_reasoning(
-            activity,
-            body,
-            view,
-            theme,
-            entity,
-            reveal,
-            &mut reveal_ix,
-        );
+        activity =
+            render_turn_body_reasoning(activity, body, view, theme, entity, reveal, &mut reveal_ix);
         column = column.child(reveal_height_block(
             activity,
             reveal,
@@ -3150,7 +3283,7 @@ fn render_turn_tail(
     entity: &WeakEntity<AppView>,
 ) -> AnyElement {
     let expanded = turn_expanded(turn, view);
-    let body = turn_body(turn);
+    let body = turn_body(turn, view);
     let texts = assistant_texts(body, view);
     let message_group = turn_message_group(turn);
     let mut column = assistant_column(&message_group);
@@ -3243,12 +3376,7 @@ fn append_tool_rows(
     if rows.is_empty() {
         return column;
     }
-    let group = div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .children(rows);
+    let group = div().w_full().flex().flex_col().gap(px(4.0)).children(rows);
     match reveal {
         // 每个成员的工具组各有自己的自然高度：挂到同一个缓存键会让后画的
         // 组覆盖前一组，展开窗口内出现裁切/高度跳变。
@@ -3428,6 +3556,7 @@ fn render_reasoning(
             .clone();
         div()
             .id(SharedString::from(format!("reasoning-body-{}", message_id)))
+            .relative()
             .ml(px(8.0))
             .pl(px(12.0))
             .border_l_1()
@@ -3445,7 +3574,15 @@ fn render_reasoning(
             )
             // Claim wheel events over the expanded body in the capture phase:
             // the body scrolls by its own handle and the chat glide stays out.
-            .child(wheel_claim_overlay(scroll_handle, entity.clone()))
+            // The canvas must be absolutely laid over the body: as a plain
+            // child it gets zero height at the bottom of the column, so
+            // `bounds.contains` never matched and the wheel fell through to
+            // the chat list instead of scrolling the reasoning text.
+            .child(
+                wheel_claim_overlay(scroll_handle, entity.clone())
+                    .absolute()
+                    .inset_0(),
+            )
     });
 
     div()
@@ -4464,6 +4601,15 @@ pub(crate) fn render_scroll_to_bottom(
         .into_any_element()
 }
 
+/// Next vertical offset for a nested scrollable from one wheel notch.
+///
+/// GPUI reports wheel deltas as "positive = up", while a `ScrollHandle` offset
+/// is negative once the content is scrolled down, so the delta is added and
+/// the result clamped to `[-max, 0]`.
+fn nested_scroll_y(current_y: f32, pixel_y: f32, max: f32) -> f32 {
+    (current_y + pixel_y).clamp(-max, 0.0)
+}
+
 /// Wheel-event routing, part 1: nested scrollable regions. This transparent
 /// overlay is painted *inside* a nested scrollable (reasoning body, code
 /// panel), so its capture-phase listener registers — and therefore runs —
@@ -4732,11 +4878,7 @@ fn tool_detail(call: &ToolCall) -> String {
 /// short window of recent ones. Revisiting an evicted image decodes it again.
 const MAX_DECODED_IMAGES: usize = 16;
 
-fn cache_decoded_image(
-    view: &ChatViewState,
-    key: String,
-    image: Option<Arc<Image>>,
-) {
+fn cache_decoded_image(view: &ChatViewState, key: String, image: Option<Arc<Image>>) {
     let mut cache = view.tool_images.borrow_mut();
     if cache.len() >= MAX_DECODED_IMAGES && !cache.contains_key(&key) {
         if let Some(victim) = cache.keys().next().cloned() {
@@ -4865,6 +5007,7 @@ fn code_panel(
         .child(
             div()
                 .id(SharedString::from(format!("code-{}", panel_key)))
+                .relative()
                 .max_h(px(320.0))
                 .overflow_y_scroll()
                 .track_scroll(&scroll_handle)
@@ -4875,7 +5018,13 @@ fn code_panel(
                 .line_height(px(18.0))
                 .text_color(theme.text)
                 .child(body.to_string())
-                .child(wheel_claim_overlay(scroll_handle, entity.clone())),
+                // Absolute, like the reasoning body: a plain zero-height
+                // canvas child never contains the pointer.
+                .child(
+                    wheel_claim_overlay(scroll_handle, entity.clone())
+                        .absolute()
+                        .inset_0(),
+                ),
         )
         .into_any_element()
 }
@@ -4886,6 +5035,69 @@ fn code_panel(
 mod tests {
     use super::*;
     use effibuddy_agent_core::{SessionState, ToolCall, ToolResult};
+
+    #[test]
+    fn nested_wheel_follows_gpui_direction() {
+        // Scrolled down 100px, wheel up: the offset moves toward zero.
+        assert_eq!(nested_scroll_y(-100.0, 30.0, 400.0), -70.0);
+        // Wheel down at the top scrolls down.
+        assert_eq!(nested_scroll_y(0.0, -30.0, 400.0), -30.0);
+        // Neither edge can overscroll.
+        assert_eq!(nested_scroll_y(0.0, 30.0, 400.0), 0.0);
+        assert_eq!(nested_scroll_y(-380.0, -50.0, 400.0), -400.0);
+    }
+
+    #[test]
+    fn wheeling_down_to_the_end_re_pins_the_transcript() {
+        let mut chat = ChatList::new();
+        // Simulate a transcript the user scrolled away from.
+        chat.pinned = false;
+        chat.wheel(-120.0);
+        // First tick arms the clock, the second settles at the bottom and
+        // restores the follow-the-stream pin.
+        assert!(chat.tick_scroll());
+        assert!(!chat.tick_scroll());
+        assert!(chat.pinned());
+    }
+
+    #[test]
+    fn wheeling_up_with_no_scroll_room_stays_pinned() {
+        let mut chat = ChatList::new();
+        assert!(chat.pinned());
+        // Nothing fits above the top: an upward wheel cannot unpin a
+        // transcript that has nowhere to go.
+        chat.wheel(120.0);
+        assert!(chat.pinned());
+    }
+
+    /// A finished turn often ends on a tool-only step; the answer text lives in
+    /// an earlier member. The body must fall back to it instead of rendering a
+    /// header with nothing below (the text used to disappear as the turn grew).
+    #[test]
+    fn turn_body_uses_the_last_member_with_text() {
+        let make = |text: &str| {
+            let mut message = Message::assistant();
+            if !text.is_empty() {
+                message.push_text(text);
+            }
+            Rc::new(build_assistant_item(&message, None))
+        };
+        let turn = TurnItem {
+            id: "turn:test".to_string(),
+            members: vec![make("first answer"), make(""), make("")],
+            signatures: vec![1, 2, 3],
+            thinking_count: 0,
+            tool_calls: 0,
+            agent_calls: 0,
+            total_ms: 0,
+            any_error: false,
+        };
+        assert_eq!(turn_body_index(&turn, None), 0);
+        // A live stream always owns the last member: its text is still
+        // arriving through the typewriter snapshot keyed by that id.
+        let streaming = turn.members[2].message.id.clone();
+        assert_eq!(turn_body_index(&turn, Some(&streaming)), 2);
+    }
 
     #[test]
     fn advance_chars_stays_on_utf8_boundaries() {
@@ -5071,10 +5283,8 @@ mod tests {
         // `prepare_frame` prunes the expired window; the live turn is still
         // auto-expanded, but the reveal must not be re-armed — otherwise the
         // whole activity stack fades in again after every tool step.
-        chat.turn_expand_at.insert(
-            turn_id.clone(),
-            Instant::now() - TURN_EXPAND_WINDOW * 2,
-        );
+        chat.turn_expand_at
+            .insert(turn_id.clone(), Instant::now() - TURN_EXPAND_WINDOW * 2);
         let view = prepare(&mut chat);
         assert!(!view.turn_expand_at.contains_key(&turn_id));
         assert!(!chat.turn_expand_at.contains_key(&turn_id));

@@ -6,6 +6,7 @@
 
 pub mod assets;
 pub mod button;
+pub mod clipboard_paths;
 pub mod markdown;
 pub mod motion;
 pub mod primitives;
@@ -17,10 +18,10 @@ pub mod theme;
 pub use assets::{EffiBuddyAssets, icons, images};
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
 pub use markdown::{
-    MarkdownInteraction, MarkdownTarget, chunk_ranges, markdown_cache_hits, markdown_inline,
-    markdown_source_key, render_markdown, render_markdown_chunk, render_markdown_chunk_with,
-    render_markdown_keyed, render_markdown_keyed_with, render_markdown_streaming,
-    render_markdown_streaming_with,
+    MarkdownCacheStats, MarkdownInteraction, MarkdownTarget, chunk_ranges, markdown_cache_hits,
+    markdown_cache_stats, markdown_inline, markdown_source_key, render_markdown,
+    render_markdown_chunk, render_markdown_chunk_with, render_markdown_keyed,
+    render_markdown_keyed_with, render_markdown_streaming, render_markdown_streaming_with,
 };
 pub use motion::{
     CONTROL_MOTION, CubicBezier, Easing, MotionController, MotionFrame, MotionId, MotionItem,

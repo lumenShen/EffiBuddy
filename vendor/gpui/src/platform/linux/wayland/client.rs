@@ -809,7 +809,13 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set_primary(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            // Use the latest input serial, not just the last key press: a
+            // copy triggered by clicking a button has a mouse serial, and a
+            // stale keyboard serial may be rejected by the compositor.
+            let mut serial = state.serial_tracker.get(SerialKind::InputPress);
+            if serial == 0 {
+                serial = state.serial_tracker.get(SerialKind::KeyPress);
+            }
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
@@ -829,7 +835,12 @@ impl LinuxClient for WaylandClient {
         };
         if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
             state.clipboard.set(item);
-            let serial = state.serial_tracker.get(SerialKind::KeyPress);
+            // See `write_to_primary`: the serial must be the event that
+            // triggered this write (click or key), not always a key press.
+            let mut serial = state.serial_tracker.get(SerialKind::InputPress);
+            if serial == 0 {
+                serial = state.serial_tracker.get(SerialKind::KeyPress);
+            }
             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
@@ -1293,6 +1304,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 state.serial_tracker.update(SerialKind::KeyPress, serial);
+                state.serial_tracker.update(SerialKind::InputPress, serial);
 
                 let focused_window = state.keyboard_focused_window.clone();
                 let Some(focused_window) = focused_window else {
@@ -1609,6 +1621,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 ..
             } => {
                 state.serial_tracker.update(SerialKind::MousePress, serial);
+                state.serial_tracker.update(SerialKind::InputPress, serial);
                 let button = linux_button_to_gpui(button);
                 let Some(button) = button else { return };
                 if state.mouse_focused_window.is_none() {

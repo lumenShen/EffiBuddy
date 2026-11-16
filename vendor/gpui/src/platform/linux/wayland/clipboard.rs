@@ -135,7 +135,29 @@ impl<T: ReceiveData> DataOffer<T> {
         }
         None
     }
+
+    /// Read a file list (`text/uri-list`), which is what a copy in a GTK/Qt
+    /// file manager puts on the clipboard.
+    ///
+    /// Only `file://` URIs are kept; every other scheme (an `http://` drag
+    /// payload, which shares this MIME type) is dropped, because a remote URL
+    /// is not something the composer can stage as an attachment.
+    fn read_paths(&self, connection: &Connection) -> Option<ClipboardItem> {
+        if !self.has_mime_type(FILE_LIST_MIME_TYPE) {
+            return None;
+        }
+        let bytes = self.read_bytes(connection, FILE_LIST_MIME_TYPE)?;
+        let paths = crate::parse_uri_list_paths(&bytes);
+        if paths.is_empty() {
+            return None;
+        }
+        Some(ClipboardItem {
+            entries: vec![ClipboardEntry::Paths(crate::ClipboardPaths::new(paths))],
+        })
+    }
 }
+
+
 
 impl Clipboard {
     pub fn new(
@@ -205,9 +227,13 @@ impl Clipboard {
             return self.contents.clone();
         }
 
+        // Order matters: a file manager advertising both `text/uri-list` and a
+        // `text/plain` file name must yield paths, not the bare name. Images
+        // come first because an image copy rarely advertises text at all.
         let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .read_image(&self.connection)
+            .or_else(|| offer.read_paths(&self.connection))
+            .or_else(|| offer.read_text(&self.connection))?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -224,8 +250,9 @@ impl Clipboard {
         }
 
         let item = offer
-            .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .read_image(&self.connection)
+            .or_else(|| offer.read_paths(&self.connection))
+            .or_else(|| offer.read_text(&self.connection))?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)

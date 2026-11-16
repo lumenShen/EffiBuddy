@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
 };
 
-use super::LineWrapper;
+use super::{LineWrapper, WRAP_TOLERANCE};
 
 /// A laid out and styled line of text
 #[derive(Default, Debug)]
@@ -183,7 +183,11 @@ impl LineLayout {
             let next_x = glyphs.peek().map_or(self.width, |(_, _, x)| *x);
             let width = next_x - last_boundary_x;
 
-            if width > wrap_width && boundary > last_boundary {
+            // `WRAP_TOLERANCE` absorbs the sub-pixel round trip described on
+            // the constant: without it, text given exactly its shaped width
+            // (auto-sized pills and buttons, for example) wraps its last
+            // glyph onto a line of its own.
+            if width > wrap_width + WRAP_TOLERANCE && boundary > last_boundary {
                 // When used line_clamp, we should limit the number of lines.
                 if let Some(max_lines) = max_lines
                     && boundaries.len() >= max_lines - 1
@@ -670,3 +674,4 @@ impl AsCacheKeyRef for CacheKeyRef<'_> {
         *self
     }
 }
+

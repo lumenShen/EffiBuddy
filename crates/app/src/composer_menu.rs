@@ -1077,6 +1077,59 @@ impl AppView {
         cx.notify();
     }
 
+    /// Stage clipboard content that the editor cannot type: a screenshot or a
+    /// copied file. `Ctrl+V` in the composer routes here, so pasting a
+    /// screenshot behaves like dropping the same image.
+    pub(crate) fn paste_media(
+        &mut self,
+        media: effibuddy_ui::text_input::PastedMedia,
+        cx: &mut Context<Self>,
+    ) {
+        match media {
+            effibuddy_ui::text_input::PastedMedia::Paths(paths) => self.attach_paths(paths, cx),
+            effibuddy_ui::text_input::PastedMedia::Image { mime_type, bytes } => {
+                let resolved = self.active_resolved_model();
+                let accepts_images = resolved.model.capabilities.vision
+                    || self.models.demo_mode(self.config.use_demo, &resolved);
+                if !accepts_images {
+                    self.last_error = Some(
+                        "当前模型不支持图片，剪贴板中的图片未添加。请在设置里切换到支持图片的模型。"
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if self.composer_attachments.len() >= MAX_ATTACHMENTS {
+                    self.last_error = Some(format!("最多附加 {MAX_ATTACHMENTS} 个附件。"));
+                    cx.notify();
+                    return;
+                }
+                let workspace = self.composer_workspace();
+                match attachments::attachment_from_image_bytes(&mime_type, bytes, &workspace) {
+                    Ok(attachment) => {
+                        // Pasting the same screenshot twice should not add a
+                        // second identical chip.
+                        if self
+                            .composer_attachments
+                            .iter()
+                            .any(|existing| existing.path == attachment.path)
+                        {
+                            return;
+                        }
+                        self.composer_attachments.push(attachment);
+                        self.persist_composer_attachments(cx);
+                        self.notice = Some("已添加剪贴板图片。".to_string());
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        self.last_error = Some(error);
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn remove_composer_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.composer_attachments.len() {
             self.composer_attachments.remove(index);

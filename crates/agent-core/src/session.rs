@@ -578,11 +578,18 @@ impl SessionState {
         self.held_compaction = None;
         self.repair_dangling_tool_calls();
         self.rebuild_message_index();
-        self.cleared_tool_calls.retain(|call_id| {
-            self.messages
+        // One pass over the transcript builds the set of result ids, so this
+        // stays O(n + kept) instead of rescanning every message per cleared id
+        // (a long transcript with many microcompacted calls becomes quadratic).
+        if !self.cleared_tool_calls.is_empty() {
+            let present: std::collections::HashSet<String> = self
+                .messages
                 .iter()
-                .any(|message| message.tool_result().is_some_and(|r| &r.call_id == call_id))
-        });
+                .filter_map(|message| message.tool_result().map(|result| result.call_id.clone()))
+                .collect();
+            self.cleared_tool_calls
+                .retain(|call_id| present.contains(call_id.as_str()));
+        }
     }
 
     fn rebuild_message_index(&mut self) {

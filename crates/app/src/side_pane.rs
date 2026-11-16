@@ -1492,38 +1492,37 @@ impl AppView {
         let scroll_entity = cx.entity().downgrade();
         let shared = self.active_shared();
         // 计划与用量来自同一次会话读取：避免两次加锁之间数据被更新。
-        let (todos, steps, model, provider, compacted, context) =
-            if let Some(shared) = &shared {
-                let session = lock_session(shared);
-                let resolved = self.models.resolve_session(&session);
-                // 与输入框占用环保持一致：演示模型按 64k 窗口计算。
-                let context_window = if self.models.demo_mode(self.config.use_demo, &resolved) {
-                    64_000
-                } else {
-                    resolved.context_window()
-                };
-                (
-                    session.todos.clone(),
-                    session.steps,
-                    resolved.model_label().to_string(),
-                    resolved.provider_label().to_string(),
-                    session
-                        .compaction
-                        .as_ref()
-                        .map(|record| record.compacted_messages)
-                        .unwrap_or(0),
-                    crate::context_meter::collect_from_session(&session, context_window),
-                )
+        let (todos, steps, model, provider, compacted, context) = if let Some(shared) = &shared {
+            let session = lock_session(shared);
+            let resolved = self.models.resolve_session(&session);
+            // 与输入框占用环保持一致：演示模型按 64k 窗口计算。
+            let context_window = if self.models.demo_mode(self.config.use_demo, &resolved) {
+                64_000
             } else {
-                (
-                    Vec::new(),
-                    0,
-                    String::new(),
-                    String::new(),
-                    0,
-                    ContextUsage::empty(128_000),
-                )
+                resolved.context_window()
             };
+            (
+                session.todos.clone(),
+                session.steps,
+                resolved.model_label().to_string(),
+                resolved.provider_label().to_string(),
+                session
+                    .compaction
+                    .as_ref()
+                    .map(|record| record.compacted_messages)
+                    .unwrap_or(0),
+                crate::context_meter::collect_from_session(&session, context_window),
+            )
+        } else {
+            (
+                Vec::new(),
+                0,
+                String::new(),
+                String::new(),
+                0,
+                ContextUsage::empty(128_000),
+            )
+        };
         // 子智能体的累计消耗来自 UI 侧任务快照（运行中由 UsageUpdated 刷新），
         // 与主会话的会话锁无关，放在锁外合并避免扩大临界区。
         let context = ContextUsage {
@@ -2354,6 +2353,7 @@ impl AppView {
                     approval_tool: None,
                     last_error: error.clone(),
                     notice: None,
+                    retry: None,
                 };
                 {
                     let session = lock_session(&shared);

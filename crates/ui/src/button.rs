@@ -199,6 +199,10 @@ impl RenderOnce for Button {
             .gap_2()
             .h(px(self.size.height()))
             .px(px(self.size.padding_x()))
+            // Buttons have a fixed height, so a wrapped label would spill out
+            // of the pill. Keep labels on one line; the button sizes itself to
+            // the text instead of breaking it.
+            .whitespace_nowrap()
             .rounded(px(radius::MD))
             .border_1()
             .border_color(border)

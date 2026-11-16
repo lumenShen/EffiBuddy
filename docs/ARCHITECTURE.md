@@ -368,7 +368,7 @@ AgentHarness (child) ── HarnessEvent ──▶ AppEvent::SubagentHarness
 | `explore` | 只读 | `read_file` / `list_dir` / `grep` + `agent` / `agent_send` / `agent_list` |
 | `reviewer` | 只读 | 同上 |
 
-档案由 `builtin_subagent_profiles()` 提供，三者都 `allow_spawn: true`：**任何代理都可以创建属于自己的子代理**。是否存在递归只由绝对深度上限（`MAX_AGENT_DEPTH = 3`）决定，提示词无法绕过。
+档案由 `builtin_subagent_profiles()` 提供，三者都 `allow_spawn: true`：**任何代理都可以创建属于自己的子代理**。是否存在递归只由绝对深度上限（`MAX_AGENT_DEPTH = 256`）决定，提示词无法绕过。
 
 每个实例由 `SubagentService::assign_name` 分配唯一 `name`（重复时加 `-2` / `-3`）。`AgentVisibility` 决定寻址范围：
 
@@ -397,12 +397,14 @@ AgentHarness (child) ── HarnessEvent ──▶ AppEvent::SubagentHarness
 
 ### 完成通知与唤醒
 
-后台子代理完成（`completed` / `failed`）时：
+后台子代理到达任一终态（`completed` / `failed` / `cancelled`）时：
 
 1. `SubagentService` 持久化子会话并发送 `SubagentFinished`；
-2. `AppView` 更新任务卡片，并把 `<task-notification>` 文本放入待注入队列；
+2. `AppView` 更新任务卡片，并把 `<task-notification>` 文本放入待注入队列。失败与停止的通知在 `<summary>` 中给出单行原因，在 `<result>` 正文以 `ERROR:` 开头保留完整错误栈与 `PARTIAL OUTPUT`，因此即使子代理没产出任何助手文本，父级也能拿到根因；
 3. 若父 turn 空闲，立即把通知作为 `Message::synthetic_user` 追加到父 transcript 并唤醒（`resume_after_run`：若用户有排队消息，队首消息与本批通知合并进同一新回合，通知在前、用户消息在后）；
 4. 若父 turn 正在运行，通知留在队列，等父 turn 成功结束后再注入，避免插在 tool_call 与 tool_result 之间。
+
+`running` 不是终态，`lost` 由重启时磁盘推导、不属于活运行期，二者都不会触发唤醒。
 
 `synthetic` 消息对模型是普通 user 消息，对 UI 是系统通知卡片。由 `agent_send` 触发的唤醒标记 `report.wake = true`，不会再生成第二条父通知。
 
@@ -482,6 +484,17 @@ workflow metadata ▶ record_workflow_metadata         （组输入/输出/schem
 - `ListAlignment::Top` + 手动吸底：`pinned` 时每次渲染在**布局之前** `scroll_to(item_count)`，短内容会被钳到顶部，长内容贴底；上滚后由 `set_scroll_handler` 标记，下一帧用 `max_offset_for_scrollbar` / `scroll_px_offset_for_scrollbar` 精确判断是否回到底部。
 - 未吸底时渲染右下角「回到底部」按钮；未吸底期间有新内容会显示强调色小圆点。右侧另有一条 6px overlay 滚动条，点击轨道可跳转。
 
+### 打开长会话的延迟预算
+
+切换到一条长会话（实测 11 MB / 377 条消息）在冷启动后首帧可见约 12–16ms，拆解如下（`EFFIBUDDY_PERF` 之外的一次性埋点测得）：
+
+- **`store.load`（约 12ms）**：`session_from_json` 直接 `from_str` 进 `SessionState`，不再经过 `serde_json::Value` 中转；旧版 `project` 字段用原始 JSON 字节扫描判断。长转写里 `Value` 中转约占总解析时间的一半。
+- **`normalize_after_load`（约 0.4ms）**：`cleared_tool_calls` 的清理改为一次 `HashSet` 收集再 `retain`，原来是每个被清除的调用都全量扫一遍 transcript（长会话里是平方级）。
+- **`descendant_sessions_raw`（约 0.8ms）**：子代理树为空时不该付任何解析成本。侧栏 summary 缓存已经记下了每个文件的 `parent_id`，所以 `parent_id: None` 的文件直接跳过、连读都不读；只有缓存未知的文件才回退到「读字节 → 检查 `"parent_id"` 是否非 null → 解析」。改动前这里会把目录里**每一条**转写完整解析（示例目录 29 个文件 21 MB，约 22ms），与是否有子代理无关。
+- 结构拆分：`assemble_descendants()` 独立出来，树的链接与排序不依赖文件系统，可直接单测。
+
+首帧构建（约 25ms）与稳态每帧（约 1.2ms）的差距来自 `list` 的一次性布局与 markdown 首次解析；长会话的 353 条消息会合并成很少的几个 turn 行，因此这一开销基本与消息条数无关，主要取决于可见 turn 的正文长度。
+
 ### 流式 reveal
 
 `StreamReveal` 保存当前消息的完整目标文本、已显示字节数与思考计时：
@@ -514,7 +527,7 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 ### 左侧会话栏
 
-- 展开态 272px，按「置顶 → 全部项目 → 任务」分组；项目是具名容器（`projects.json`），行内 `+N` 徽标表示附加文件夹数量，悬停显示全部路径，菜单可管理文件夹、按根打开、折叠与移除；
+- 展开态 272px，按「置顶 → 全部项目 → 任务」分组；项目是具名容器（`projects.json`），行内 `+N` 徽标表示附加文件夹数量，悬停显示全部路径，菜单可管理文件夹、按根打开、折叠与删除（两步确认，一并删除项目内会话的转写、检查点与草稿；磁盘上的文件不动）；
 - 会话按项目 id 归属（旧会话按路径解析到项目根），折叠键为 `project:<id>`；「+」支持一次多选文件夹新建项目，第一个为主动文件夹；
 - `Ctrl+B`（标题栏按钮或命令面板）折叠为 52px 图标栏：保留新建会话、搜索、工作区提示、主题与设置入口，会话列表不再构建；
 - 折叠状态写入 `config.json`，重启后按上次的布局恢复。

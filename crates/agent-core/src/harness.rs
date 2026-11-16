@@ -36,9 +36,11 @@ use tokio_util::sync::CancellationToken;
 use crate::context;
 use crate::error::{AgentError, ProviderError, ToolError};
 use crate::ids::new_id;
-use crate::message::{Message, TodoItem, ToolCall, ToolResult, Usage, UserAttachment};
+use crate::message::{
+    FinishReason, Message, TodoItem, ToolCall, ToolResult, Usage, UserAttachment,
+};
 use crate::prompt::{PromptContext, system_prompt};
-use crate::provider::{ChatRequest, Completion, ModelProvider, ProviderEvent};
+use crate::provider::{ChatMessage, ChatRequest, Completion, ModelProvider, ProviderEvent};
 use crate::session::{
     CompactionRecord, HeldCompaction, HeldCompactionStatus, RunOutcome, RunStatus, SharedSession,
     lock_session,
@@ -73,6 +75,19 @@ pub enum HarnessEvent {
     AssistantFinished {
         message_id: String,
         interrupted: bool,
+    },
+    /// A partially streamed assistant message was rolled back because the
+    /// request failed and is being retried. The next attempt starts from a
+    /// clean transcript, so the host must drop the local reveal/snapshot copy.
+    AssistantDiscarded {
+        message_id: String,
+    },
+    /// A retryable provider failure (a dropped SSE stream, a 429/5xx) is about
+    /// to be retried. The host can show "正在重试" instead of an error card.
+    ProviderRetry {
+        attempt: usize,
+        max_retries: usize,
+        reason: String,
     },
     ApprovalRequested {
         request: ApprovalRequest,
@@ -274,7 +289,24 @@ struct StreamState {
     message_id: Option<String>,
     text: String,
     reasoning: String,
+    /// True when this stream resumes the previous assistant message after an
+    /// output-limit cut instead of opening a new one. The transcript message
+    /// already holds the earlier part; deltas append to it, so the UI keeps a
+    /// single growing answer rather than two assistant rows (a merged turn
+    /// would only show the last row's text).
+    append: bool,
 }
+
+/// Request-only user instruction appended after an answer was cut off by the
+/// model's output-token limit. The partial assistant text is already in the
+/// transcript, so the model only needs to pick up where it stopped. This is
+/// never persisted: it belongs to the in-flight turn, like ZCode's hidden
+/// output-token continuation entry.
+const OUTPUT_LIMIT_CONTINUE_PROMPT: &str = "Output token limit hit. Resume directly - no apology, no recap of what you were doing. Pick up mid-thought if that is where the cut happened. Break remaining work into smaller pieces.";
+
+/// ZCode allows three continuations per user turn; after that the output
+/// limit is reported as an error instead of silently ending mid-answer.
+const MAX_OUTPUT_CONTINUATIONS: usize = 3;
 
 impl AgentHarness {
     pub fn new(
@@ -362,8 +394,7 @@ impl AgentHarness {
             .drain(..)
             .collect();
         for steer in pending {
-            let message =
-                Message::mid_turn_user_with_attachments(steer.text, steer.attachments);
+            let message = Message::mid_turn_user_with_attachments(steer.text, steer.attachments);
             let message_id = message.id.clone();
             {
                 let mut session = lock_session(&self.session);
@@ -489,6 +520,15 @@ impl AgentHarness {
         // oversized request after a forced summary, retrying forever would
         // just burn tokens.
         let mut reactive_attempted = false;
+        // Output-limit recovery (ZCode's Continue): a provider that ran out of
+        // output tokens ends the completion with `FinishReason::Length` but no
+        // tool calls, which used to look like a completed turn. Keep asking it
+        // to resume instead of leaving a sentence cut in half.
+        let mut output_continuation: Option<ChatMessage> = None;
+        let mut output_continuations = 0usize;
+        // The assistant message a continuation resumes, so its text keeps
+        // accumulating in one transcript row instead of splitting the answer.
+        let mut continuation_message: Option<String> = None;
         loop {
             step += 1;
             if cancel.is_cancelled() {
@@ -534,9 +574,16 @@ impl AgentHarness {
 
             let request = {
                 let session = lock_session(&self.session);
+                let mut messages = context::build_chat_messages(&session, &system_prompt);
+                // Appended to the request only (not the transcript), for the
+                // rest of this turn, so a resumed answer sees its own partial
+                // text and the instruction that follows it.
+                if let Some(continuation) = &output_continuation {
+                    messages.push(continuation.clone());
+                }
                 ChatRequest {
                     model: session.model.clone(),
-                    messages: context::build_chat_messages(&session, &system_prompt),
+                    messages,
                     tools: self.tools.specs(),
                     temperature: self.config.temperature,
                     max_tokens: self.config.max_tokens,
@@ -545,6 +592,10 @@ impl AgentHarness {
             };
 
             let mut stream = StreamState::default();
+            if let Some(message_id) = continuation_message.take() {
+                stream.message_id = Some(message_id);
+                stream.append = true;
+            }
             let completion = match self.stream_with_retry(request, &mut stream, cancel).await {
                 Ok(Some(completion)) => completion,
                 Ok(None) => {
@@ -588,17 +639,38 @@ impl AgentHarness {
                 return RunOutcome::Interrupted;
             }
 
-            let tool_calls = self.commit_completion(&mut stream, completion);
+            let (tool_calls, finish_reason) = self.commit_completion(&mut stream, completion);
             if tool_calls.is_empty() {
                 // A steer that arrived while the final text was streaming
                 // extends the turn: the assistant message above stays in the
                 // transcript and the model gets another request with the new
                 // user input appended (ZCode's text-only continuation edge).
                 if self.has_pending_steers() {
+                    output_continuation = None;
+                    output_continuations = 0;
                     continue;
+                }
+                if finish_reason == FinishReason::Length {
+                    // The answer hit the output cap. Retry with a transient
+                    // "resume" user message (bounded), so a long answer is not
+                    // silently presented as complete after being cut mid-word.
+                    if output_continuations < MAX_OUTPUT_CONTINUATIONS {
+                        output_continuations += 1;
+                        output_continuation = Some(ChatMessage::user(OUTPUT_LIMIT_CONTINUE_PROMPT));
+                        continuation_message = stream.message_id.clone();
+                        continue;
+                    }
+                    return RunOutcome::Failed(format!(
+                        "模型输出达到上限，已自动续写 {MAX_OUTPUT_CONTINUATIONS} 次仍未完成。请在「设置 → 模型」中调高该模型的最大输出，或把任务拆成更小的步骤。"
+                    ));
                 }
                 return RunOutcome::Completed;
             }
+
+            // A tool step is a fresh model call: the resume note has served
+            // its purpose and the continuation budget resets.
+            output_continuation = None;
+            output_continuations = 0;
 
             let mut interrupted = false;
             for (index, call) in tool_calls.iter().enumerate() {
@@ -1136,7 +1208,13 @@ impl AgentHarness {
         }
     }
 
-    /// Stream one completion, retrying only when nothing has been shown yet.
+    /// Stream one completion, retrying retryable failures with backoff.
+    ///
+    /// A retry re-issues the whole request, so any partial output the failed
+    /// attempt streamed into the transcript is rolled back first. That is what
+    /// lets a dropped SSE stream (the common "chat stopped mid-sentence"
+    /// failure) recover automatically instead of surfacing an error the user
+    /// has to dismiss.
     async fn stream_with_retry(
         &self,
         request: ChatRequest,
@@ -1151,13 +1229,24 @@ impl AgentHarness {
                 Ok(None) => return Ok(None),
                 Err(error) if error.is_cancelled() => return Ok(None),
                 Err(error) => {
-                    let can_retry = stream.text.is_empty()
-                        && stream.reasoning.is_empty()
-                        && attempt <= self.config.max_retries
-                        && error.is_retryable();
+                    let can_retry = attempt <= self.config.max_retries && error.is_retryable();
                     if !can_retry {
                         return Err(error);
                     }
+                    // Discard the truncated attempt before retrying. Without
+                    // this the transcript would keep a half answer (and the UI
+                    // a stale reveal buffer) next to the retried one.
+                    if stream.message_id.is_some()
+                        || !stream.text.is_empty()
+                        || !stream.reasoning.is_empty()
+                    {
+                        self.discard_stream(stream);
+                    }
+                    self.emit(HarnessEvent::ProviderRetry {
+                        attempt,
+                        max_retries: self.config.max_retries,
+                        reason: error.to_string(),
+                    });
                     let delay = self.config.retry_base_delay * 2u32.pow((attempt - 1) as u32);
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(None),
@@ -1166,6 +1255,22 @@ impl AgentHarness {
                 }
             }
         }
+    }
+
+    /// Roll back the partially streamed assistant message of a failed attempt.
+    ///
+    /// Only reasoning/text can be present: tool calls are committed from the
+    /// provider's final completion, after the stream succeeded.
+    fn discard_stream(&self, stream: &mut StreamState) {
+        if let Some(message_id) = stream.message_id.take() {
+            {
+                let mut session = lock_session(&self.session);
+                session.messages.retain(|message| message.id != message_id);
+                session.touch();
+            }
+            self.emit(HarnessEvent::AssistantDiscarded { message_id });
+        }
+        *stream = StreamState::default();
     }
 
     async fn stream_once(
@@ -1262,7 +1367,18 @@ impl AgentHarness {
 
     /// Reconcile streamed deltas with the provider's authoritative completion,
     /// persist tool calls and close the assistant message.
-    fn commit_completion(&self, stream: &mut StreamState, completion: Completion) -> Vec<ToolCall> {
+    fn commit_completion(
+        &self,
+        stream: &mut StreamState,
+        completion: Completion,
+    ) -> (Vec<ToolCall>, FinishReason) {
+        let finish_reason = completion.finish_reason.clone().unwrap_or_else(|| {
+            if completion.tool_calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCalls
+            }
+        });
         let final_text = if completion.text.is_empty() {
             stream.text.clone()
         } else {
@@ -1285,18 +1401,30 @@ impl AgentHarness {
                 session.usage.clone()
             };
             self.emit(HarnessEvent::UsageUpdated { usage });
-            return Vec::new();
+            return (Vec::new(), finish_reason);
         }
 
         let message_id = self.ensure_assistant(stream);
         {
             let mut session = lock_session(&self.session);
             if let Some(message) = session.message_by_id(&message_id) {
-                if !final_text.is_empty() {
-                    message.set_text(final_text.clone());
-                }
-                if !final_reasoning.is_empty() {
-                    message.set_reasoning(final_reasoning.clone());
+                if stream.append {
+                    // Resumed answer: `apply_provider_event` already appended
+                    // the streamed deltas to this same message, so only the
+                    // no-delta providers need the authoritative text pushed.
+                    if stream.text.is_empty() && !final_text.is_empty() {
+                        message.push_text(final_text.clone());
+                    }
+                    if stream.reasoning.is_empty() && !final_reasoning.is_empty() {
+                        message.push_reasoning(final_reasoning.clone());
+                    }
+                } else {
+                    if !final_text.is_empty() {
+                        message.set_text(final_text.clone());
+                    }
+                    if !final_reasoning.is_empty() {
+                        message.set_reasoning(final_reasoning.clone());
+                    }
                 }
                 for call in &completion.tool_calls {
                     message.push_tool_call(call.clone());
@@ -1325,7 +1453,7 @@ impl AgentHarness {
         self.finish_stream(stream, false);
         let usage = lock_session(&self.session).usage.clone();
         self.emit(HarnessEvent::UsageUpdated { usage });
-        completion.tool_calls
+        (completion.tool_calls, finish_reason)
     }
 
     fn finish_stream(&self, stream: &mut StreamState, interrupted: bool) {
@@ -1666,14 +1794,66 @@ fn truncate_tool_output(content: String, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::message::{Role, TodoStatus};
-    use crate::provider::ToolSpec;
+    use crate::provider::{ProviderEvent, ToolSpec, send_event};
     use crate::session::{SessionState, new_shared_session};
     use crate::testing::ScriptedProvider;
     use crate::tool::{AutoApprovalGate, Tool, ToolOutput};
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// Fails the first request after streaming a partial reasoning block (the
+    /// shape of a dropped SSE connection), then answers normally. Used to pin
+    /// the automatic retry + rollback behavior.
+    struct DropFirstStreamProvider {
+        attempts: AtomicUsize,
+        requests: Mutex<Vec<ChatRequest>>,
+    }
+
+    impl Default for DropFirstStreamProvider {
+        fn default() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for DropFirstStreamProvider {
+        fn name(&self) -> &str {
+            "drop-first-stream"
+        }
+
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _cancel: CancellationToken,
+            events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                send_event(
+                    &events,
+                    ProviderEvent::ReasoningDelta("half a thought".to_string()),
+                )?;
+                return Err(ProviderError::Network(
+                    "stream ended before the response completed".to_string(),
+                ));
+            }
+            send_event(
+                &events,
+                ProviderEvent::TextDelta("recovered answer".to_string()),
+            )?;
+            Ok(Completion {
+                text: "recovered answer".to_string(),
+                finish_reason: Some(FinishReason::Stop),
+                ..Completion::default()
+            })
+        }
+    }
 
     struct EchoTool {
         calls: Arc<Mutex<Vec<Value>>>,
@@ -2850,6 +3030,146 @@ mod tests {
         assert_eq!(
             handle.take_pending_steers(),
             vec!["never drained".to_string()]
+        );
+    }
+
+    /// A completion that stops because it ran out of output tokens is not a
+    /// finished turn: resume it with a request-only continuation instruction
+    /// (ZCode's Continue) instead of showing a sentence cut in half as done.
+    #[tokio::test]
+    async fn output_limit_continues_the_answer_instead_of_ending_the_turn() {
+        let length = || Completion {
+            text: "part one".to_string(),
+            finish_reason: Some(FinishReason::Length),
+            ..Completion::default()
+        };
+        let (harness, handle, _events, provider) = harness_with(
+            vec![
+                length(),
+                Completion {
+                    text: " part two".to_string(),
+                    finish_reason: Some(FinishReason::Stop),
+                    ..Completion::default()
+                },
+            ],
+            default_tools(),
+            HarnessConfig::default(),
+        );
+
+        let outcome = harness.run_turn("write a long answer").await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "one continuation request");
+        // The resume instruction rides at the end of the second request only.
+        let last = requests[1].messages.last().expect("continuation message");
+        assert_eq!(last.role, "user");
+        assert!(last.content.contains("Resume directly"));
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        let assistant_texts: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text())
+            .collect();
+        // The resumed completion appends to the same message: a turn merges
+        // consecutive assistant messages and would only render the last row's
+        // text, hiding the first half of the answer.
+        assert_eq!(assistant_texts, vec!["part one part two"]);
+        // The continuation prompt is transient: the transcript still has the
+        // single real user turn and no synthetic resume message.
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .filter(|message| message.role == Role::User)
+                .count(),
+            1
+        );
+    }
+
+    /// After the continuation budget is spent, the output limit is reported as
+    /// an error instead of silently ending (which looked like a normal stop).
+    #[tokio::test]
+    async fn output_limit_reports_an_error_after_the_continuation_budget() {
+        let script: Vec<Completion> = (0..=MAX_OUTPUT_CONTINUATIONS)
+            .map(|index| Completion {
+                text: format!("part {index}"),
+                finish_reason: Some(FinishReason::Length),
+                ..Completion::default()
+            })
+            .collect();
+        let (harness, _handle, _events, provider) =
+            harness_with(script, default_tools(), HarnessConfig::default());
+
+        let outcome = harness.run_turn("write forever").await.unwrap();
+        match outcome {
+            RunOutcome::Failed(message) => assert!(
+                message.contains("输出达到上限"),
+                "unexpected failure message: {message}"
+            ),
+            other => panic!("expected a failed run, got {other:?}"),
+        }
+        assert_eq!(provider.requests().len(), MAX_OUTPUT_CONTINUATIONS + 1);
+    }
+
+    /// A dropped stream (partial reasoning, then a network error) is retried
+    /// automatically: the half answer is rolled back, the retry runs, and the
+    /// user never sees an error card. The host learns about both steps through
+    /// `AssistantDiscarded` and `ProviderRetry`.
+    #[tokio::test]
+    async fn dropped_stream_retries_and_discards_the_partial_answer() {
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let provider = Arc::new(DropFirstStreamProvider::default());
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider.clone(),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                retry_base_delay: Duration::from_millis(1),
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+        let handle = harness.handle();
+
+        let outcome = harness.run_turn("q").await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(provider.requests.lock().unwrap().len(), 2);
+
+        let mut discarded = Vec::new();
+        let mut retried = 0;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                HarnessEvent::AssistantDiscarded { message_id } => discarded.push(message_id),
+                HarnessEvent::ProviderRetry { .. } => retried += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(retried, 1, "one retry announcement");
+        assert_eq!(discarded.len(), 1, "the truncated message is rolled back");
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        // Only the successful attempt remains: no second assistant message and
+        // no leftover reasoning from the dropped one.
+        let assistants: Vec<Message> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .cloned()
+            .collect();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0].text(), "recovered answer");
+        assert!(
+            session
+                .messages
+                .iter()
+                .all(|message| !message.id.eq(&discarded[0]))
         );
     }
 }

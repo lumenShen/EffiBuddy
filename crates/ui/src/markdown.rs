@@ -128,7 +128,6 @@ pub(crate) struct ImageIr {
     src: SharedString,
 }
 
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InlineKind {
     Strong,
@@ -221,11 +220,7 @@ impl InlineBuffer {
         if range.start >= range.end || range.end > self.text.len() {
             return;
         }
-        if self
-            .links
-            .iter()
-            .any(|link| overlaps(&link.range, &range))
-        {
+        if self.links.iter().any(|link| overlaps(&link.range, &range)) {
             return;
         }
         if protect {
@@ -242,7 +237,10 @@ impl InlineBuffer {
             return;
         }
         for (range, target) in detect_plain_targets(&self.text) {
-            if self.protected.iter().any(|protected| overlaps(protected, &range))
+            if self
+                .protected
+                .iter()
+                .any(|protected| overlaps(protected, &range))
                 || self.links.iter().any(|link| overlaps(&link.range, &range))
             {
                 continue;
@@ -261,19 +259,159 @@ fn overlaps(left: &Range<usize>, right: &Range<usize>) -> bool {
 /// deliberately code/document/image-heavy: it keeps `example.com`, versions
 /// (`v1.2.3`) and abbreviations (`e.g.`) from turning into links.
 const KNOWN_EXTENSIONS: &[&str] = &[
-    "rs", "md", "markdown", "mdx", "toml", "json", "jsonc", "json5", "yaml", "yml", "txt", "text",
-    "log", "csv", "tsv", "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "py", "pyi", "pyx",
-    "js", "mjs", "cjs", "jsx", "ts", "mts", "cts", "tsx", "vue", "svelte", "astro", "css",
-    "scss", "sass", "less", "styl", "html", "htm", "xhtml", "xml", "xsl", "xslt", "svg", "png",
-    "jpg", "jpeg", "gif", "webp", "bmp", "ico", "avif", "tif", "tiff", "heic", "psd", "pdf",
-    "doc", "docx", "xls", "xlsx", "ppt", "pptx", "odt", "ods", "odp", "rtf", "zip", "tar", "gz",
-    "tgz", "bz2", "xz", "zst", "7z", "rar", "jar", "war", "lock", "cfg", "ini", "conf", "config",
-    "env", "properties", "plist", "desktop", "service", "c", "h", "cc", "cpp", "cxx", "hpp",
-    "hh", "hxx", "m", "mm", "swift", "kt", "kts", "java", "class", "go", "rb", "php", "pl", "pm",
-    "lua", "r", "rmd", "sql", "db", "sqlite", "sqlite3", "proto", "graphql", "gql", "dart", "ex",
-    "exs", "erl", "hrl", "hs", "lhs", "clj", "cljs", "cljc", "scala", "sc", "cs", "fs", "fsx",
-    "vb", "asm", "s", "wat", "wasm", "ipynb", "tex", "bib", "org", "adoc", "rst", "diff", "patch",
-    "puml", "plantuml", "drawio",
+    "rs",
+    "md",
+    "markdown",
+    "mdx",
+    "toml",
+    "json",
+    "jsonc",
+    "json5",
+    "yaml",
+    "yml",
+    "txt",
+    "text",
+    "log",
+    "csv",
+    "tsv",
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "bat",
+    "cmd",
+    "py",
+    "pyi",
+    "pyx",
+    "js",
+    "mjs",
+    "cjs",
+    "jsx",
+    "ts",
+    "mts",
+    "cts",
+    "tsx",
+    "vue",
+    "svelte",
+    "astro",
+    "css",
+    "scss",
+    "sass",
+    "less",
+    "styl",
+    "html",
+    "htm",
+    "xhtml",
+    "xml",
+    "xsl",
+    "xslt",
+    "svg",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "ico",
+    "avif",
+    "tif",
+    "tiff",
+    "heic",
+    "psd",
+    "pdf",
+    "doc",
+    "docx",
+    "xls",
+    "xlsx",
+    "ppt",
+    "pptx",
+    "odt",
+    "ods",
+    "odp",
+    "rtf",
+    "zip",
+    "tar",
+    "gz",
+    "tgz",
+    "bz2",
+    "xz",
+    "zst",
+    "7z",
+    "rar",
+    "jar",
+    "war",
+    "lock",
+    "cfg",
+    "ini",
+    "conf",
+    "config",
+    "env",
+    "properties",
+    "plist",
+    "desktop",
+    "service",
+    "c",
+    "h",
+    "cc",
+    "cpp",
+    "cxx",
+    "hpp",
+    "hh",
+    "hxx",
+    "m",
+    "mm",
+    "swift",
+    "kt",
+    "kts",
+    "java",
+    "class",
+    "go",
+    "rb",
+    "php",
+    "pl",
+    "pm",
+    "lua",
+    "r",
+    "rmd",
+    "sql",
+    "db",
+    "sqlite",
+    "sqlite3",
+    "proto",
+    "graphql",
+    "gql",
+    "dart",
+    "ex",
+    "exs",
+    "erl",
+    "hrl",
+    "hs",
+    "lhs",
+    "clj",
+    "cljs",
+    "cljc",
+    "scala",
+    "sc",
+    "cs",
+    "fs",
+    "fsx",
+    "vb",
+    "asm",
+    "s",
+    "wat",
+    "wasm",
+    "ipynb",
+    "tex",
+    "bib",
+    "org",
+    "adoc",
+    "rst",
+    "diff",
+    "patch",
+    "puml",
+    "plantuml",
+    "drawio",
 ];
 
 /// Extension-less files people reference by name.
@@ -466,7 +604,10 @@ fn has_path_separator(token: &str) -> bool {
 
 fn is_windows_absolute(token: &str) -> bool {
     let bytes = token.as_bytes();
-    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/')
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 fn looks_like_plain_path(token: &str) -> bool {
@@ -545,8 +686,6 @@ fn link_target(dest: &str) -> Option<LinkTargetIr> {
     }
     Some(LinkTargetIr::File(dest.to_string().into()))
 }
-
-
 
 /// Merges the currently open inline kinds into one [`HighlightStyle`].
 fn combined_highlight(kinds: &[InlineKind], theme: &Theme) -> Option<HighlightStyle> {
@@ -1103,6 +1242,31 @@ pub fn markdown_cache_hits() -> u64 {
     CACHE.with(|cache| cache.borrow().hits)
 }
 
+/// Occupancy of the memoized markdown IR, for the memory diagnostics panel.
+///
+/// `*_bytes` sum the source text each entry was built from. The IR keeps its
+/// own strings, so this is a lower bound on the cache's footprint — enough to
+/// spot a cache that grew far beyond the transcript it serves.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkdownCacheStats {
+    pub documents: usize,
+    pub document_bytes: u64,
+    pub chunks: usize,
+    pub chunk_bytes: u64,
+}
+
+pub fn markdown_cache_stats() -> MarkdownCacheStats {
+    CACHE.with(|cache| {
+        let cache = cache.borrow();
+        MarkdownCacheStats {
+            documents: cache.docs.len(),
+            document_bytes: cache.docs.keys().map(|key| key.len as u64).sum(),
+            chunks: cache.chunks.len(),
+            chunk_bytes: cache.chunks.keys().map(|key| key.len as u64).sum(),
+        }
+    })
+}
+
 fn hash_source(source: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     source.hash(&mut hasher);
@@ -1521,14 +1685,15 @@ fn render_block(
         BlockIr::Text(text) => render_text_block(theme, text, interaction, doc_key, block_ix),
         BlockIr::Item(item) => render_item_row(theme, item, interaction, doc_key, block_ix),
         BlockIr::List { items, quote } => {
-            let mut container = div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .children(items.iter().enumerate().map(|(index, item)| {
-                    render_item_row(theme, item, interaction, doc_key, block_ix + index)
-                }));
+            let mut container =
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(items.iter().enumerate().map(|(index, item)| {
+                        render_item_row(theme, item, interaction, doc_key, block_ix + index)
+                    }));
             if *quote {
                 container = container
                     .border_l_2()
@@ -1694,13 +1859,8 @@ fn render_text_block(
     } else {
         element.into_any_element()
     };
-    let element = match render_linked_image_strip(
-        theme,
-        &ir.links,
-        interaction,
-        doc_key,
-        block_ix,
-    ) {
+    let element = match render_linked_image_strip(theme, &ir.links, interaction, doc_key, block_ix)
+    {
         Some(strip) => div()
             .w_full()
             .flex()
@@ -1814,7 +1974,16 @@ fn is_image_source(src: &str) -> bool {
         .is_some_and(|extension| {
             matches!(
                 extension.as_str(),
-                "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "avif" | "tif" | "tiff"
+                "png"
+                    | "jpg"
+                    | "jpeg"
+                    | "gif"
+                    | "webp"
+                    | "bmp"
+                    | "ico"
+                    | "avif"
+                    | "tif"
+                    | "tiff"
                     | "svg"
             )
         })
@@ -2051,7 +2220,8 @@ fn percent_decode(input: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(high), Some(low)) = (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
             {
                 out.push(high * 16 + low);
                 index += 3;
@@ -2285,11 +2455,7 @@ mod tests {
         let BlockIr::Text(text) = blocks[0].as_ref() else {
             panic!("expected text block");
         };
-        let targets: Vec<&LinkTargetIr> = text
-            .links
-            .iter()
-            .map(|link| &link.target)
-            .collect();
+        let targets: Vec<&LinkTargetIr> = text.links.iter().map(|link| &link.target).collect();
         assert_eq!(targets.len(), 4, "links: {targets:?}");
         assert!(matches!(targets[0], LinkTargetIr::File(path) if path == "crates/agent-core"));
         assert!(matches!(targets[1], LinkTargetIr::File(path) if path == "README.md"));
@@ -2297,10 +2463,7 @@ mod tests {
         assert!(matches!(targets[3], LinkTargetIr::Url(url) if url == "https://example.com/a?b=1"));
         // The clickable ranges cover exactly the visible token, not the
         // surrounding prose or the trailing punctuation.
-        assert_eq!(
-            &text.text[text.links[0].range.clone()],
-            "crates/agent-core"
-        );
+        assert_eq!(&text.text[text.links[0].range.clone()], "crates/agent-core");
         assert_eq!(
             &text.text[text.links[3].range.clone()],
             "https://example.com/a?b=1"
@@ -2351,7 +2514,11 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["before", "after"]);
-        assert!(blocks.iter().any(|block| matches!(block.as_ref(), BlockIr::Image(_))));
+        assert!(
+            blocks
+                .iter()
+                .any(|block| matches!(block.as_ref(), BlockIr::Image(_)))
+        );
     }
 
     /// Manual benchmark: simulates a typewriter streaming a ~30 KB document

@@ -1539,6 +1539,11 @@ pub enum ClipboardEntry {
     String(ClipboardString),
     /// An image entry
     Image(Image),
+    /// A file-list entry (paths copied from a file manager).
+    ///
+    /// Not text: the paths are already resolved and must be staged as
+    /// attachments, never inserted into an editor as characters.
+    Paths(ClipboardPaths),
 }
 
 impl ClipboardItem {
@@ -1611,6 +1616,109 @@ impl ClipboardItem {
     pub fn into_entries(self) -> impl Iterator<Item = ClipboardEntry> {
         self.entries.into_iter()
     }
+
+    /// The first image entry, if the clipboard holds one.
+    ///
+    /// Callers that can accept images (a chat composer pasting a screenshot)
+    /// need this because [`Self::text`] only ever looks at string entries: a
+    /// screenshot on the clipboard usually has no text at all, so pasting it
+    /// used to be a silent no-op.
+    pub fn first_image(&self) -> Option<&Image> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image),
+            ClipboardEntry::String(_) | ClipboardEntry::Paths(_) => None,
+        })
+    }
+
+    /// The file list the clipboard holds, if any.
+    pub fn paths(&self) -> Option<&ClipboardPaths> {
+        self.entries.iter().find_map(|entry| match entry {
+            ClipboardEntry::Paths(paths) => Some(paths),
+            ClipboardEntry::String(_) | ClipboardEntry::Image(_) => None,
+        })
+    }
+}
+
+/// Paths a clipboard item refers to, if it holds a file list rather than text.
+///
+/// A "copy" in a file manager puts no text on the clipboard — GNOME/KDE use
+/// `text/uri-list`, Windows uses `CF_HDROP`, macOS a file-URL pasteboard type.
+/// Each backend hands those back as [`ClipboardEntry::Paths`], so a paste
+/// handler can stage them as attachments instead of inserting a bogus string.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClipboardPaths(pub SmallVec<[PathBuf; 2]>);
+
+impl ClipboardPaths {
+    /// Build a file list from `paths`.
+    pub fn new(paths: Vec<PathBuf>) -> Self {
+        Self(SmallVec::from_vec(paths))
+    }
+
+    /// The referenced paths, in clipboard order.
+    pub fn paths(&self) -> &[PathBuf] {
+        &self.0
+    }
+
+    /// Consume the list and return the owned paths.
+    pub fn into_paths(self) -> Vec<PathBuf> {
+        self.0.into_vec()
+    }
+
+    /// Whether the clipboard held no paths at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Parse a `text/uri-list` clipboard payload into local file paths.
+///
+/// The format is one URI per line and `#` starts a comment. Only `file://`
+/// URIs naming an existing regular file are kept: an `http://` entry means the
+/// clipboard carries a link, which is not something a composer can stage as an
+/// attachment. An empty result tells the caller to fall back to text.
+pub fn parse_uri_list_paths(bytes: &[u8]) -> Vec<PathBuf> {
+    let list = String::from_utf8_lossy(bytes);
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for line in list.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(path) = file_uri_to_path(line) else {
+            continue;
+        };
+        if path.is_file() {
+            paths.push(path);
+        }
+    }
+    paths.dedup();
+    paths
+}
+
+/// Convert a `file://` URI into a filesystem path, undoing percent-encoding.
+///
+/// Returns `None` for any other scheme and for a URI with a non-empty host: a
+/// remote host means the payload is not a local file we can read.
+pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // `file:///home/u/a.png` has an empty host; `file://host/share` does not.
+    if !rest.starts_with('/') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Some(PathBuf::from(String::from_utf8(decoded).ok()?))
 }
 
 impl From<ClipboardString> for ClipboardEntry {

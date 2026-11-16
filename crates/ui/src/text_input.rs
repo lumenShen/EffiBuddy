@@ -273,6 +273,20 @@ pub struct TextInputState {
     /// Secondary submit (Ctrl/Cmd+Enter). Lets a host distinguish "send" from
     /// "send with a different delivery", e.g. steering a running agent.
     on_submit_alternate: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    /// Handler for a paste that carries no text: a screenshot (`Ctrl+V` after
+    /// `PrintScreen`) or a file copied in a file manager. Without it those
+    /// pastes are silent no-ops, because there is nothing to insert.
+    on_paste_media: Option<Rc<dyn Fn(PastedMedia, &mut Window, &mut App)>>,
+}
+
+/// Clipboard content that cannot be typed into the field: an image or a list
+/// of files. Handed to the host, which stages it as an attachment.
+#[derive(Clone, Debug)]
+pub enum PastedMedia {
+    /// Raw encoded image bytes (PNG/JPEG/…), as they sat on the clipboard.
+    Image { mime_type: String, bytes: Vec<u8> },
+    /// Paths from a file-manager copy.
+    Paths(Vec<std::path::PathBuf>),
 }
 
 impl TextInputState {
@@ -296,6 +310,7 @@ impl TextInputState {
             pending_scroll_to_caret: false,
             on_submit: None,
             on_submit_alternate: None,
+            on_paste_media: None,
         }
     }
 
@@ -686,8 +701,32 @@ impl TextInputState {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        // A plain text paste is the common case and stays self-contained.
+        if let Some(text) = item.text() {
             self.replace_text_in_range(None, &text, window, cx);
+            return;
+        }
+        // No text: a screenshot or a copied file. Both need the host, because
+        // neither can be represented as characters in the field.
+        let media = if let Some(image) = item.first_image() {
+            Some(PastedMedia::Image {
+                mime_type: image.format.mime_type().to_string(),
+                bytes: image.bytes.clone(),
+            })
+        } else {
+            item.paths()
+                .map(|paths| PastedMedia::Paths(paths.paths().to_vec()))
+        };
+        let Some(media) = media else {
+            return;
+        };
+        // Without a host handler there is nowhere to put the pixels or paths,
+        // so such a paste stays a no-op (a plain search field, for example).
+        if let Some(handler) = self.on_paste_media.clone() {
+            handler(media, window, cx);
         }
     }
 
@@ -1276,6 +1315,7 @@ pub struct TextInputView {
     state: Entity<TextInputState>,
     on_submit: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
     on_submit_alternate: Option<Rc<dyn Fn(String, &mut Window, &mut App)>>,
+    on_paste_media: Option<Rc<dyn Fn(PastedMedia, &mut Window, &mut App)>>,
     frameless: bool,
     _subscription: Option<Subscription>,
     _theme_subscription: Subscription,
@@ -1289,6 +1329,7 @@ impl TextInputView {
             state,
             on_submit: None,
             on_submit_alternate: None,
+            on_paste_media: None,
             frameless: false,
             _subscription: Some(subscription),
             _theme_subscription: theme_subscription,
@@ -1320,6 +1361,18 @@ impl TextInputView {
     pub fn state(&self) -> Entity<TextInputState> {
         self.state.clone()
     }
+
+    /// Install the handler for non-text pastes (images, copied files).
+    ///
+    /// Only hosts that can stage attachments need this; a plain search field
+    /// leaves it unset and simply ignores such pastes.
+    pub fn on_paste_media(
+        mut self,
+        handler: impl Fn(PastedMedia, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_paste_media = Some(Rc::new(handler));
+        self
+    }
 }
 
 impl Render for TextInputView {
@@ -1328,9 +1381,11 @@ impl Render for TextInputView {
         let state = self.state.clone();
         let on_submit = self.on_submit.clone();
         let on_submit_alternate = self.on_submit_alternate.clone();
+        let on_paste_media = self.on_paste_media.clone();
         state.update(cx, |state, _cx| {
             state.on_submit = on_submit;
             state.on_submit_alternate = on_submit_alternate;
+            state.on_paste_media = on_paste_media;
         });
 
         let focus_handle = state.read(cx).focus_handle.clone();

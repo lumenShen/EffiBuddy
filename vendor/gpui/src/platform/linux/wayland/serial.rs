@@ -4,6 +4,14 @@ use collections::HashMap;
 pub(crate) enum SerialKind {
     DataDevice,
     InputMethod,
+    /// The most recent keyboard or pointer press, whichever arrived last.
+    ///
+    /// Clipboard selection (`wl_data_device.set_selection`) must name the
+    /// serial of the event that triggered it. Copying from a button click used
+    /// to pass the last *keyboard* serial, which can be minutes old; wlroots
+    /// and some Mutter paths reject that, so the copy silently never reached
+    /// the clipboard. This kind tracks both input sources.
+    InputPress,
     MouseEnter,
     MousePress,
     KeyPress,

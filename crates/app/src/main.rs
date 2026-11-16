@@ -20,6 +20,7 @@ mod draft_store;
 mod events;
 mod file_menu;
 mod graph;
+mod memory;
 mod model_config;
 mod model_picker;
 mod perf;
@@ -48,6 +49,12 @@ use crate::config::AppConfig;
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
 
 fn main() {
+    // Must run before GPUI spawns its worker pool: glibc's default arena count
+    // grows with the number of cores, and with one arena per worker the freed
+    // chunks of large temporary buffers are never reused by other threads
+    // (~1 GB retained on a long session). See memory.rs.
+    memory::configure_allocator();
+
     // Crash reporter mode: a separate process that survives whatever killed
     // the main one and shows the saved report. It must not install the panic
     // hook again, or a reporter failure would spawn reporters forever.
@@ -70,6 +77,13 @@ fn main() {
     }
     if std::env::args().any(|argument| argument == "--computer-probe") {
         run_computer_probe();
+        return;
+    }
+    // Reads the real clipboard once and exits: the only way to verify that the
+    // platform backends actually surface a screenshot or a copied file, which
+    // no unit test can do.
+    if std::env::args().any(|argument| argument == "--clipboard-probe") {
+        run_clipboard_probe();
         return;
     }
 
@@ -235,4 +249,102 @@ fn run_computer_probe() {
             }
         }
     });
+}
+
+/// Developer probe: print what the platform reports for the current clipboard.
+///
+/// ```text
+/// cargo run -p effibuddy-app -- --clipboard-probe
+/// ```
+///
+/// Verifies the paste path end to end: copy a screenshot (or a file in your
+/// file manager) and this prints `kind: image` / `kind: paths` with the shape
+/// the composer will receive. Text copies print `kind: text` plus a preview.
+fn run_clipboard_probe() {
+    // Wayland only reports clipboard contents to a client that owns a focused
+    // toplevel (`wl_data_device.selection` follows keyboard focus), so the
+    // probe has to open a real window and wait a moment before reading.
+    gpui::Application::new().run(|cx: &mut gpui::App| {
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                None,
+                size(px(360.0), px(240.0)),
+                cx,
+            ))),
+            window_decorations: Some(gpui::WindowDecorations::Client),
+            ..Default::default()
+        };
+        let window = cx
+            .open_window(options, |_, cx| cx.new(|_| ClipboardProbe))
+            .expect("failed to open the clipboard probe window");
+        let _ = window.update(cx, |_, window, _| {
+            window.set_window_title("EffiBuddy clipboard probe");
+            window.activate_window();
+        });
+
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(900))
+                .await;
+            let _ = cx.update(|cx| {
+                let report = clipboard_report(cx);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string())
+                );
+                use std::io::Write as _;
+                let _ = std::io::stdout().flush();
+                std::process::exit(0);
+            });
+        })
+        .detach();
+    });
+}
+
+/// A blank window: the Wayland backend needs a focused toplevel before the
+/// compositor sends it the clipboard selection.
+struct ClipboardProbe;
+
+impl gpui::Render for ClipboardProbe {
+    fn render(
+        &mut self,
+        _window: &mut gpui::Window,
+        _cx: &mut gpui::Context<Self>,
+    ) -> impl gpui::IntoElement {
+        gpui::div()
+    }
+}
+
+/// Describe the current clipboard as the composer would see it.
+fn clipboard_report(cx: &mut gpui::App) -> serde_json::Value {
+    let Some(item) = cx.read_from_clipboard() else {
+        return serde_json::json!({ "kind": "none" });
+    };
+    if let Some(image) = item.first_image() {
+        return serde_json::json!({
+            "kind": "image",
+            "mime_type": image.format.mime_type(),
+            "bytes": image.bytes.len(),
+        });
+    }
+    if let Some(paths) = item.paths() {
+        return serde_json::json!({
+            "kind": "paths",
+            "count": paths.paths().len(),
+            "paths": paths
+                .paths()
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>(),
+        });
+    }
+    if let Some(text) = item.text() {
+        let preview: String = text.chars().take(120).collect();
+        return serde_json::json!({
+            "kind": "text",
+            "chars": text.chars().count(),
+            "preview": preview,
+        });
+    }
+    serde_json::json!({ "kind": "empty" })
 }

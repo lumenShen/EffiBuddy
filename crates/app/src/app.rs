@@ -246,6 +246,8 @@ pub(crate) struct SessionUiState {
     /// Last failure shown by that conversation; restored on switch so a
     /// background failure is not lost.
     pub(crate) last_error: Option<String>,
+    /// Transient retry banner ("正在重试…") owned by that conversation.
+    pub(crate) retry_status: Option<String>,
 }
 
 impl Default for SessionUiState {
@@ -258,6 +260,7 @@ impl Default for SessionUiState {
             subagent_tasks: Vec::new(),
             subagent_task_index: HashMap::new(),
             last_error: None,
+            retry_status: None,
         }
     }
 }
@@ -351,11 +354,14 @@ impl ProjectGroup {
     }
 }
 
-/// Popover anchored to a project's "more" button in the sidebar.
+/// Popover anchored to a project's "more" button in the sidebar. Deleting a
+/// project that still owns conversations is two-step: the first click arms
+/// the row, the second removes the project and its transcripts.
 #[derive(Default)]
 pub(crate) struct ProjectMenuState {
     pub target: Option<ProjectGroup>,
     pub position: Option<Point<Pixels>>,
+    pub confirm_delete: bool,
 }
 
 /// Popover anchored to a conversation row's "more" button. Deleting is the
@@ -442,7 +448,9 @@ pub struct AppView {
     pub(crate) runtime: Option<tokio::runtime::Runtime>,
     pub(crate) app_tx: UnboundedSender<AppEvent>,
 
-    sessions: Vec<SessionSummary>,
+    /// Conversation summaries shown in the sidebar (settings reads the count
+    /// for memory diagnostics).
+    pub(crate) sessions: Vec<SessionSummary>,
     /// Conversations archived from the sidebar; listed in Settings → 归档.
     pub(crate) archived_sessions: Vec<SessionSummary>,
     pub(crate) active: Option<ActiveSession>,
@@ -636,6 +644,9 @@ pub struct AppView {
     run_ticker_active: bool,
     pub(crate) last_error: Option<String>,
     pub(crate) notice: Option<String>,
+    /// Transient "正在重试（n/m）…" status while a retryable provider failure
+    /// is being retried. Rendered in the run-status row instead of an error.
+    pub(crate) retry_status: Option<String>,
     pub(crate) preview_mode: bool,
     /// `--preview-sidebar-hover` forces hover affordances on one project
     /// header and one session row so screenshots can verify them.
@@ -684,6 +695,7 @@ impl AppView {
                 || argument == "--preview-computer"
                 || argument == "--preview-link-menu"
                 || argument == "--preview-open-with"
+                || argument == "--preview-memory"
         });
         let state = if preview_launch {
             models.new_session_state(config.workspace())
@@ -696,9 +708,7 @@ impl AppView {
                 .last_active()
                 .and_then(|id| store.load(id))
                 .filter(|session| !session.archived)
-                .filter(|session| {
-                    !session.messages.is_empty() || drafts.is_unsent(&session.id)
-                });
+                .filter(|session| !session.messages.is_empty() || drafts.is_unsent(&session.id));
             last_active
                 .or_else(|| {
                     summaries
@@ -808,8 +818,10 @@ impl AppView {
             )
         });
         let weak = cx.entity().downgrade();
+        let weak_alt = weak.clone();
+        let weak_paste = weak.clone();
         let composer = cx.new(|cx| {
-            let weak_alt = weak.clone();
+            let weak_alt = weak_alt.clone();
             TextInputView::new(composer_state.clone(), cx)
                 .frameless(true)
                 .on_submit(move |text, window, cx| {
@@ -818,6 +830,9 @@ impl AppView {
                 .on_submit_alternate(move |text, window, cx| {
                     let _ =
                         weak_alt.update(cx, |this, cx| this.send_message(text, true, window, cx));
+                })
+                .on_paste_media(move |media, _window, cx| {
+                    let _ = weak_paste.update(cx, |this, cx| this.paste_media(media, cx));
                 })
         });
         let composer_subscription = cx.observe(&composer_state, |this, state, cx| {
@@ -891,13 +906,12 @@ impl AppView {
                     .placeholder("会话名称"),
             )
         });
-        let session_rename_name_subscription =
-            cx.observe(&session_rename_name, |this, _, cx| {
-                if let Some(state) = this.session_rename.as_mut() {
-                    state.error = None;
-                }
-                cx.notify();
-            });
+        let session_rename_name_subscription = cx.observe(&session_rename_name, |this, _, cx| {
+            if let Some(state) = this.session_rename.as_mut() {
+                state.error = None;
+            }
+            cx.notify();
+        });
         let session_rename_weak = cx.entity().downgrade();
         let session_rename_name_view = cx.new(|cx| {
             TextInputView::new(session_rename_name.clone(), cx).on_submit(
@@ -1133,6 +1147,7 @@ impl AppView {
             run_ticker_active: false,
             last_error: None,
             notice: None,
+            retry_status: None,
             preview_mode: preview_launch,
             preview_sidebar_hover: false,
             preview_context_tip: false,
@@ -1230,6 +1245,18 @@ impl AppView {
             }
             cx.notify();
         }
+        if std::env::args()
+            .any(|argument| argument == "--settings-memory" || argument == "--preview-memory")
+        {
+            view.settings.section = SettingsSection::Memory;
+            view.settings_open = true;
+            cx.notify();
+        }
+        if std::env::args().any(|argument| argument == "--settings-context") {
+            view.settings.section = SettingsSection::Context;
+            view.settings_open = true;
+            cx.notify();
+        }
         if std::env::args().any(|argument| argument == "--preview-sidepane-files") {
             view.side.open_tab(SidePaneTab::files());
             view.on_side_tab_activated(cx);
@@ -1294,8 +1321,12 @@ impl AppView {
                         roots: vec![workspace],
                     }
                 });
-            view.project_menu.target = Some(target);
-            view.project_menu.position = Some(point(px(240.0), px(300.0)));
+            view.project_menu = ProjectMenuState {
+                target: Some(target),
+                position: Some(point(px(240.0), px(300.0))),
+                confirm_delete: std::env::args()
+                    .any(|argument| argument == "--preview-project-delete"),
+            };
             cx.notify();
         }
         if std::env::args().any(|argument| argument == "--preview-link-menu") {
@@ -1904,6 +1935,7 @@ impl AppView {
             subagent_tasks: std::mem::take(&mut self.subagent_tasks),
             subagent_task_index: std::mem::take(&mut self.subagent_task_index),
             last_error: self.last_error.take(),
+            retry_status: self.retry_status.take(),
         };
         if let Some(run) = self.active_run.take() {
             self.background_runs.insert(id.clone(), run);
@@ -1928,6 +1960,7 @@ impl AppView {
             subagent_tasks,
             subagent_task_index,
             last_error,
+            retry_status,
         } = state;
         self.pending_inputs = pending_inputs;
         self.queue_held = queue_held;
@@ -1936,6 +1969,7 @@ impl AppView {
         self.subagent_tasks = subagent_tasks;
         self.subagent_task_index = subagent_task_index;
         self.last_error = last_error;
+        self.retry_status = retry_status;
         self.active_run = self.background_runs.remove(id);
         if let Some(run) = &self.active_run {
             self.session_shares
@@ -2152,10 +2186,7 @@ impl AppView {
         let Some(id) = self.active_id() else {
             return;
         };
-        if let Err(error) = self
-            .drafts
-            .set_attachments(&id, &self.composer_attachments)
-        {
+        if let Err(error) = self.drafts.set_attachments(&id, &self.composer_attachments) {
             self.last_error = Some(error);
         }
     }
@@ -2452,13 +2483,7 @@ impl AppView {
             self.commit_edit_message(text, attachments, window, cx);
             return;
         }
-        self.start_run(
-            Some(RunInput {
-                text,
-                attachments,
-            }),
-            cx,
-        );
+        self.start_run(Some(RunInput { text, attachments }), cx);
     }
 
     /// Drop one pending input from the queue bar.
@@ -2674,13 +2699,7 @@ impl AppView {
                 self.composer_state
                     .update(cx, |state, cx| state.clear(window, cx));
                 self.last_error = None;
-                self.start_run(
-                    Some(RunInput {
-                        text,
-                        attachments,
-                    }),
-                    cx,
-                );
+                self.start_run(Some(RunInput { text, attachments }), cx);
                 self.composer_focus_handle(cx).focus(window);
                 if self.active_run.is_some() && restored > 0 {
                     self.notice = Some(format!("已还原 {restored} 个文件，正在发送…"));
@@ -3471,6 +3490,7 @@ impl AppView {
             }
             HarnessEvent::AssistantStarted { message_id } => {
                 self.chat.begin_message(message_id);
+                self.retry_status = None;
                 structural = true;
             }
             HarnessEvent::TextDelta { message_id, delta } => {
@@ -3492,6 +3512,18 @@ impl AppView {
                     self.chat.finish_message(&message);
                 }
                 self.persist_active(cx);
+                structural = true;
+            }
+            HarnessEvent::AssistantDiscarded { message_id } => {
+                self.chat.discard_message(message_id);
+                structural = true;
+            }
+            HarnessEvent::ProviderRetry {
+                attempt,
+                max_retries,
+                ..
+            } => {
+                self.retry_status = Some(format!("连接中断，正在重试（{attempt}/{max_retries}）…"));
                 structural = true;
             }
             HarnessEvent::ApprovalRequested { request } => {
@@ -3543,6 +3575,7 @@ impl AppView {
                     input.kind = PendingInputKind::Queue;
                 }
                 self.active_run = None;
+                self.retry_status = None;
                 // A failed or interrupted turn pauses the queue (ZCode's
                 // error-paused state): the messages stay visible and the user
                 // decides whether to send or drop them.
@@ -3596,6 +3629,10 @@ impl AppView {
             {
                 self.resume_after_run_for(&session_id, cx);
             }
+            // The turn just dropped its largest temporaries (serialized
+            // session, prompt JSON, markdown buffers). Hand the freed pages
+            // back now; the trim is throttled and runs off the UI thread.
+            crate::memory::trim_heap_async();
         }
         // Token deltas are picked up by the typewriter reveal loop, which
         // already keeps a frame scheduled while it has backlog; notifying per
@@ -3646,10 +3683,27 @@ impl AppView {
                 structural = true;
             }
             HarnessEvent::StepStarted { .. }
-            | HarnessEvent::AssistantStarted { .. }
             | HarnessEvent::ToolCallStarted { .. }
+            | HarnessEvent::AssistantDiscarded { .. }
             | HarnessEvent::SessionChanged => {
                 structural = true;
+            }
+            HarnessEvent::AssistantStarted { .. } => {
+                self.background_sessions
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .retry_status = None;
+                structural = true;
+            }
+            HarnessEvent::ProviderRetry {
+                attempt,
+                max_retries,
+                ..
+            } => {
+                self.background_sessions
+                    .entry(session_id.to_string())
+                    .or_default()
+                    .retry_status = Some(format!("连接中断，正在重试（{attempt}/{max_retries}）…"));
             }
             // Deltas already landed in the shared transcript; the hidden
             // transcript's typewriter mirror is not running.
@@ -3717,6 +3771,7 @@ impl AppView {
                     state
                         .pending_approvals
                         .retain(|pending| pending.agent_id.is_some());
+                    state.retry_status = None;
                     if let RunOutcome::Failed(error) = outcome {
                         state.last_error = Some(error.clone());
                     }
@@ -3740,6 +3795,9 @@ impl AppView {
                 }
                 self.refresh_sessions(cx);
                 structural = true;
+                // Same post-turn cleanup as the in-front path: a background
+                // run also drops its largest temporaries at RunFinished.
+                crate::memory::trim_heap_async();
             }
             HarnessEvent::TodosUpdated { .. } | HarnessEvent::ContextCompacted { .. } => {
                 self.persist_session(session_id, &shared, cx);
@@ -4260,6 +4318,15 @@ impl AppView {
                 }
                 structural = true;
             }
+            HarnessEvent::AssistantDiscarded { message_id } => {
+                if let Some(view) = self.side.agent_views.get_mut(agent_id) {
+                    view.chat.discard_message(message_id);
+                }
+                structural = true;
+            }
+            // A child retry is reflected by the task card's running state;
+            // the compact card has no room for a separate retry line.
+            HarnessEvent::ProviderRetry { .. } => {}
             HarnessEvent::ApprovalRequested { request } => {
                 let approvals = if in_front {
                     &mut self.pending_approvals
@@ -4416,11 +4483,16 @@ impl AppView {
             };
         }
 
+        // Every terminal state of a background child must reach the parent.
+        // Dropping `Cancelled` here left the launcher waiting for a
+        // notification that would never arrive, so it never learned that the
+        // child stopped (or why). `Running` is not terminal and `Lost` is
+        // derived from disk on restore, so neither is a live wake-up.
         if report.background
             && !report.wake
             && matches!(
                 report.status,
-                SubagentStatus::Completed | SubagentStatus::Failed
+                SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Cancelled
             )
         {
             let notification = format_task_notification(&report);
@@ -4615,6 +4687,7 @@ impl AppView {
                 approval_tool: None,
                 last_error: task.error.clone(),
                 notice: None,
+                retry: None,
             };
             {
                 let session = lock_session(&task.shared);
@@ -5136,6 +5209,17 @@ impl AppView {
         self.project_group(summary.project_id.as_deref(), summary.project.as_deref())
     }
 
+    /// Conversations owned by a registered project, sidebar plus archive.
+    /// Membership resolves from the project itself (id first, then its
+    /// folders), so it stays correct even when the registry entry is gone.
+    fn project_members(&self, project_id: &str, roots: &[PathBuf]) -> Vec<SessionSummary> {
+        sessions_in_project(
+            self.sessions.iter().chain(self.archived_sessions.iter()),
+            project_id,
+            roots,
+        )
+    }
+
     /// Session cwd plus the project's other folders (in project order).
     fn workspace_roots_for_session(&self, shared: &SharedSession) -> (PathBuf, Vec<PathBuf>) {
         let (cwd, project_id, legacy) = {
@@ -5206,10 +5290,7 @@ impl AppView {
                 None => (self.config.workspace(), None, None),
             },
         };
-        let scope = crate::draft_store::scope_key(
-            project_id.as_deref(),
-            legacy_project.as_deref(),
-        );
+        let scope = crate::draft_store::scope_key(project_id.as_deref(), legacy_project.as_deref());
 
         // Pressing the same scope's “+” again while its draft is open must not
         // replace the draft or clear the half-written prompt.
@@ -5933,13 +6014,104 @@ impl AppView {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        self.project_menu.target = Some(target);
-        self.project_menu.position = Some(position);
+        self.project_menu = ProjectMenuState {
+            target: Some(target),
+            position: Some(position),
+            confirm_delete: false,
+        };
         cx.notify();
     }
 
     pub(crate) fn close_project_menu(&mut self, cx: &mut Context<Self>) {
         self.project_menu = ProjectMenuState::default();
+        cx.notify();
+    }
+
+    /// Permanently delete a project: its registry entry, every transcript that
+    /// belongs to it (sidebar and archive), their checkpoints and drafts.
+    /// Deleting is two-step — the menu arms first, this performs the second
+    /// click — and is refused while one of its conversations is still running.
+    pub(crate) fn delete_project(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.project_menu.target.clone() else {
+            return;
+        };
+        self.project_menu = ProjectMenuState::default();
+        let Some(id) = target.id.clone() else {
+            // Legacy groups have no registry entry; removing the row would only
+            // make `reconcile` recreate it on the next launch.
+            self.notice = Some("该项目来自旧版会话路径，无法删除。".to_string());
+            cx.notify();
+            return;
+        };
+        let summaries = self.project_members(&id, &target.roots);
+        if summaries
+            .iter()
+            .any(|summary| self.session_row_status(&summary.id).running)
+        {
+            self.notice = Some("项目内仍有会话在运行，停止后才能删除项目。".to_string());
+            cx.notify();
+            return;
+        }
+        // The project may still own an unsent draft conversation; it never shows
+        // up in `summaries` (no messages yet) but belongs to the project too.
+        let scope = crate::draft_store::scope_key(Some(&id), None);
+        let draft_id = self
+            .drafts
+            .scope_session(&scope)
+            .map(str::to_string)
+            .filter(|draft| !summaries.iter().any(|summary| &summary.id == draft));
+        let active_id = self.active_id();
+        let active_removed = active_id.as_ref().is_some_and(|active| {
+            summaries.iter().any(|summary| &summary.id == active)
+                || draft_id.as_deref() == Some(active.as_str())
+        });
+        let mut failures = 0usize;
+        let mut deleted: Vec<String> = Vec::new();
+        for session_id in summaries
+            .iter()
+            .map(|summary| summary.id.clone())
+            .chain(draft_id.clone())
+        {
+            if self.store.delete(&session_id).is_err() {
+                failures += 1;
+                continue;
+            }
+            crate::checkpoint::remove_session_checkpoints(&session_id);
+            self.drafts.remove_session(&session_id);
+            self.forget_session_runtime(&session_id);
+            deleted.push(session_id);
+        }
+        self.save_drafts_now();
+        // Drop the removed rows from the in-memory lists now: the async
+        // refresh below lands a frame later, and `activate_session_after_removal`
+        // must not pick a conversation that no longer exists.
+        self.sessions
+            .retain(|summary| !deleted.iter().any(|id| id == &summary.id));
+        self.archived_sessions
+            .retain(|summary| !deleted.iter().any(|id| id == &summary.id));
+        if self.projects.remove(&id) {
+            let _ = self.projects.save();
+        }
+        let key = project_group_key(&id);
+        self.config
+            .sidebar_collapsed_sections
+            .retain(|group| group != &key && group != &scope);
+        let _ = self.config.save();
+        if active_removed {
+            self.activate_session_after_removal(active_id.as_deref().unwrap_or_default(), cx);
+        }
+        let name = target.name;
+        self.notice = Some(if failures == 0 {
+            if summaries.is_empty() {
+                format!("已删除项目「{name}」。")
+            } else {
+                format!("已删除项目「{name}」及其 {} 个会话。", summaries.len())
+            }
+        } else {
+            format!("项目「{name}」已移除，但有 {failures} 个会话删除失败。")
+        });
+        self.refresh_sessions(cx);
+        self.refresh_archived_sessions(cx);
         cx.notify();
     }
 
@@ -6032,7 +6204,12 @@ impl AppView {
     }
 
     fn open_session_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(summary) = self.sessions.iter().find(|summary| summary.id == id).cloned() else {
+        let Some(summary) = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()
+        else {
             return;
         };
         self.session_menu = SessionMenuState::default();
@@ -6073,9 +6250,8 @@ impl AppView {
         // its value if validation or I/O fails.
         let name = match submitted {
             Some(text) => {
-                self.session_rename_name.update(cx, |state, cx| {
-                    state.set_content(text.clone(), window, cx)
-                });
+                self.session_rename_name
+                    .update(cx, |state, cx| state.set_content(text.clone(), window, cx));
                 text
             }
             None => self.session_rename_name.read(cx).content().to_string(),
@@ -6123,7 +6299,12 @@ impl AppView {
     /// Ask where to save, then bundle the structured transcript tree and the
     /// files it referenced into one zip.
     fn export_session(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(summary) = self.sessions.iter().find(|summary| summary.id == id).cloned() else {
+        let Some(summary) = self
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()
+        else {
             return;
         };
         self.session_menu = SessionMenuState::default();
@@ -6203,12 +6384,7 @@ impl AppView {
                             .ok_or_else(|| format!("无法读取会话 {id}"))?,
                     };
                     let children = crate::session_export::descendants(&store, &main.id);
-                    crate::session_export::export(
-                        &main,
-                        &children,
-                        &project_roots,
-                        &destination,
-                    )
+                    crate::session_export::export(&main, &children, &project_roots, &destination)
                 })
                 .await;
             let _ = weak.update(cx, |this, cx| {
@@ -7024,9 +7200,7 @@ impl AppView {
                                 .flex()
                                 .flex_col()
                                 .gap(px(1.0))
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation()
-                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                                 .child(
                                     div()
                                         .px(px(7.0))
@@ -7058,10 +7232,12 @@ impl AppView {
                                         "导出会话…",
                                         false,
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.export_session(&id_for_export, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.export_session(&id_for_export, cx);
+                                        },
+                                    )),
                                 )
                                 .child(
                                     session_menu_row(
@@ -7071,23 +7247,31 @@ impl AppView {
                                         "修改会话名…",
                                         false,
                                     )
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.open_session_rename(&id_for_rename, window, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.open_session_rename(&id_for_rename, window, cx);
+                                        },
+                                    )),
                                 )
                                 .child(
                                     session_menu_row(
                                         &theme,
                                         "session-menu-unread",
                                         icons::MAIL,
-                                        if unread { "标为已读" } else { "标为未读" },
+                                        if unread {
+                                            "标为已读"
+                                        } else {
+                                            "标为未读"
+                                        },
                                         false,
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.set_session_unread(&id_for_unread, !unread, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.set_session_unread(&id_for_unread, !unread, cx);
+                                        },
+                                    )),
                                 )
                                 .child(div().h(px(1.0)).bg(theme.border).my(px(2.0)))
                                 .child(
@@ -7102,15 +7286,17 @@ impl AppView {
                                         },
                                         true,
                                     )
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        if this.session_menu.confirm_delete {
-                                            this.delete_session(&id_for_delete, cx);
-                                        } else {
-                                            this.session_menu.confirm_delete = true;
-                                            cx.notify();
-                                        }
-                                    })),
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            if this.session_menu.confirm_delete {
+                                                this.delete_session(&id_for_delete, cx);
+                                            } else {
+                                                this.session_menu.confirm_delete = true;
+                                                cx.notify();
+                                            }
+                                        },
+                                    )),
                                 )
                                 .when(confirm, |element| {
                                     element.child(
@@ -7265,19 +7451,15 @@ impl AppView {
             .unwrap_or_default();
         let path_text = primary.clone();
         let path_for_copy = primary;
-        let project_in_use = self
-            .sessions
-            .iter()
-            .chain(self.archived_sessions.iter())
-            .any(|summary| {
-                self.project_group_for_summary(summary)
-                    .is_some_and(|group| group.key == key)
-            });
+        let session_count = target
+            .id
+            .as_deref()
+            .map(|id| self.project_members(id, &target.roots).len())
+            .unwrap_or_default();
+        let confirm = self.project_menu.confirm_delete;
         let project_id_for_new = target.id.clone();
         let project_primary_for_new = target.primary().map(Path::to_path_buf);
         let project_id_for_edit = target.id.clone();
-        let project_id_for_remove = target.id.clone();
-        let project_name = name.clone();
 
         // One reveal row per folder so multi-root projects open the right one.
         let mut reveal_rows: Vec<AnyElement> = Vec::new();
@@ -7482,37 +7664,48 @@ impl AppView {
                                         },
                                     )),
                                 )
-                                .when(!project_in_use, |element| {
+                                .when(target.id.is_some(), |element| {
                                     element
                                         .child(div().h(px(1.0)).bg(theme.border).my(px(2.0)))
                                         .child(
-                                            project_menu_row(
+                                            project_menu_row_danger(
                                                 &theme,
-                                                "project-menu-remove",
+                                                "project-menu-delete",
                                                 icons::TRASH,
-                                                "从项目列表移除",
+                                                if confirm {
+                                                    "确认删除项目"
+                                                } else {
+                                                    "删除项目"
+                                                },
                                             )
-                                            .on_click(
-                                                cx.listener(move |this, _, _, cx| {
-                                                    if let Some(id) = &project_id_for_remove {
-                                                        if this.projects.remove(id) {
-                                                            let _ = this.projects.save();
-                                                        }
-                                                        let id_key = project_group_key(id);
-                                                        this.config
-                                                            .sidebar_collapsed_sections
-                                                            .retain(|group| group != &id_key);
-                                                        let _ = this.config.save();
+                                            .on_click(cx.listener(
+                                                move |this, _, _, cx| {
+                                                    if this.project_menu.confirm_delete {
+                                                        this.delete_project(cx);
+                                                    } else {
+                                                        this.project_menu.confirm_delete = true;
+                                                        cx.notify();
                                                     }
-                                                    this.project_menu = ProjectMenuState::default();
-                                                    this.notice = Some(format!(
-                                                        "已从项目列表移除：{}",
-                                                        project_name
-                                                    ));
-                                                    cx.notify();
-                                                }),
-                                            ),
+                                                },
+                                            )),
                                         )
+                                        .when(confirm, |element| {
+                                            element.child(
+                                                div()
+                                                    .px(px(8.0))
+                                                    .pb(px(5.0))
+                                                    .text_size(px(9.5))
+                                                    .text_color(theme.text_faint)
+                                                    .child(if session_count == 0 {
+                                                        "项目及其文件夹记录会一并移除；磁盘上的文件不会删除。"
+                                                            .to_string()
+                                                    } else {
+                                                        format!(
+                                                            "将一并删除 {session_count} 个会话，无法恢复；磁盘上的文件不会删除。"
+                                                        )
+                                                    }),
+                                            )
+                                        })
                                 })
                                 .with_animation(
                                     "project-menu-enter",
@@ -8169,55 +8362,50 @@ impl AppView {
             )
             .child(divider(theme))
             .child(
-                div()
-                    .px_4()
-                    .py_3()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                IconButton::new(
-                                    "theme-toggle",
-                                    if theme.is_dark() {
-                                        icons::SUN
-                                    } else {
-                                        icons::MOON
-                                    },
-                                    theme,
-                                )
+                div().px_4().py_3().flex().flex_col().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            IconButton::new(
+                                "theme-toggle",
+                                if theme.is_dark() {
+                                    icons::SUN
+                                } else {
+                                    icons::MOON
+                                },
+                                theme,
+                            )
+                            .size(28.0, 14.0)
+                            .tooltip("切换主题 (Ctrl+Shift+T)")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
+                        )
+                        .child(
+                            Button::new("settings", "设置", theme)
+                                .icon(icons::SETTINGS)
+                                .size(ButtonSize::Sm)
+                                .variant(ButtonVariant::Ghost)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.open_settings(window, cx)
+                                })),
+                        )
+                        // Spacer pins the donation entry to the far right,
+                        // so the running spinner never pushes it around.
+                        .child(div().flex_1())
+                        .when(running, |element| {
+                            element.child(Spinner::new(theme.accent, 12.0))
+                        })
+                        .child(
+                            IconButton::new("reward", icons::HEART, theme)
                                 .size(28.0, 14.0)
-                                .tooltip("切换主题 (Ctrl+Shift+T)")
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_theme(cx))),
-                            )
-                            .child(
-                                Button::new("settings", "设置", theme)
-                                    .icon(icons::SETTINGS)
-                                    .size(ButtonSize::Sm)
-                                    .variant(ButtonVariant::Ghost)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_settings(window, cx)
-                                    })),
-                            )
-                            // Spacer pins the donation entry to the far right,
-                            // so the running spinner never pushes it around.
-                            .child(div().flex_1())
-                            .when(running, |element| {
-                                element.child(Spinner::new(theme.accent, 12.0))
-                            })
-                            .child(
-                                IconButton::new("reward", icons::HEART, theme)
-                                    .size(28.0, 14.0)
-                                    .tooltip("为开发者打赏")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.reward_open = true;
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
+                                .tooltip("为开发者打赏")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.reward_open = true;
+                                    cx.notify();
+                                })),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -8347,9 +8535,11 @@ impl AppView {
         }
 
         // 会话名跑马灯：播放/收尾期间逐帧重绘；顺带清理已不存在会话的行状态。
-        self.sidebar_marquees
-            .borrow_mut()
-            .retain(|id, _| self.sessions.iter().any(|summary| summary.id.as_str() == id));
+        self.sidebar_marquees.borrow_mut().retain(|id, _| {
+            self.sessions
+                .iter()
+                .any(|summary| summary.id.as_str() == id)
+        });
         if self.sidebar_marquee_animating() && !self.sidebar_marquee_scheduled {
             self.sidebar_marquee_scheduled = true;
             cx.on_next_frame(window, |this, _, cx| {
@@ -8370,6 +8560,7 @@ impl AppView {
                 }),
                 last_error: self.last_error.clone(),
                 notice: self.notice.clone(),
+                retry: self.retry_status.clone(),
             };
             {
                 let session = lock_session(&shared);
@@ -8419,7 +8610,14 @@ impl AppView {
                 theme.warning,
             ))
         } else {
-            current_todo.map(|todo| (SidePaneTab::overview(), icons::CLOCK, todo, theme.text_muted))
+            current_todo.map(|todo| {
+                (
+                    SidePaneTab::overview(),
+                    icons::CLOCK,
+                    todo,
+                    theme.text_muted,
+                )
+            })
         };
 
         let update_banner = self.render_update_banner(cx);
@@ -8578,15 +8776,13 @@ impl AppView {
             // The whole conversation accepts OS file drops, not only the
             // composer card; the card's own handler wins when the pointer is
             // over it (`stop_propagation`).
-            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                style.bg(drop_highlight)
-            })
-            .on_drop(cx.listener(
-                |this, paths: &gpui::ExternalPaths, window, cx| {
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| style.bg(drop_highlight))
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
                     this.attach_paths(paths.paths().to_vec(), cx);
                     this.composer_focus_handle(cx).focus(window);
-                },
-            ))
+                }),
+            )
             .child(header)
             .children(update_banner)
             .child(body)
@@ -8676,10 +8872,7 @@ impl AppView {
         };
         self.jump_flash_seq = self.jump_flash_seq.wrapping_add(1);
         let seq = self.jump_flash_seq;
-        self.jump_flash = Some(JumpFlash {
-            message_id,
-            seq,
-        });
+        self.jump_flash = Some(JumpFlash { message_id, seq });
         // The ring fades out on its own; drop the state one beat later so a
         // reduced-motion static ring (and the removed element) cannot linger.
         cx.spawn(async move |weak, cx| {
@@ -8977,181 +9170,173 @@ impl AppView {
         };
 
         let drop_theme = theme.clone();
-        let mut composer_card =
-            div()
-                .w_full()
-                .max_w(px(760.0))
-                .rounded(px(radius::XL))
-                .border_1()
-                .border_color(if focused {
-                    theme.focus_ring
-                } else {
-                    theme.border
-                })
-                .bg(theme.surface)
-                .shadow(shadow_float(theme))
-                // Dropping OS files anywhere on the card stages them for the
-                // next message. `drag_over` is re-evaluated every frame from
-                // the active drag, so the highlight cannot stick.
-                .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
-                    style.bg(drop_theme.accent_soft).border_color(drop_theme.accent)
-                })
-                .on_drop(cx.listener(
-                    |this, paths: &gpui::ExternalPaths, window, cx| {
-                        this.attach_paths(paths.paths().to_vec(), cx);
-                        this.composer_focus_handle(cx).focus(window);
-                    },
-                ))
-                .pt(px(14.0))
-                .px(px(16.0))
-                .pb(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(12.0))
-                .on_mouse_down(MouseButton::Left, {
-                    let state = self.composer_state.clone();
-                    move |_, window, cx| {
-                        let _ = state.update(cx, |state, _| {
-                            window.focus(&state.focus_handle());
-                        });
-                    }
-                });
+        let mut composer_card = div()
+            .w_full()
+            .max_w(px(760.0))
+            .rounded(px(radius::XL))
+            .border_1()
+            .border_color(if focused {
+                theme.focus_ring
+            } else {
+                theme.border
+            })
+            .bg(theme.surface)
+            .shadow(shadow_float(theme))
+            // Dropping OS files anywhere on the card stages them for the
+            // next message. `drag_over` is re-evaluated every frame from
+            // the active drag, so the highlight cannot stick.
+            .drag_over::<gpui::ExternalPaths>(move |style, _, _, _| {
+                style
+                    .bg(drop_theme.accent_soft)
+                    .border_color(drop_theme.accent)
+            })
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    this.attach_paths(paths.paths().to_vec(), cx);
+                    this.composer_focus_handle(cx).focus(window);
+                }),
+            )
+            .pt(px(14.0))
+            .px(px(16.0))
+            .pb(px(12.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .on_mouse_down(MouseButton::Left, {
+                let state = self.composer_state.clone();
+                move |_, window, cx| {
+                    let _ = state.update(cx, |state, _| {
+                        window.focus(&state.focus_handle());
+                    });
+                }
+            });
         if let Some(chips) = self.render_composer_attachments(cx) {
             composer_card = composer_card.child(chips);
         }
-        let composer_card = composer_card
-                .child(self.composer.clone())
+        let composer_card = composer_card.child(self.composer.clone()).child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h(px(34.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .justify_between()
-                        .h(px(34.0))
+                        .gap(px(6.0))
+                        .child(
+                            IconButton::new("composer-add", icons::PLUS, theme)
+                                .size(26.0, 13.0)
+                                .tooltip("添加文件到会话（也可直接拖入）")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pick_composer_files(cx);
+                                })),
+                        )
                         .child(
                             div()
+                                .id("composer-permission")
                                 .flex()
                                 .items_center()
-                                .gap(px(6.0))
-                                .child(
-                                    IconButton::new("composer-add", icons::PLUS, theme)
-                                        .size(26.0, 13.0)
-                                        .tooltip("添加文件到会话（也可直接拖入）")
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.pick_composer_files(cx);
-                                        })),
+                                .gap(px(5.0))
+                                .h(px(26.0))
+                                .px(px(9.0))
+                                .rounded(px(999.0))
+                                .bg(permission_bg)
+                                .text_color(permission_color)
+                                .text_size(px(11.0))
+                                .cursor_pointer()
+                                .tooltip(effibuddy_ui::tooltip(theme, "权限模式 · Shift+Tab 切换"))
+                                .hover(|style| style.bg(theme.active))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.cycle_permission_mode(cx)),
                                 )
                                 .child(
-                                    div()
-                                        .id("composer-permission")
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(5.0))
-                                        .h(px(26.0))
-                                        .px(px(9.0))
-                                        .rounded(px(999.0))
-                                        .bg(permission_bg)
-                                        .text_color(permission_color)
-                                        .text_size(px(11.0))
-                                        .cursor_pointer()
-                                        .tooltip(effibuddy_ui::tooltip(
-                                            theme,
-                                            "权限模式 · Shift+Tab 切换",
-                                        ))
-                                        .hover(|style| style.bg(theme.active))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.cycle_permission_mode(cx)
-                                        }))
-                                        .child(
-                                            svg()
-                                                .path(permission_icon)
-                                                .size(px(11.0))
-                                                .text_color(permission_color),
-                                        )
-                                        .child(permission_label.to_string())
-                                        .child(
-                                            svg()
-                                                .path(icons::CHEVRON_DOWN)
-                                                .size(px(9.0))
-                                                .text_color(permission_color),
-                                        ),
+                                    svg()
+                                        .path(permission_icon)
+                                        .size(px(11.0))
+                                        .text_color(permission_color),
+                                )
+                                .child(permission_label.to_string())
+                                .child(
+                                    svg()
+                                        .path(icons::CHEVRON_DOWN)
+                                        .size(px(9.0))
+                                        .text_color(permission_color),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .id("composer-context")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .size(px(26.0))
+                                .rounded(px(999.0))
+                                .bg(theme.surface_alt)
+                                .cursor_pointer()
+                                .tooltip(crate::context_meter::context_tooltip(
+                                    theme,
+                                    context_usage.clone(),
+                                ))
+                                .hover(|style| style.bg(theme.active))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.open_sidebar_kind(SidePaneTab::overview(), cx);
+                                }))
+                                // 静止时只给进度环不给百分比；占用构成与累计
+                                // 消耗都在悬停 tips 里展开。
+                                .child(
+                                    ProgressRing::new(context_usage.fraction(), 16.0)
+                                        .stroke_width(2.2)
+                                        .track(theme.border_strong)
+                                        .progress(if context_pct > 75.0 {
+                                            theme.warning
+                                        } else {
+                                            theme.success
+                                        }),
                                 ),
                         )
                         .child(
                             div()
+                                .id("composer-model")
                                 .flex()
                                 .items_center()
                                 .gap(px(6.0))
+                                .h(px(26.0))
+                                .px(px(9.0))
+                                .rounded(px(999.0))
+                                .bg(theme.surface_alt)
+                                .text_size(px(11.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
+                                .hover(|style| style.bg(theme.active))
+                                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                                    this.open_model_menu(event.position(), cx);
+                                }))
+                                .child(div().size(px(6.0)).rounded(px(999.0)).bg(if demo_mode {
+                                    theme.warning
+                                } else if resolved.live {
+                                    theme.success
+                                } else {
+                                    theme.warning
+                                }))
+                                .child(resolved.model_label().to_string())
                                 .child(
-                                    div()
-                                        .id("composer-context")
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .size(px(26.0))
-                                        .rounded(px(999.0))
-                                        .bg(theme.surface_alt)
-                                        .cursor_pointer()
-                                        .tooltip(crate::context_meter::context_tooltip(
-                                            theme,
-                                            context_usage.clone(),
-                                        ))
-                                        .hover(|style| style.bg(theme.active))
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.open_sidebar_kind(SidePaneTab::overview(), cx);
-                                        }))
-                                        // 静止时只给进度环不给百分比；占用构成与累计
-                                        // 消耗都在悬停 tips 里展开。
-                                        .child(
-                                            ProgressRing::new(context_usage.fraction(), 16.0)
-                                                .stroke_width(2.2)
-                                                .track(theme.border_strong)
-                                                .progress(if context_pct > 75.0 {
-                                                    theme.warning
-                                                } else {
-                                                    theme.success
-                                                }),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .id("composer-model")
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .h(px(26.0))
-                                        .px(px(9.0))
-                                        .rounded(px(999.0))
-                                        .bg(theme.surface_alt)
-                                        .text_size(px(11.0))
-                                        .text_color(theme.text_muted)
-                                        .cursor_pointer()
-                                        .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
-                                        .hover(|style| style.bg(theme.active))
-                                        .on_click(cx.listener(
-                                            |this, event: &gpui::ClickEvent, _, cx| {
-                                                this.open_model_menu(event.position(), cx);
-                                            },
-                                        ))
-                                        .child(div().size(px(6.0)).rounded(px(999.0)).bg(
-                                            if demo_mode {
-                                                theme.warning
-                                            } else if resolved.live {
-                                                theme.success
-                                            } else {
-                                                theme.warning
-                                            },
-                                        ))
-                                        .child(resolved.model_label().to_string())
-                                        .child(
-                                            svg()
-                                                .path(icons::CHEVRON_DOWN)
-                                                .size(px(10.0))
-                                                .text_color(theme.text_faint),
-                                        ),
-                                )
-                                .child(send),
-                        ),
-                );
+                                    svg()
+                                        .path(icons::CHEVRON_DOWN)
+                                        .size(px(10.0))
+                                        .text_color(theme.text_faint),
+                                ),
+                        )
+                        .child(send),
+                ),
+        );
 
         let mut column = div()
             .w_full()
@@ -9240,19 +9425,11 @@ impl AppView {
         if self.preview_context_tip {
             // 预览：把 hover tips 常驻渲染在输入框上方（对齐 context 环一侧），
             // Wayland 截图验收用；真实交互仍走 tooltip 闭包。
-            column = column.child(
-                div()
-                    .w_full()
-                    .max_w(px(760.0))
-                    .flex()
-                    .justify_end()
-                    .child(cx.new(|_cx| {
-                        crate::context_meter::ContextUsageTip::new(
-                            theme.clone(),
-                            context_usage.clone(),
-                        )
-                    })),
-            );
+            column = column.child(div().w_full().max_w(px(760.0)).flex().justify_end().child(
+                cx.new(|_cx| {
+                    crate::context_meter::ContextUsageTip::new(theme.clone(), context_usage.clone())
+                }),
+            ));
         }
 
         if let Some(menu) = self.render_composer_menu(window, cx) {
@@ -10016,7 +10193,12 @@ impl AppView {
                             .size(px(30.0))
                             .rounded(px(radius::MD))
                             .bg(theme.accent_soft)
-                            .child(svg().path(icons::HEART).size(px(15.0)).text_color(theme.text)),
+                            .child(
+                                svg()
+                                    .path(icons::HEART)
+                                    .size(px(15.0))
+                                    .text_color(theme.text),
+                            ),
                     )
                     .child(
                         div()
@@ -10356,6 +10538,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // EFFIBUDDY_PERF=1 measures the element-tree build cost per frame.
         let perf_frame = perf::frame_start();
+
         let theme = self.theme.clone();
 
         // Smooth-scroll glide: apply this frame's step before the scroll
@@ -11124,6 +11307,33 @@ fn project_menu_row(
         )
 }
 
+/// Danger variant of [`project_menu_row`]: used by destructive entries such as
+/// “删除项目”, which drops the project and its transcripts.
+fn project_menu_row_danger(
+    theme: &Theme,
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(30.0))
+        .px(px(7.0))
+        .rounded(px(radius::XS))
+        .cursor_pointer()
+        .hover(|style| style.bg(theme.danger_soft))
+        .child(svg().path(icon).size(px(12.0)).text_color(theme.danger))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.danger)
+                .child(label),
+        )
+}
+
 /// One row in a conversation's “more” popover.
 fn session_menu_row(
     theme: &Theme,
@@ -11141,19 +11351,45 @@ fn session_menu_row(
         .px(px(7.0))
         .rounded(px(radius::XS))
         .cursor_pointer()
-        .hover(|style| style.bg(if danger { theme.danger_soft } else { theme.hover }))
-        .child(
-            svg()
-                .path(icon)
-                .size(px(12.0))
-                .text_color(if danger { theme.danger } else { theme.text_muted }),
-        )
+        .hover(|style| {
+            style.bg(if danger {
+                theme.danger_soft
+            } else {
+                theme.hover
+            })
+        })
+        .child(svg().path(icon).size(px(12.0)).text_color(if danger {
+            theme.danger
+        } else {
+            theme.text_muted
+        }))
         .child(
             div()
                 .text_size(px(12.0))
                 .text_color(if danger { theme.danger } else { theme.text })
                 .child(label),
         )
+}
+
+/// Conversations that belong to one registered project: id first, then any of
+/// its folders (`project` path) for legacy transcripts that never stored an
+/// id. Kept free-standing so the project-delete path is unit-testable without
+/// a window.
+fn sessions_in_project<'a>(
+    summaries: impl Iterator<Item = &'a SessionSummary>,
+    project_id: &str,
+    roots: &[PathBuf],
+) -> Vec<SessionSummary> {
+    summaries
+        .filter(|summary| {
+            summary.project_id.as_deref() == Some(project_id)
+                || summary.project.as_ref().is_some_and(|path| {
+                    let normalized = crate::project_store::normalize_root(path);
+                    roots.iter().any(|root| root == &normalized)
+                })
+        })
+        .cloned()
+        .collect()
 }
 
 /// Deterministic per-project accent, mirroring ZCode's colored program icons.
@@ -11452,9 +11688,13 @@ struct SessionMarqueeFrame {
 enum MarqueeTick {
     None,
     /// 播放中：条带绘制期左移 offset（px）。
-    Play { offset: f32 },
+    Play {
+        offset: f32,
+    },
     /// 收尾：偏移已回 0，左缘遮罩按 progress（0..1）收回。
-    Retract { progress: f32 },
+    Retract {
+        progress: f32,
+    },
 }
 
 /// 会话行跑马灯状态机。
@@ -11478,7 +11718,10 @@ enum MarqueePhase {
     /// 循环播放中。`cycle_start` 是本轮循环起点。
     Playing { cycle_start: Instant },
     /// 指针已离开：继续播到下一个 left=0 边界再收尾。
-    Finish { cycle_start: Instant, left_at: Instant },
+    Finish {
+        cycle_start: Instant,
+        left_at: Instant,
+    },
     /// 偏移已回 0，左缘遮罩正在收回（150ms ease-out）。
     Retract { start: Instant },
 }
@@ -11558,7 +11801,8 @@ impl SessionMarquee {
                 }
             }
             MarqueePhase::Retract { start } => {
-                let t = ((now - start).as_secs_f32() / CONTROL_MOTION.as_secs_f32()).clamp(0.0, 1.0);
+                let t =
+                    ((now - start).as_secs_f32() / CONTROL_MOTION.as_secs_f32()).clamp(0.0, 1.0);
                 MarqueeTick::Retract { progress: t }
             }
         }
@@ -11706,13 +11950,7 @@ fn sidebar_session_row(
                 this.toggle_pin(&id_for_pin, cx);
             })),
         )
-        .child(session_title(
-            theme,
-            &title,
-            active,
-            &row_group,
-            marquee,
-        ))
+        .child(session_title(theme, &title, active, &row_group, marquee))
         .child(
             div()
                 .relative()
@@ -11734,10 +11972,7 @@ fn sidebar_session_row(
                                 .size(px(7.0))
                                 .rounded(px(999.0))
                                 .bg(theme.warning)
-                                .tooltip(effibuddy_ui::tooltip(
-                                    theme,
-                                    "等待你的批准 · 点击切换",
-                                ))
+                                .tooltip(effibuddy_ui::tooltip(theme, "等待你的批准 · 点击切换"))
                                 .into_any_element()
                         } else if status.running {
                             div()
@@ -11755,10 +11990,7 @@ fn sidebar_session_row(
                                 .size(px(7.0))
                                 .rounded(px(999.0))
                                 .bg(theme.accent)
-                                .tooltip(effibuddy_ui::tooltip(
-                                    theme,
-                                    format!("未读 · {time}"),
-                                ))
+                                .tooltip(effibuddy_ui::tooltip(theme, format!("未读 · {time}")))
                                 .into_any_element()
                         } else {
                             div()
@@ -11788,11 +12020,7 @@ fn sidebar_session_row(
                             .on_click(cx.listener(
                                 move |this, event: &gpui::ClickEvent, _, cx| {
                                     cx.stop_propagation();
-                                    this.open_session_menu(
-                                        &id_for_more,
-                                        event.position(),
-                                        cx,
-                                    );
+                                    this.open_session_menu(&id_for_more, event.position(), cx);
                                 },
                             )),
                         )
@@ -11847,14 +12075,22 @@ fn session_title(
 
     // 遮罩渐变基色必须与行背景一致：静止=侧栏底色，行悬停时经 group_hover
     // 换成 hover 色，激活行恒为 accent_soft。
-    let fade_base = if active { theme.accent_soft } else { theme.sidebar };
+    let fade_base = if active {
+        theme.accent_soft
+    } else {
+        theme.sidebar
+    };
     let fade_gradient = |base: gpui::Hsla, inward: bool| {
         let (left, right) = if inward {
             (base.opacity(0.0), base)
         } else {
             (base, base.opacity(0.0))
         };
-        linear_gradient(90.0, linear_color_stop(left, 0.0), linear_color_stop(right, 1.0))
+        linear_gradient(
+            90.0,
+            linear_color_stop(left, 0.0),
+            linear_color_stop(right, 1.0),
+        )
     };
 
     div()
@@ -11996,6 +12232,19 @@ pub(crate) fn relative_time(time: DateTime<Utc>) -> String {
 
 /// Model-visible wake-up for a finished background subagent. The UI renders
 /// the synthetic message as a system notice, never as a user bubble.
+/// Collapse a multi-line error into a single line so it fits the one-line
+/// `<summary>` field of a task notification without breaking the XML-ish frame.
+fn one_line(text: &str) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 300 {
+        let mut truncated = collapsed.chars().take(300).collect::<String>();
+        truncated.push('…');
+        truncated
+    } else {
+        collapsed
+    }
+}
+
 fn format_task_notification(report: &SubagentReport) -> String {
     let status = match report.status {
         SubagentStatus::Completed => "completed",
@@ -12015,7 +12264,7 @@ fn format_task_notification(report: &SubagentReport) -> String {
             "Agent \"{}\" ({}) failed: {}",
             report.name,
             report.description,
-            report.error.as_deref().unwrap_or("unknown error")
+            one_line(report.error.as_deref().unwrap_or("unknown error"))
         ),
         SubagentStatus::Lost => format!(
             "Agent \"{}\" ({}) was lost after a restart",
@@ -12023,8 +12272,15 @@ fn format_task_notification(report: &SubagentReport) -> String {
         ),
         SubagentStatus::Cancelled => {
             format!(
-                "Agent \"{}\" ({}) was stopped",
-                report.name, report.description
+                "Agent \"{}\" ({}) was stopped: {}",
+                report.name,
+                report.description,
+                one_line(
+                    report
+                        .error
+                        .as_deref()
+                        .unwrap_or("stopped before it finished")
+                )
             )
         }
         SubagentStatus::Running => {
@@ -12035,6 +12291,21 @@ fn format_task_notification(report: &SubagentReport) -> String {
         }
     };
     let mut result = report.report.clone();
+    // A failed or stopped run may have produced no assistant text at all, which
+    // would leave `<result>` empty and hide the actual cause from the parent.
+    // Lead with the error so the reason always survives the round-trip.
+    if let Some(error) = report.error.as_deref().filter(|_| {
+        matches!(
+            report.status,
+            SubagentStatus::Failed | SubagentStatus::Cancelled
+        )
+    }) {
+        if result.trim().is_empty() {
+            result = format!("ERROR: {error}");
+        } else {
+            result = format!("ERROR: {error}\n\nPARTIAL OUTPUT:\n{result}");
+        }
+    }
     if result.chars().count() > 20_000 {
         result = result.chars().take(20_000).collect::<String>();
         result.push_str("\n\n[report truncated]");
@@ -12303,6 +12574,128 @@ mod tests {
         assert!(!has_han("settings"));
         assert!(is_subsequence("nws", "new session"));
         assert!(!is_subsequence("nxs", "new session"));
+    }
+
+    fn summary(id: &str, project_id: Option<&str>, project: Option<&str>) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            title: id.to_string(),
+            updated_at: chrono::Utc::now(),
+            message_count: 1,
+            project: project.map(PathBuf::from),
+            project_id: project_id.map(str::to_string),
+            pinned: false,
+            unread: false,
+        }
+    }
+
+    #[test]
+    fn sessions_in_project_matches_id_then_folder() {
+        let summaries = vec![
+            summary("by-id", Some("p1"), Some("/code/alpha")),
+            // Legacy transcript: only the folder, no registry id.
+            summary("by-folder", None, Some("/code/alpha")),
+            summary("other-folder", None, Some("/code/beta")),
+            summary("other-id", Some("p2"), Some("/code/beta")),
+            // A plain task carries neither.
+            summary("task", None, None),
+        ];
+        let roots = vec![
+            PathBuf::from("/code/alpha"),
+            PathBuf::from("/code/alpha-extra"),
+        ];
+        let members = sessions_in_project(summaries.iter(), "p1", &roots);
+        let ids: Vec<&str> = members.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, vec!["by-id", "by-folder"]);
+    }
+
+    #[test]
+    fn sessions_in_project_keeps_archived_rows() {
+        // `delete_project` chains sidebar and archive rows; an archived
+        // conversation of the project must be collected too.
+        let sidebar = vec![summary("live", Some("p1"), None)];
+        let archived = vec![summary("old", Some("p1"), None)];
+        let members = sessions_in_project(
+            sidebar.iter().chain(archived.iter()),
+            "p1",
+            &[PathBuf::from("/code/alpha")],
+        );
+        assert_eq!(members.len(), 2);
+    }
+
+    fn report_with(status: SubagentStatus, error: Option<&str>, text: &str) -> SubagentReport {
+        SubagentReport {
+            agent_id: "agent_test".to_string(),
+            name: "scout".to_string(),
+            profile: "explore".to_string(),
+            color: SubagentColor::Blue,
+            description: "测试任务".to_string(),
+            child_session_id: "child".to_string(),
+            parent_call_id: "call".to_string(),
+            parent_agent_id: None,
+            group_id: None,
+            group_name: None,
+            visibility: AgentVisibility::Private,
+            background: true,
+            wake: false,
+            status,
+            report: text.to_string(),
+            data: None,
+            error: error.map(str::to_string),
+            tool_uses: 3,
+            duration_ms: 1200,
+            usage: Usage::default(),
+        }
+    }
+
+    #[test]
+    fn failed_background_child_reports_the_error_to_the_parent() {
+        let report = report_with(
+            SubagentStatus::Failed,
+            Some("output did not satisfy output_schema: missing \"facts\"\nsecond line"),
+            "",
+        );
+        let note = format_task_notification(&report);
+        assert!(note.contains("<status>failed</status>"));
+        // A failed child often has no assistant text; the cause must still be
+        // present in the body, not only in the one-line summary.
+        assert!(note.contains("ERROR: output did not satisfy output_schema"));
+        assert!(note.contains("missing"));
+        // Only the `<summary>` field must stay flat so the frame stays valid;
+        // the `<result>` body legitimately keeps line breaks.
+        let summary = note
+            .split("<summary>")
+            .nth(1)
+            .and_then(|rest| rest.split("</summary>").next())
+            .expect("summary field");
+        assert!(
+            !summary.contains('\n'),
+            "summary must be one line: {summary:?}"
+        );
+        assert!(summary.contains("failed:"));
+    }
+
+    #[test]
+    fn cancelled_background_child_notifies_with_its_reason() {
+        let report = report_with(
+            SubagentStatus::Cancelled,
+            Some("subagent was stopped"),
+            "partial findings",
+        );
+        let note = format_task_notification(&report);
+        assert!(note.contains("<status>cancelled</status>"));
+        assert!(note.contains("was stopped"));
+        assert!(note.contains("ERROR: subagent was stopped"));
+        assert!(note.contains("PARTIAL OUTPUT"));
+    }
+
+    #[test]
+    fn one_line_collapses_and_truncates() {
+        assert_eq!(one_line("a\n  b\t c"), "a b c");
+        let long = "x".repeat(400);
+        let out = one_line(&long);
+        assert_eq!(out.chars().count(), 301);
+        assert!(out.ends_with('…'));
     }
 }
 

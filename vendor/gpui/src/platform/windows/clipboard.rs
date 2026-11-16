@@ -159,6 +159,9 @@ fn write_to_clipboard_inner(item: ClipboardItem) -> Result<()> {
             ClipboardEntry::Image(image) => {
                 write_image_to_clipboard(image)?;
             }
+            ClipboardEntry::Paths(paths) => {
+                write_paths_to_clipboard(paths)?;
+            }
         },
         None => {
             // Writing an empty list of entries just clears the clipboard.
@@ -193,6 +196,55 @@ fn set_data_to_clipboard<T>(data: &[T], format: u32) -> Result<()> {
         std::ptr::copy_nonoverlapping(data.as_ptr(), handle as _, data.len());
         let _ = GlobalUnlock(global);
         SetClipboardData(format, Some(HANDLE(global.0)))?;
+    }
+    Ok(())
+}
+
+/// Publish a file list as `CF_HDROP` so Explorer and other apps paste files.
+///
+/// The payload is a `DROPFILES` header (with `fWide = TRUE`) followed by
+/// double-NUL-terminated UTF-16 paths.
+fn write_paths_to_clipboard(paths: &crate::ClipboardPaths) -> Result<()> {
+    use windows::Win32::UI::Shell::DROPFILES;
+
+    let mut names: Vec<u16> = Vec::new();
+    for path in paths.paths() {
+        names.extend(path.to_string_lossy().encode_utf16());
+        names.push(0);
+    }
+    if names.is_empty() {
+        return Ok(());
+    }
+    names.push(0);
+
+    let header_len = std::mem::size_of::<DROPFILES>();
+    let mut payload = vec![0u8; header_len + names.len() * 2];
+    let header = DROPFILES {
+        pFiles: header_len as u32,
+        pt: windows::Win32::Foundation::POINT { x: 0, y: 0 },
+        fNC: windows::core::BOOL(0),
+        // UTF-16 payload; some legacy consumers only accept ANSI, but every
+        // supported Windows version reads the wide form.
+        fWide: windows::core::BOOL(1),
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&header as *const DROPFILES).cast::<u8>(),
+            payload.as_mut_ptr(),
+            header_len,
+        );
+        std::ptr::copy_nonoverlapping(
+            names.as_ptr().cast::<u8>(),
+            payload.as_mut_ptr().add(header_len),
+            names.len() * 2,
+        );
+    }
+    unsafe {
+        let global = GlobalAlloc(GMEM_MOVEABLE, payload.len())?;
+        let handle = GlobalLock(global);
+        std::ptr::copy_nonoverlapping(payload.as_ptr(), handle as _, payload.len());
+        let _ = GlobalUnlock(global);
+        SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(global.0)))?;
     }
     Ok(())
 }
@@ -346,18 +398,21 @@ fn read_image_for_type(format_number: u32, format: ImageFormat) -> Option<Clipbo
 }
 
 fn read_files_from_clipboard() -> Option<ClipboardEntry> {
-    let text = with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, _size| {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    with_clipboard_data(CF_HDROP.0 as u32, |data_ptr, _size| {
         let hdrop = HDROP(data_ptr);
-        let mut filenames = String::new();
         with_file_names(hdrop, |file_name| {
-            filenames.push_str(&file_name);
+            paths.push(std::path::PathBuf::from(file_name));
         });
-        filenames
     })?;
-    Some(ClipboardEntry::String(ClipboardString {
-        text,
-        metadata: None,
-    }))
+    paths.dedup();
+    if paths.is_empty() {
+        return None;
+    }
+    // A file list is not text: concatenating the names produced a string no
+    // paste handler could use, and round-tripping it back into a path is
+    // impossible for multi-file copies.
+    Some(ClipboardEntry::Paths(crate::ClipboardPaths::new(paths)))
 }
 
 fn with_clipboard_data<F, R>(format: u32, f: F) -> Option<R>
