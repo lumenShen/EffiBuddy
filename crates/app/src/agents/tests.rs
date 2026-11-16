@@ -15,7 +15,7 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use crate::events::AppEvent;
 use crate::store::SessionStore;
 
-use super::runtime::SubagentService;
+use super::runtime::{DeviceTools, SubagentService};
 
 fn request(workspace: &std::path::Path, background: bool) -> SubagentRequest {
     SubagentRequest {
@@ -496,5 +496,95 @@ async fn agents_lists_main_children_and_groups() {
         agents
             .iter()
             .any(|agent| agent.kind == effibuddy_agent_core::AgentNodeKind::Agent)
+    );
+}
+
+/// Device tools (`computer`, `browser`) joined the tool permission matrix, so a
+/// child must reach them through the same `PermissionMode`. Before this they
+/// were filtered out of every child registry *and* gated by a consent layer
+/// that FullAccess could not pass.
+#[tokio::test]
+async fn subagents_use_device_tools_under_the_parent_permission_mode() {
+    use effibuddy_agent_core::{HarnessEvent, ToolResult};
+    use effibuddy_browser::testing::FakeBrowser;
+    use effibuddy_browser::BrowserRuntime;
+    use effibuddy_computer::testing::FakeBackend;
+    use effibuddy_computer::ComputerRuntime;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mode = Arc::new(std::sync::Mutex::new(PermissionMode::FullAccess));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        Completion::default().with_tool_call(ToolCall::new(
+            "computer",
+            serde_json::json!({"action": "status"}),
+        )),
+        Completion::text("desktop is reachable"),
+    ]));
+    let (tx, mut rx) = unbounded_channel();
+    let mode_for_gate = mode.clone();
+    let service = SubagentService::new(
+        provider,
+        "parent-session".to_string(),
+        "deepseek".to_string(),
+        "test-model".to_string(),
+        None,
+        HarnessConfig::default(),
+        String::new(),
+        SessionStore::with_directory(directory.path().join("sessions")),
+        tx,
+        tokio::runtime::Handle::current(),
+        directory.path().to_path_buf(),
+        Arc::new(effibuddy_agent_core::ModelConfigFile::with_builtins()),
+    )
+    .with_permission_mode(Arc::new(move || *mode_for_gate.lock().unwrap()))
+    .with_device_tools(DeviceTools {
+        computer: Arc::new(ComputerRuntime::new(Arc::new(FakeBackend::new()))),
+        browser: Arc::new(BrowserRuntime::with_data_dir(
+            Arc::new(FakeBrowser::new()),
+            directory.path().join("browser"),
+        )),
+        vision: false,
+    });
+
+    let mut child_request = request(directory.path(), false);
+    // A general-purpose child may mutate; `explore` is read-only and therefore
+    // never receives device tools.
+    child_request.profile = "general-purpose".to_string();
+    child_request.read_only = Some(false);
+    let report = service
+        .run(child_request, tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.status,
+        SubagentStatus::Completed,
+        "{:?}",
+        report.error
+    );
+
+    let mut cards = 0;
+    let mut computer_results = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::SubagentHarness { event, .. } = event {
+            match event {
+                HarnessEvent::ApprovalRequested { .. } => cards += 1,
+                HarnessEvent::ToolCallFinished {
+                    result: ToolResult { name, content, is_error, .. },
+                } if name == "computer" => computer_results.push((content, is_error)),
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        cards, 0,
+        "FullAccess must not surface a child device approval card"
+    );
+    let (content, is_error) = computer_results
+        .first()
+        .cloned()
+        .expect("the child's computer call must run");
+    assert!(!is_error, "computer call failed: {content}");
+    assert!(
+        content.contains("platform"),
+        "unexpected computer output: {content}"
     );
 }

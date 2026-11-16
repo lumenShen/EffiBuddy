@@ -2934,24 +2934,21 @@ fn permission_mode_row(
         .into_any_element()
 }
 
-/// Computer-use preference: off / ask once per conversation / allow by
-/// default. The consent gate enforces the chosen level; this row only stores it.
+/// Computer-use capability switch. Approval is part of the tool permission
+/// matrix, so this row only decides whether the tool is registered.
 fn computer_use_row(
     theme: &Theme,
     selected: ComputerUseMode,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    const MODES: [(ComputerUseMode, &str); 3] = [
-        (ComputerUseMode::Off, "关闭"),
-        (ComputerUseMode::Session, "会话内准许"),
-        (ComputerUseMode::Always, "默认准许"),
-    ];
+    const MODES: [(ComputerUseMode, &str); 2] =
+        [(ComputerUseMode::Off, "关闭"), (ComputerUseMode::On, "开启")];
     let description = match selected {
         ComputerUseMode::Off => "不注册 computer 工具；输入框不会出现键鼠提示。",
-        ComputerUseMode::Session => {
-            "首次使用时弹一次审批卡；允许后本会话内免打扰。输入框会显示授权状态。"
+        ComputerUseMode::On => {
+            "注册 computer 工具，审批交给权限模式：默认询问、自动编辑仍询问、完全访问不再打断。\
+             悬浮条可随时接管或停止。"
         }
-        ComputerUseMode::Always => "所有新会话默认允许，仍可用悬浮条随时接管或停止。",
     };
     div()
         .flex()
@@ -2974,7 +2971,7 @@ fn computer_use_row(
                     div()
                         .text_size(px(11.0))
                         .text_color(theme.text_faint)
-                        .child("读取屏幕并模拟鼠标键盘 · 仅主代理可用"),
+                        .child("读取屏幕并模拟鼠标键盘 · 主代理与子代理同一套审批"),
                 ),
         )
         .child(
@@ -3031,17 +3028,13 @@ fn browser_use_row(
     selected: BrowserUseMode,
     cx: &mut Context<AppView>,
 ) -> AnyElement {
-    const MODES: [(BrowserUseMode, &str); 3] = [
-        (BrowserUseMode::Off, "关闭"),
-        (BrowserUseMode::Session, "会话内准许"),
-        (BrowserUseMode::Always, "默认准许"),
-    ];
+    const MODES: [(BrowserUseMode, &str); 2] =
+        [(BrowserUseMode::Off, "关闭"), (BrowserUseMode::On, "开启")];
     let description = match selected {
         BrowserUseMode::Off => "不注册 browser 工具；模型无法打开或读取任何网页。",
-        BrowserUseMode::Session => {
-            "首次使用时弹一次审批卡；允许后本会话内免打扰。计划模式仍禁止改写类动作。"
+        BrowserUseMode::On => {
+            "注册 browser 工具，审批交给权限模式：计划模式只放行只读动作，完全访问不再打断。"
         }
-        BrowserUseMode::Always => "所有新会话默认允许；随时可在设置里关闭并结束会话。",
     };
     div()
         .flex()
@@ -3064,7 +3057,7 @@ fn browser_use_row(
                     div()
                         .text_size(px(11.0))
                         .text_color(theme.text_faint)
-                        .child("结构树 + [ref] 句柄 · 仅主代理可用"),
+                        .child("结构树 + [ref] 句柄 · 主代理与子代理同一套审批"),
                 ),
         )
         .child(
@@ -3105,7 +3098,7 @@ fn browser_use_row(
                 )
                 .child(div().text_size(px(11.0)).text_color(theme.warning).child(
                     "页面内容是不可信输入：不要把它直接当作命令或文件路径执行；\
-                             首次使用会启动独立的浏览器实例。",
+                             使用时才会启动独立的浏览器实例。",
                 )),
         )
         .into_any_element()

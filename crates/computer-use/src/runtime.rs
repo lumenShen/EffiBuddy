@@ -1,4 +1,4 @@
-//! Per-session consent, frame tracking, pause/stop and action orchestration.
+//! Frame tracking, pause/stop and action orchestration.
 //!
 //! Backends are stateless with respect to the agent: every decision about who
 //! may control the computer, which frame a coordinate belongs to, and whether
@@ -113,7 +113,6 @@ pub struct KeyRequest {
 }
 
 struct SessionRuntime {
-    granted: bool,
     paused: bool,
     stopped: bool,
     notify: Arc<Notify>,
@@ -127,9 +126,8 @@ struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    fn new(granted: bool) -> Self {
+    fn new() -> Self {
         Self {
-            granted,
             paused: false,
             stopped: false,
             notify: Arc::new(Notify::new()),
@@ -160,7 +158,7 @@ impl ComputerRuntime {
 
     pub fn with_artifact_dir(backend: Arc<dyn ComputerBackend>, artifact_dir: PathBuf) -> Self {
         Self {
-            mode: RwLock::new(ComputerUseMode::Session),
+            mode: RwLock::new(ComputerUseMode::On),
             backend,
             sessions: Mutex::new(HashMap::new()),
             overlay: Mutex::new(None),
@@ -213,13 +211,6 @@ impl ComputerRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(emitter);
     }
 
-    pub fn is_granted(&self, session_id: &str) -> bool {
-        self.lock_sessions()
-            .get(session_id)
-            .map(|session| session.granted)
-            .unwrap_or(false)
-    }
-
     pub fn is_stopped(&self, session_id: &str) -> bool {
         self.lock_sessions()
             .get(session_id)
@@ -227,17 +218,10 @@ impl ComputerRuntime {
             .unwrap_or(false)
     }
 
-    pub fn grant(&self, session_id: &str) {
-        let mode = self.mode();
-        let mut sessions = self.lock_sessions();
-        sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionRuntime::new(mode == ComputerUseMode::Always))
-            .granted = true;
-    }
-
-    /// Revoke consent and drop all transient state for a conversation.
-    pub fn forget_consent(&self, session_id: &str) {
+    /// Drop all transient state for one conversation (screenshots, parked
+    /// windows, pause/stop flags). Approval lives in the tool permission
+    /// system, so there is no consent state to clear.
+    pub fn forget_session(&self, session_id: &str) {
         if let Some(session) = self.lock_sessions().remove(session_id) {
             session.notify.notify_waiters();
         }
@@ -298,14 +282,15 @@ impl ComputerRuntime {
         );
     }
 
-    /// User kill switch. Revokes consent, wakes waiters and hides the bar.
+    /// User kill switch. Ends this conversation's drive, wakes waiters and
+    /// hides the bar. Approval is unaffected: the next run's calls still go
+    /// through the permission mode.
     pub fn stop(&self, session_id: &str) {
         {
             let mut sessions = self.lock_sessions();
             if let Some(session) = sessions.get_mut(session_id) {
                 session.stopped = true;
                 session.paused = false;
-                session.granted = false;
                 session.overlay_visible = false;
                 session.notify.notify_waiters();
             }
@@ -387,7 +372,7 @@ impl ComputerRuntime {
                 let sessions = self.lock_sessions();
                 let session = sessions
                     .get(session_id)
-                    .ok_or(ComputerError::ConsentRequired)?;
+                    .ok_or_else(|| ComputerError::Invalid("session runtime is gone".to_string()))?;
                 (session.notify.clone(), session.paused, session.stopped)
             };
             if stopped {
@@ -409,22 +394,20 @@ impl ComputerRuntime {
         if mode.is_enabled() {
             self.show_overlay(session_id, "正在检查电脑操作能力…");
         }
-        let (granted, paused, stopped, desktop, moved) = {
+        let (paused, stopped, desktop, moved) = {
             let sessions = self.lock_sessions();
             match sessions.get(session_id) {
                 Some(session) => (
-                    session.granted,
                     session.paused,
                     session.stopped,
                     session.active_desktop.clone(),
                     session.moved_windows.clone(),
                 ),
-                None => (false, false, false, None, Vec::new()),
+                None => (false, false, None, Vec::new()),
             }
         };
         let mut value = json!({
             "mode": mode,
-            "consent": granted,
             "paused": paused,
             "stopped": stopped,
             "active_desktop": desktop,
@@ -512,7 +495,7 @@ impl ComputerRuntime {
             let mut sessions = self.lock_sessions();
             let session = sessions
                 .get_mut(session_id)
-                .ok_or(ComputerError::ConsentRequired)?;
+                .ok_or_else(|| ComputerError::Invalid("session runtime is gone".to_string()))?;
             session.frames.record(capture.frame.clone())
         };
         capture.frame = frame;
@@ -843,11 +826,10 @@ impl ComputerRuntime {
     }
 
     fn ensure_session(&self, session_id: &str) {
-        let mode = self.mode();
         let mut sessions = self.lock_sessions();
         sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| SessionRuntime::new(mode == ComputerUseMode::Always));
+            .or_insert_with(SessionRuntime::new);
     }
 
     fn ensure_ready(&self, session_id: &str) -> Result<(), ComputerError> {
@@ -859,12 +841,9 @@ impl ComputerRuntime {
         let sessions = self.lock_sessions();
         let session = sessions
             .get(session_id)
-            .ok_or(ComputerError::ConsentRequired)?;
+            .ok_or_else(|| ComputerError::Invalid("session runtime is gone".to_string()))?;
         if session.stopped {
             return Err(ComputerError::Stopped);
-        }
-        if mode == ComputerUseMode::Session && !session.granted {
-            return Err(ComputerError::ConsentRequired);
         }
         Ok(())
     }
@@ -923,7 +902,7 @@ impl ComputerRuntime {
             let sessions = self.lock_sessions();
             let session = sessions
                 .get(session_id)
-                .ok_or(ComputerError::ConsentRequired)?;
+                .ok_or_else(|| ComputerError::Invalid("session runtime is gone".to_string()))?;
             (
                 session.frames.resolve(frame_id)?,
                 session
@@ -1112,34 +1091,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_mode_requires_consent_until_granted() {
+    async fn wait_turn_requires_only_an_enabled_capability() {
         let (runtime, _) = runtime();
         let cancel = CancellationToken::new();
+        // No per-session consent: an enabled capability is ready on first use;
+        // approval belongs to the tool permission mode.
+        assert!(runtime.wait_turn("s", &cancel).await.is_ok());
+        runtime.set_mode(ComputerUseMode::Off);
         assert_eq!(
             runtime.wait_turn("s", &cancel).await,
-            Err(ComputerError::ConsentRequired)
+            Err(ComputerError::Disabled)
         );
-        runtime.grant("s");
-        assert!(runtime.wait_turn("s", &cancel).await.is_ok());
     }
 
     #[tokio::test]
-    async fn status_requires_consent_but_works_after_grant() {
+    async fn status_reports_the_device_without_a_consent_flag() {
         let (runtime, _) = runtime();
-        assert_eq!(
-            runtime.status("s").await,
-            Err(ComputerError::ConsentRequired)
-        );
-        runtime.grant("s");
         let status = runtime.status("s").await.unwrap();
-        assert_eq!(status["consent"], true);
+        assert!(status.get("consent").is_none());
         assert_eq!(status["platform"]["backend"], "fake");
     }
 
     #[tokio::test]
     async fn takeover_pauses_until_resume_or_stop() {
         let (runtime, _) = runtime();
-        runtime.grant("s");
+        // The session exists once the tool has been used at least once.
+        runtime.wait_turn("s", &CancellationToken::new()).await.unwrap();
         runtime.take_over("s");
         let waiter = {
             let runtime = runtime.clone();
@@ -1160,13 +1137,11 @@ mod tests {
             runtime.wait_turn("s", &CancellationToken::new()).await,
             Err(ComputerError::Stopped)
         );
-        assert!(!runtime.is_granted("s"));
     }
 
     #[tokio::test]
     async fn screenshot_records_frame_and_click_maps_coordinates() {
         let (runtime, backend) = runtime();
-        runtime.grant("s");
         let capture = runtime
             .screenshot(
                 "s",
@@ -1203,7 +1178,6 @@ mod tests {
     #[tokio::test]
     async fn stale_frame_is_rejected_after_eviction() {
         let (runtime, _) = runtime();
-        runtime.grant("s");
         let mut first = String::new();
         for _ in 0..(crate::frame::MAX_FRAMES + 1) {
             let capture = runtime
@@ -1242,7 +1216,6 @@ mod tests {
     #[tokio::test]
     async fn parking_lane_uses_background_strategy() {
         let (runtime, backend) = runtime();
-        runtime.grant("s");
         let desktop = runtime
             .lock_desktop("s", "EffiBuddy", &CancellationToken::new())
             .await

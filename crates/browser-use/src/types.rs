@@ -12,17 +12,18 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 /// User preference for letting the model drive a browser.
+///
+/// Like [`ComputerUseMode`](effibuddy_computer::ComputerUseMode) this is a
+/// capability switch; approval belongs to the session permission mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserUseMode {
     /// Browser tools are not registered at all.
     Off,
-    /// One consent prompt per conversation; after approval the session may
-    /// drive the browser without another card.
+    /// Browser tools are registered and gated by the permission mode.
     #[default]
-    Session,
-    /// Every conversation is allowed up front. Stopping is still one click.
-    Always,
+    #[serde(alias = "session", alias = "always")]
+    On,
 }
 
 impl BrowserUseMode {
@@ -414,8 +415,6 @@ pub struct JournalPage<T> {
 pub enum BrowserError {
     #[error("browser use is disabled in settings")]
     Disabled,
-    #[error("this conversation has not been allowed to use the browser yet")]
-    ConsentRequired,
     #[error("the user stopped browser control")]
     Stopped,
     #[error("browser control was cancelled")]
@@ -449,7 +448,6 @@ impl BrowserError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Disabled => "BROWSER_DISABLED",
-            Self::ConsentRequired => "CONSENT_REQUIRED",
             Self::Stopped => "CONTROL_STOPPED",
             Self::Cancelled => "CANCELLED",
             Self::NoEngine(_) => "NO_ENGINE",
@@ -478,11 +476,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mode_defaults_to_session_and_off_disables_registration() {
-        assert_eq!(BrowserUseMode::default(), BrowserUseMode::Session);
-        assert!(BrowserUseMode::Session.is_enabled());
-        assert!(BrowserUseMode::Always.is_enabled());
+    fn mode_defaults_to_on_and_off_disables_registration() {
+        assert_eq!(BrowserUseMode::default(), BrowserUseMode::On);
+        assert!(BrowserUseMode::On.is_enabled());
         assert!(!BrowserUseMode::Off.is_enabled());
+        // Old config files used "session" / "always" for the same state.
+        assert_eq!(
+            serde_json::from_value::<BrowserUseMode>(serde_json::json!("session")).unwrap(),
+            BrowserUseMode::On
+        );
+        assert_eq!(
+            serde_json::from_value::<BrowserUseMode>(serde_json::json!("always")).unwrap(),
+            BrowserUseMode::On
+        );
     }
 
     #[test]

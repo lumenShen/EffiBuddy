@@ -329,6 +329,45 @@ impl ProjectStore {
         mapping
     }
 
+    /// Re-add a registry entry for a project id that sessions still reference
+    /// but the registry lost (crash during save, hand edit, older build).
+    /// `create` always mints a fresh id, so a dangling id can otherwise never
+    /// be rebuilt and its conversations stay stranded in the tasks list.
+    /// Returns true when a project was (re)created.
+    pub fn restore(&mut self, id: &str, folders: &[PathBuf]) -> bool {
+        if id.trim().is_empty() || self.by_id(id).is_some() {
+            return false;
+        }
+        let roots = normalize_roots(folders);
+        let Some(first) = roots.first().cloned() else {
+            return false;
+        };
+        let position = self
+            .file
+            .projects
+            .iter()
+            .map(|project| project.position)
+            .max()
+            .map(|max| max + 1)
+            .unwrap_or(0);
+        let now = Utc::now();
+        self.file.projects.push(Project {
+            id: id.to_string(),
+            name: self.unique_name(project_default_name(&first), Some(id)),
+            roots: roots
+                .into_iter()
+                .map(|path| ProjectRoot {
+                    is_primary: path == first,
+                    path,
+                })
+                .collect(),
+            position,
+            created_at: now,
+            updated_at: now,
+        });
+        true
+    }
+
     /// Add a single-root project for any session folder the registry does not
     /// know yet. Keeps the sidebar complete when `projects.json` is missing,
     /// older than the sessions, or was edited by hand.
@@ -356,9 +395,16 @@ impl ProjectStore {
         let temporary = self.path.with_extension("json.tmp");
         std::fs::write(&temporary, json)
             .map_err(|error| format!("无法写入 {}：{error}", temporary.display()))?;
-        if self.path.exists() {
-            let _ = std::fs::remove_file(&self.path);
+        // Replace the live file with a single rename. The previous version
+        // deleted it first and renamed afterwards; a crash, a kill, or a
+        // failing rename in that window left no `projects.json` at all, which
+        // is exactly how projects silently disappeared from the sidebar.
+        // `rename` atomically replaces an existing target on Unix; Windows
+        // refuses, so fall back to remove-then-rename only there.
+        if std::fs::rename(&temporary, &self.path).is_ok() {
+            return Ok(());
         }
+        let _ = std::fs::remove_file(&self.path);
         std::fs::rename(&temporary, &self.path)
             .map_err(|error| format!("无法完成 {} 写入：{error}", self.path.display()))
     }
@@ -523,6 +569,35 @@ mod tests {
         let third = directory.path().join("one");
         let project = store.create(&[third]).unwrap();
         assert_eq!(project.name, "one (2)");
+    }
+
+    /// 回归：注册表丢了项目记录（崩溃、手改、旧版本写入），但会话仍带着
+    /// 原来的 project_id。这类会话以前永远进不了侧栏的项目分组，只能靠
+    /// 新建项目把整段重新显示出来。restore 必须用原 id 补回条目。
+    #[test]
+    fn restore_rebuilds_a_project_the_registry_lost() {
+        let (directory, mut store) = temp_project_store();
+        let folder = directory.path().join("alpha");
+        std::fs::create_dir_all(&folder).unwrap();
+        let lost_id = "0f5f0f50-0000-4000-8000-000000000000";
+
+        assert!(store.by_id(lost_id).is_none());
+        assert!(store.restore(lost_id, &[folder.clone()]));
+
+        let restored = store.by_id(lost_id).expect("restored project");
+        assert_eq!(restored.id, lost_id);
+        assert_eq!(restored.name, "alpha");
+        assert_eq!(restored.primary(), Some(folder.as_path()));
+        // Re-running recovery must stay idempotent.
+        assert!(!store.restore(lost_id, &[folder]));
+    }
+
+    #[test]
+    fn restore_ignores_an_empty_id_or_missing_folder() {
+        let (_directory, mut store) = temp_project_store();
+        assert!(!store.restore("", &[PathBuf::from("/tmp/whatever")]));
+        assert!(!store.restore("some-id", &[]));
+        assert!(store.projects().is_empty());
     }
 
     #[test]

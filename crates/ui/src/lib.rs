@@ -28,11 +28,14 @@ pub use motion::{
     MotionSpec, OVERLAY_MOTION, PaintShift, SWITCH_MOTION, Spring, ease_out_cubic, mix_color,
     motion_item, overlay_motion_duration, reduce_motion,
 };
+pub use primitives::window_drag_region;
 pub use primitives::{
     BadgeTone, ProgressRing, Spinner, TooltipView, avatar, badge, card, chip, disclosure_chevron,
     divider, dot, elevated_card, empty_state, kbd, section_label, shadow_float, small_badge,
     switch, tooltip, vertical_divider,
 };
+#[cfg(not(target_os = "windows"))]
+pub use primitives::{TitlebarPress, titlebar_press_action};
 pub use scroll::{
     GlideTick, SCROLL_GLIDE_CUTOFF, SCROLL_GLIDE_TAU, ScrollGlide, SmoothScrollHandle,
     WHEEL_LINE_HEIGHT, wheel_capture_overlay,

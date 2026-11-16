@@ -11,7 +11,7 @@
 //! - Ref-based actions resolve `eN` through the most recent snapshot's own
 //!   element records, so a click always targets the box the model saw.
 //!
-//! Everything the model can do funnels through here; policy and consent live in
+//! Everything the model can do funnels through here; policy lives in
 //! [`crate::runtime`].
 
 use std::collections::HashMap;

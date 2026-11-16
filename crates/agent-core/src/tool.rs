@@ -39,6 +39,13 @@ pub struct ApprovalRequest {
     pub call_id: String,
     pub summary: String,
     pub arguments: Value,
+    /// Risk of *this* call, as declared by the tool. The permission matrix uses
+    /// it to decide whether a device tool (computer / browser) is allowed in a
+    /// read-only mode such as [`PermissionMode::Plan`]. Defaults to
+    /// [`ToolRisk::Mutating`] so a tool that forgets to declare anything can
+    /// never quietly gain read-only treatment.
+    #[serde(default)]
+    pub risk: ToolRisk,
 }
 
 impl ApprovalRequest {
@@ -49,8 +56,32 @@ impl ApprovalRequest {
             call_id: call.id.clone(),
             summary: summary.into(),
             arguments: call.arguments.clone(),
+            risk: ToolRisk::Mutating,
         }
     }
+
+    /// Attach the tool-declared risk of this call.
+    pub fn with_risk(mut self, risk: ToolRisk) -> Self {
+        self.risk = risk;
+        self
+    }
+}
+
+/// How dangerous one concrete tool call is, independent of the tool itself.
+///
+/// File and command tools are classified by [`ToolClass`] alone. Device tools
+/// (`computer`, `browser`) expose both observation and control through a single
+/// tool name, so they declare the risk of each action and the matrix treats
+/// [`ToolClass::Device`] accordingly: read-only device calls stay available in
+/// plan mode, mutating ones are denied exactly like edits and commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRisk {
+    /// Observation only: snapshots, screenshots, listings, reading a page.
+    ReadOnly,
+    /// Changes external state: clicks, key presses, navigation, uploads.
+    #[default]
+    Mutating,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,8 +240,8 @@ impl PermissionMode {
 ///
 /// The classification is deliberately name-based so it works for every
 /// registry without inspecting tool implementations: known read-only helpers,
-/// known file editors, known command runners; anything else falls into
-/// [`ToolClass::Other`].
+/// known file editors, known command runners, known device controllers;
+/// anything else falls into [`ToolClass::Other`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolClass {
     /// Reading state: files, directories, search, todo lists.
@@ -219,6 +250,10 @@ pub enum ToolClass {
     Edit,
     /// Running programs: shell, PTC scripts, workflow runs.
     Command,
+    /// Driving hardware outside the workspace: the user's screen and keyboard
+    /// (`computer`) or a browser (`browser`). Device tools mix observation and
+    /// control under one name, so their per-call [`ToolRisk`] decides.
+    Device,
     /// Anything that is none of the above (agents, messaging, …).
     Other,
 }
@@ -229,6 +264,7 @@ impl ToolClass {
             "read_file" | "list_dir" | "grep" | "todo_write" => ToolClass::ReadOnly,
             "write_file" | "edit_file" => ToolClass::Edit,
             "shell" | "run_js" | "workflow_run" => ToolClass::Command,
+            "computer" | "browser" => ToolClass::Device,
             _ => ToolClass::Other,
         }
     }
@@ -238,18 +274,23 @@ impl ToolClass {
 ///
 /// Decision matrix:
 ///
-/// | mode          | edit            | command         | read-only       | other   |
-/// |---------------|-----------------|-----------------|-----------------|---------|
-/// | Default       | forward         | forward         | forward         | forward |
-/// | AcceptEdits   | approve locally | forward         | forward         | forward |
-/// | Plan          | deny locally    | deny locally    | approve locally | forward |
-/// | FullAccess    | approve locally | approve locally | approve locally | approve |
+/// | mode          | edit            | command         | device (read)   | device (mutate) | read-only       | other   |
+/// |---------------|-----------------|-----------------|-----------------|-----------------|-----------------|---------|
+/// | Default       | forward         | forward         | forward         | forward         | forward         | forward |
+/// | AcceptEdits   | approve locally | forward         | forward         | forward         | forward         | forward |
+/// | Plan          | deny locally    | deny locally    | approve locally | deny locally    | approve locally | forward |
+/// | FullAccess    | approve locally | approve locally | approve locally | approve locally | approve locally | approve |
 ///
 /// Locally decided calls never reach the inner gate, so the UI never shows an
 /// approval card for them and `mode` is re-read on every request — switching
 /// modes mid-run takes effect immediately. The harness consults this gate for
 /// every tool while in Plan mode (not only `Ask`-policy tools), so Auto tools
 /// such as `run_js` and `agent` are held to the read-only research contract.
+///
+/// Device tools (computer / browser) are *not* a separate approval layer: the
+/// `Off` half of their preference removes them from the registry entirely, and
+/// once registered they are gated by this matrix like every other capability.
+/// FullAccess therefore reaches subagents and the main agent alike.
 pub struct ModeApprovalGate {
     inner: Arc<dyn ApprovalGate>,
     mode: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
@@ -278,6 +319,12 @@ impl ApprovalGate for ModeApprovalGate {
             PermissionMode::Plan => match class {
                 ToolClass::Edit | ToolClass::Command => ApprovalDecision::Deny,
                 ToolClass::ReadOnly => ApprovalDecision::Approve,
+                // Observation stays available for research; anything that
+                // changes the desktop or the page is a mutation.
+                ToolClass::Device => match request.risk {
+                    ToolRisk::ReadOnly => ApprovalDecision::Approve,
+                    ToolRisk::Mutating => ApprovalDecision::Deny,
+                },
                 ToolClass::Other => self.inner.request_approval(request).await,
             },
         }
@@ -401,6 +448,13 @@ pub trait Tool: Send + Sync + 'static {
     fn parameters(&self) -> Value;
     fn approval(&self) -> ApprovalPolicy {
         ApprovalPolicy::Auto
+    }
+
+    /// Risk of one concrete call. Only consulted for [`ToolClass::Device`]
+    /// tools, which mix observation and control under a single name; leaving
+    /// the default is safe because [`ToolRisk::Mutating`] is the strict answer.
+    fn risk(&self, _arguments: &Value) -> ToolRisk {
+        ToolRisk::Mutating
     }
 
     /// Human-readable one-liner shown in the approval card.
@@ -577,7 +631,82 @@ mod tests {
         assert_eq!(ToolClass::of_tool_name("shell"), ToolClass::Command);
         assert_eq!(ToolClass::of_tool_name("run_js"), ToolClass::Command);
         assert_eq!(ToolClass::of_tool_name("workflow_run"), ToolClass::Command);
+        // Device tools are classified by name; their per-call risk decides the
+        // read-only half of the matrix.
+        assert_eq!(ToolClass::of_tool_name("computer"), ToolClass::Device);
+        assert_eq!(ToolClass::of_tool_name("browser"), ToolClass::Device);
         assert_eq!(ToolClass::of_tool_name("agent"), ToolClass::Other);
+    }
+
+    fn device_request(tool: &str, risk: ToolRisk) -> ApprovalRequest {
+        ApprovalRequest::new(
+            &ToolCall::new(tool, json!({"action": "any"})),
+            "summary",
+        )
+        .with_risk(risk)
+    }
+
+    #[tokio::test]
+    async fn plan_mode_keeps_device_observation_and_denies_device_control() {
+        let (gate, inner) = mode_gate(
+            PermissionMode::Plan,
+            Arc::new(CountingGate::new(ApprovalDecision::Approve)),
+        );
+        for tool in ["computer", "browser"] {
+            assert_eq!(
+                gate.request_approval(device_request(tool, ToolRisk::Mutating))
+                    .await,
+                ApprovalDecision::Deny,
+                "plan mode must deny mutating `{tool}`",
+            );
+            assert_eq!(
+                gate.request_approval(device_request(tool, ToolRisk::ReadOnly))
+                    .await,
+                ApprovalDecision::Approve,
+                "plan mode must allow observing `{tool}`",
+            );
+        }
+        assert_eq!(
+            inner.calls(),
+            0,
+            "plan mode decides device calls without a consent card"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_access_approves_device_tools_without_a_card() {
+        // Regression for the old consent layer: FullAccess used to be stopped by
+        // a computer/browser consent card that sat outside this matrix.
+        let (gate, inner) = mode_gate(
+            PermissionMode::FullAccess,
+            Arc::new(CountingGate::new(ApprovalDecision::Deny)),
+        );
+        for tool in ["computer", "browser"] {
+            for risk in [ToolRisk::ReadOnly, ToolRisk::Mutating] {
+                assert_eq!(
+                    gate.request_approval(device_request(tool, risk)).await,
+                    ApprovalDecision::Approve,
+                    "full access must approve `{tool}` ({risk:?})",
+                );
+            }
+        }
+        assert_eq!(inner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_and_accept_edits_still_ask_for_device_control() {
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
+            let (gate, inner) = mode_gate(
+                mode,
+                Arc::new(CountingGate::new(ApprovalDecision::ApproveForSession)),
+            );
+            assert_eq!(
+                gate.request_approval(device_request("computer", ToolRisk::Mutating))
+                    .await,
+                ApprovalDecision::ApproveForSession,
+            );
+            assert_eq!(inner.calls(), 1, "{mode:?} must show a real card");
+        }
     }
 
     #[tokio::test]

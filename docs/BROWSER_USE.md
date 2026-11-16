@@ -1,6 +1,6 @@
 # Browser Use（浏览器操控）
 
-EffiBuddy 的主代理可以通过 `browser` 工具，用 Chrome DevTools Protocol 驱动一个真实的
+EffiBuddy 可以通过 `browser` 工具，用 Chrome DevTools Protocol 驱动一个真实的
 Chromium 浏览器：读取页面结构、点击元素、填写表单、查看控制台与网络请求。
 
 > 与 [`COMPUTER_USE.md`](COMPUTER_USE.md) 的区别：`computer` 是**看像素 + 模拟系统键鼠**，
@@ -28,31 +28,30 @@ page: 登录 | https://app.test/login | 6 nodes
 截图（`action=screenshot`）仍保留，用于 canvas / 图表这类没有结构可读的界面；
 在有视觉模型时图片会随结果返回，否则保存到 `<数据目录>/browser/screens/<会话>/`。
 
-## 2. 授权模型
+## 2. 能力开关与审批
 
 设置 → 通用 → **浏览器操作（Chromium / DevTools）**：
 
 | 档位 | 行为 |
 | --- | --- |
 | 关闭 | 不注册 `browser` 工具；输入框不显示浏览器 chip。 |
-| 会话内准许（默认） | 首次调用弹真实审批卡；选"本会话允许"后自动放行。 |
-| 默认准许 | 新会话直接放行；仍可随时结束会话。 |
+| 开启（默认） | 注册 `browser` 工具，审批交给会话权限模式。 |
 
 补充规则：
 
-- **只有主代理**注册 `browser`。子代理的 registry 由 `builtin_tools()` 重建，拿不到。
+- `browser` 是普通工具（`ToolClass::Device`），**主代理与子代理都注册**，走同一套权限矩阵；只读 profile 的子代理不注册。
 - 权限模式为**计划模式**时，`navigate` / `click` / `type` / `hover` / `press_key` /
   `scroll` / `select` / `set_checked` / `new_tab` / `select_tab` / `close_tab` / `eval` /
   `upload` 直接拒绝；`snapshot` / `text` / `console` / `network` / `tabs` / `screenshot` /
-  `wait_for` 仍可询问。调研类任务因此依然可用。
-- 审批由 app 层 `BrowserApprovalGate` 强制拦截，**完全访问模式也不能绕过首次授权**。
-- 停止运行会立即撤销授权并关闭浏览器进程。
+  `wait_for` 本地放行。调研类任务因此依然可用。
+- **完全访问模式不再单独询问**：矩阵内直接批准，主代理与子代理一致。
+- 所有代理共用同一个 `BrowserRuntime`，会话按 id 隔离 snapshot/frame；并发驱动同一个浏览器时以最后到达的动作顺序为准。
+- 停止运行会结束本会话的驱动并隐藏悬浮条；下一次调用仍按当前权限模式审批。
 
 输入框底部的 chip：
 
-- `浏览器 · 首次使用询问`
-- `浏览器已授权 · 本会话`
-- `浏览器已允许 · Chromium`
+- `浏览器已开启 · 按操作审批`
+- `浏览器已允许 · 完全访问`（完全访问档）
 
 ## 3. 工具参数
 
@@ -60,7 +59,7 @@ page: 登录 | https://app.test/login | 6 nodes
 
 | action | 说明 |
 | --- | --- |
-| `status` | 引擎、版本、连接状态、授权与快照情况。 |
+| `status` | 引擎、版本、连接状态、暂停/停止与快照情况。 |
 | `navigate` | 打开网址，`wait` 可选 `load` / `dom_content_loaded` / `none`。 |
 | `snapshot` | 生成 `[ref]` 快照；`mode` = `interesting` / `full` / `text`，`max_nodes` 默认 300。 |
 | `text` | 只取正文文本，用于读文章。 |
@@ -112,7 +111,7 @@ page: 登录 | https://app.test/login | 6 nodes
 - 单页面的 `confirm()` / `alert()` 会被自动接受，否则会挂死整个会话。
 
 `eval` 等价于在 DevTools 控制台敲代码：能读 cookie、localStorage、发起同源请求。
-它按高危动作处理（计划模式直接拒绝，其他模式仍需授权），返回结果标记 `untrusted`。
+它按高危动作处理（计划模式直接拒绝，其他模式按当前权限模式审批），返回结果标记 `untrusted`。
 
 ## 5. 引擎：自带还是复用系统？
 

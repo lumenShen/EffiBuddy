@@ -836,11 +836,16 @@ impl AgentHarness {
             self.config.max_tokens.map(|tokens| tokens as usize),
         );
 
-        let (current, held) = {
+        // `current` is calibrated (local estimate vs. the provider's reported
+        // prompt size) and drives the threshold decision. `estimate` keeps the
+        // local measure only, so the before/after numbers reported for a
+        // compaction compare two identical baselines instead of mixing a
+        // provider figure with an estimate.
+        let (current, estimate, held) = {
             let mut session = lock_session(&self.session);
-            let mut current =
-                context::estimate_request_tokens(&session, system_prompt, tool_tokens)
-                    .max(session.usage.last_prompt_tokens as usize);
+            let mut estimate =
+                context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+            let mut current = estimate.max(session.usage.last_prompt_tokens as usize);
 
             if config.clear_tool_outputs && (force || current >= thresholds.microcompact_tokens) {
                 let outcome = context::microcompact_tool_results(
@@ -851,13 +856,14 @@ impl AgentHarness {
                     // The provider-reported footprint describes the request
                     // before clearing; recompute from the transcript so the
                     // ring and the next decision see the drop immediately.
-                    current =
+                    estimate =
                         context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+                    current = estimate;
                     session.usage.last_prompt_tokens = current as u64;
                     session.touch();
                 }
             }
-            (current, session.held_compaction.clone())
+            (current, estimate, session.held_compaction.clone())
         };
 
         let due = force || current >= thresholds.trigger_tokens;
@@ -939,7 +945,7 @@ impl AgentHarness {
             // first kept message so an edit/undo that lands meanwhile wins over
             // a stale boundary instead of corrupting `compacted_upto`.
             let boundary_id = session.messages[plan.boundary].id.clone();
-            (current, plan, previous, request, use_model, boundary_id)
+            (estimate, plan, previous, request, use_model, boundary_id)
         };
 
         let mut model_summary = None;
@@ -998,6 +1004,13 @@ impl AgentHarness {
             {
                 return None;
             }
+            // Snapshot the mutable compaction state so a fold that turns out to
+            // save nothing can be rolled back instead of being persisted.
+            let previous_compacted_upto = session.compacted_upto;
+            let previous_cleared = session.cleared_tool_calls.clone();
+            let previous_record = session.compaction.clone();
+            let previous_held = session.held_compaction.clone();
+
             session.held_compaction = None;
             session.compacted_upto = plan.boundary;
             // Cleared ids covered by the summary can never appear again; keep
@@ -1009,7 +1022,7 @@ impl AgentHarness {
             session
                 .cleared_tool_calls
                 .retain(|call_id| surviving.contains(call_id));
-            let record = context::compose_compaction_record(
+            let mut record = context::compose_compaction_record(
                 summary,
                 source,
                 trigger,
@@ -1019,12 +1032,25 @@ impl AgentHarness {
                 thresholds.trigger_tokens,
             );
             session.compaction = Some(record.clone());
-            let post_tokens =
+            record.post_tokens =
                 context::estimate_request_tokens(&session, system_prompt, tool_tokens);
-            let mut record = record;
-            record.post_tokens = post_tokens;
+
+            // A summary that is not meaningfully smaller than the rounds it
+            // replaces buys nothing and leaves `compacted_upto` in a place that
+            // makes the next pass fold even less. Report it as a no-op and keep
+            // the original transcript window so `/compact` can retry later.
+            if record.pre_tokens.saturating_sub(record.post_tokens)
+                < context::required_compaction_savings(plan.summarized_tokens)
+            {
+                session.compacted_upto = previous_compacted_upto;
+                session.cleared_tool_calls = previous_cleared;
+                session.compaction = previous_record;
+                session.held_compaction = previous_held;
+                return None;
+            }
+
             session.compaction = Some(record.clone());
-            session.usage.last_prompt_tokens = post_tokens as u64;
+            session.usage.last_prompt_tokens = record.post_tokens as u64;
             session.touch();
             record
         };
@@ -1068,15 +1094,30 @@ impl AgentHarness {
         };
 
         let end = session.messages.len();
+        let cleared: HashSet<String> = session.cleared_tool_calls.iter().cloned().collect();
+        let summarized_tokens: usize = session.messages
+            [held.start.min(end)..held.boundary.min(end)]
+            .iter()
+            .map(|message| context::estimate_message_tokens_with_cleared(message, &cleared))
+            .sum();
         let plan = context::CompactionPlan {
             start: held.start,
             boundary: held.boundary,
             end,
             summarized_messages: held.summarized_messages,
             kept_messages: end.saturating_sub(held.boundary),
-            summarized_tokens: 0,
+            summarized_tokens,
             kept_tokens: 0,
         };
+        // Same baseline on both sides of the fold: `current_tokens` is
+        // calibrated with the provider figure, so reporting it as "before" and
+        // a local estimate as "after" made healthy compactions look like they
+        // grew the request.
+        let pre_tokens = context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+        let previous_compacted_upto = session.compacted_upto;
+        let previous_cleared = session.cleared_tool_calls.clone();
+        let previous_record = session.compaction.clone();
+
         session.held_compaction = None;
         session.compacted_upto = held.boundary;
         let surviving: HashSet<String> = session.messages[held.boundary..]
@@ -1091,15 +1132,26 @@ impl AgentHarness {
             crate::session::SummarySource::Model,
             trigger,
             &plan,
-            current_tokens,
+            pre_tokens,
             0,
             thresholds.trigger_tokens,
         );
         session.compaction = Some(record.clone());
-        let post_tokens = context::estimate_request_tokens(&session, system_prompt, tool_tokens);
-        record.post_tokens = post_tokens;
+        record.post_tokens = context::estimate_request_tokens(&session, system_prompt, tool_tokens);
+
+        if record.pre_tokens.saturating_sub(record.post_tokens)
+            < context::required_compaction_savings(plan.summarized_tokens)
+        {
+            // Not worth swapping in: restore the window and let the caller
+            // fall back to a foreground pass.
+            session.compacted_upto = previous_compacted_upto;
+            session.cleared_tool_calls = previous_cleared;
+            session.compaction = previous_record;
+            return None;
+        }
+
         session.compaction = Some(record.clone());
-        session.usage.last_prompt_tokens = post_tokens as u64;
+        session.usage.last_prompt_tokens = record.post_tokens as u64;
         session.touch();
         Some(record)
     }
@@ -1558,6 +1610,7 @@ impl AgentHarness {
             let mut session = lock_session(&self.session);
             if let Some(message) = session.message_by_id(message_id) {
                 message.interrupted = true;
+                message.touch();
             }
             session.touch();
         }
@@ -1669,7 +1722,8 @@ impl ToolExecutor {
                 && !already_approved);
 
         if needs_approval {
-            let request = ApprovalRequest::new(call, tool.summarize(&call.arguments));
+            let request = ApprovalRequest::new(call, tool.summarize(&call.arguments))
+                .with_risk(tool.risk(&call.arguments));
             {
                 let mut session = lock_session(&self.session);
                 session.set_status(RunStatus::WaitingApproval);
@@ -2462,6 +2516,58 @@ mod tests {
             }
         }
         assert!(!saw_compaction);
+    }
+
+    #[tokio::test]
+    async fn compaction_that_saves_nothing_leaves_the_transcript_window_alone() {
+        // A model summary larger than the rounds it replaces must not be kept:
+        // moving `compacted_upto` forward would pay for a summary request, grow
+        // the request, and leave the next pass less to fold. `/compact` reports
+        // this as "nothing to compact" instead of "减少 0".
+        let mut filler = String::from("<analysis>x</analysis><summary>");
+        filler.push_str(&"verbose summary sentence ".repeat(40));
+        filler.push_str("</summary>");
+        let (harness, handle, mut events, _) = harness_with(
+            vec![Completion::text(filler)],
+            default_tools(),
+            // A small window makes the keep budget a fixed share of the small
+            // seeded transcript, so one leading round is a real fold.
+            HarnessConfig {
+                context_window_override: Some(20_000),
+                compaction: crate::context::CompactionConfig {
+                    trigger_percent: 95.0,
+                    keep_recent_percent: 5.0,
+                    summary_percent: 10.0,
+                    clear_tool_outputs: false,
+                    ..crate::context::CompactionConfig::default()
+                },
+                ..HarnessConfig::default()
+            },
+        );
+        seed_long_turn(&harness, 2, "tiny");
+
+        let outcome = harness.run_compaction().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        assert_eq!(
+            session.compacted_upto, 0,
+            "a fold with no savings must not advance the visible window"
+        );
+        assert!(session.compaction.is_none(), "no record for a no-op fold");
+        drop(session);
+
+        let mut saw_compaction = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, HarnessEvent::ContextCompacted { .. }) {
+                saw_compaction = true;
+            }
+        }
+        assert!(
+            !saw_compaction,
+            "the host reports a no-op, not a compaction"
+        );
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! The platform backend boundary.
 //!
-//! A backend only knows how to observe and inject input. Consent, frame
+//! A backend only knows how to observe and inject input. Frame
 //! bookkeeping, pause/stop and overlay state live in [`crate::runtime`] so all
 //! platforms share the same safety behavior.
 

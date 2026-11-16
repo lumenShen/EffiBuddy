@@ -33,14 +33,12 @@ pub struct AppConfig {
     /// explicitly, so legacy `auto_approve_tools` configs still migrate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_permission_mode: Option<PermissionMode>,
-    /// Whether the model may read the screen and simulate keyboard/mouse.
-    /// `session` asks once per conversation; `always` permits new
-    /// conversations up front; `off` hides the computer tool entirely.
+    /// Whether the `computer` tool is registered at all. Approval is decided by
+    /// the session permission mode, not by a per-session consent card.
     #[serde(default)]
     pub computer_use_mode: ComputerUseMode,
-    /// Whether the model may drive a Chromium browser over CDP. `session`
-    /// asks once per conversation; `always` permits new conversations up
-    /// front; `off` hides the browser tool entirely.
+    /// Whether the `browser` tool is registered at all. Approval is decided by
+    /// the session permission mode, not by a per-session consent card.
     #[serde(default)]
     pub browser_use_mode: BrowserUseMode,
     /// Most recently used command palette item ids (commands and sessions) in
@@ -152,8 +150,8 @@ impl Default for AppConfig {
             use_demo: false,
             auto_approve_tools: false,
             default_permission_mode: None,
-            computer_use_mode: ComputerUseMode::Session,
-            browser_use_mode: BrowserUseMode::Session,
+            computer_use_mode: ComputerUseMode::On,
+            browser_use_mode: BrowserUseMode::On,
             palette_recent: Vec::new(),
             theme: default_theme(),
             workspace: None,
@@ -496,20 +494,32 @@ mod tests {
     }
 
     #[test]
-    fn computer_use_mode_defaults_to_session_and_roundtrips() {
+    fn device_use_modes_default_to_on_and_accept_legacy_values() {
         let config = AppConfig::default();
-        assert_eq!(config.computer_use_mode, ComputerUseMode::Session);
+        assert_eq!(config.computer_use_mode, ComputerUseMode::On);
+        assert_eq!(config.browser_use_mode, BrowserUseMode::On);
 
         let mut json = serde_json::to_value(&config).unwrap();
-        assert_eq!(json["computer_use_mode"], "session");
-        json["computer_use_mode"] = serde_json::json!("always");
-        let parsed: AppConfig = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.computer_use_mode, ComputerUseMode::Always);
+        assert_eq!(json["computer_use_mode"], "on");
+        assert_eq!(json["browser_use_mode"], "on");
 
-        // Old config files without the key fall back to Session.
+        // Configs written before device tools joined the permission matrix used
+        // `session` / `always`; both mean "registered" now.
+        for legacy in ["session", "always"] {
+            json["computer_use_mode"] = serde_json::json!(legacy);
+            json["browser_use_mode"] = serde_json::json!(legacy);
+            let parsed: AppConfig = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(parsed.computer_use_mode, ComputerUseMode::On);
+            assert_eq!(parsed.browser_use_mode, BrowserUseMode::On);
+        }
+        json["computer_use_mode"] = serde_json::json!("off");
+        let parsed: AppConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.computer_use_mode, ComputerUseMode::Off);
+
+        // Old config files without the key fall back to "on".
         let parsed: AppConfig =
             serde_json::from_value(serde_json::json!({"theme": "dark"})).unwrap();
-        assert_eq!(parsed.computer_use_mode, ComputerUseMode::Session);
+        assert_eq!(parsed.computer_use_mode, ComputerUseMode::On);
     }
 
     #[test]

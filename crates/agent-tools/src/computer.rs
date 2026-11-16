@@ -12,7 +12,7 @@ use base64::Engine;
 use serde_json::{Value, json};
 
 use effibuddy_agent_core::{
-    ApprovalPolicy, ImageAttachment, Tool, ToolContext, ToolError, ToolOutput,
+    ApprovalPolicy, ImageAttachment, Tool, ToolContext, ToolError, ToolOutput, ToolRisk,
 };
 use effibuddy_computer::{
     CaptureTarget, ClickRequest, ComputerError, ComputerRuntime, DragRequest, InputStrategy,
@@ -126,11 +126,21 @@ impl Tool for ComputerTool {
     }
 
     fn approval(&self) -> ApprovalPolicy {
-        // The app's ComputerApprovalGate turns this into either a real consent
-        // card (Session mode) or an automatic approval (Always mode). Keeping
-        // the policy at Ask means FullAccess cannot silently skip the consent
-        // gate.
+        // Ask so the session permission mode decides: the full-access fast path
+        // approves locally (no card), and every other mode can surface a normal
+        // approval card. `risk` below keeps plan mode read-only.
         ApprovalPolicy::Ask
+    }
+
+    fn risk(&self, arguments: &Value) -> ToolRisk {
+        // Desktop observation never changes state; every other action drives the
+        // mouse or the keyboard, including unknown ones (fail closed).
+        match arguments.get("action").and_then(Value::as_str) {
+            Some(
+                "status" | "list_displays" | "list_windows" | "list_desktops" | "screenshot",
+            ) => ToolRisk::ReadOnly,
+            _ => ToolRisk::Mutating,
+        }
     }
 
     fn summarize(&self, arguments: &Value) -> String {
@@ -554,8 +564,7 @@ mod tests {
     fn tool() -> (ComputerTool, Arc<FakeBackend>) {
         let backend = Arc::new(FakeBackend::new());
         let runtime = Arc::new(ComputerRuntime::new(backend.clone()));
-        runtime.grant("s");
-        (ComputerTool::new(runtime, true), backend)
+                (ComputerTool::new(runtime, true), backend)
     }
 
     fn context() -> ToolContext {
@@ -591,8 +600,7 @@ mod tests {
     async fn non_vision_screenshot_is_saved_to_disk() {
         let backend = Arc::new(FakeBackend::new());
         let runtime = Arc::new(ComputerRuntime::new(backend));
-        runtime.grant("s");
-        let tool = ComputerTool::new(runtime, false);
+                let tool = ComputerTool::new(runtime, false);
         let output = tool
             .execute(context(), json!({"action": "screenshot"}))
             .await

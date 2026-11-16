@@ -27,6 +27,14 @@ pub struct ChatMessage {
     /// message carrying every image from that tool step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageAttachment>,
+    /// The reasoning trace the provider returned alongside this assistant
+    /// message. DeepSeek's thinking mode treats it as protocol state: a
+    /// request that carries `tools` is rejected unless every historical
+    /// assistant message echoes its trace back, and an empty trace must still
+    /// be present as an empty string. `None` means the provider never supplied
+    /// one; adapters that do not speak this protocol ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -37,6 +45,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -47,6 +56,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -57,6 +67,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: None,
             images,
+            reasoning: None,
         }
     }
 
@@ -67,7 +78,16 @@ impl ChatMessage {
             tool_calls,
             tool_call_id: None,
             images: Vec::new(),
+            reasoning: None,
         }
+    }
+
+    /// Attach the reasoning trace returned with an assistant message. The
+    /// trace may be empty; `Some("")` is meaningful because DeepSeek requires
+    /// the field to be present even when the model produced no reasoning.
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
     }
 
     pub fn tool(call_id: impl Into<String>, content: impl Into<String>) -> Self {
@@ -77,6 +97,7 @@ impl ChatMessage {
             tool_calls: Vec::new(),
             tool_call_id: Some(call_id.into()),
             images: Vec::new(),
+            reasoning: None,
         }
     }
 }

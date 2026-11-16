@@ -3,18 +3,21 @@
 use serde::{Deserialize, Serialize};
 
 /// User preference for letting the model read the screen and simulate input.
+///
+/// This is a *capability* switch, not an approval policy: `Off` keeps the tool
+/// out of the registry, and once it is registered the session's
+/// `PermissionMode` decides whether a call is approved. The old per-session
+/// consent state is gone, so FullAccess reaches the whole agent tree instead of
+/// stopping at a one-time card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputerUseMode {
     /// Computer tools are not registered at all.
     Off,
-    /// One consent prompt per conversation; after approval the whole session
-    /// can use the computer without another card.
+    /// Computer tools are registered and gated by the permission mode.
     #[default]
-    Session,
-    /// Every new conversation is allowed up front. The floating control bar is
-    /// still shown so the user can take over or stop at any time.
-    Always,
+    #[serde(alias = "session", alias = "always")]
+    On,
 }
 
 impl ComputerUseMode {
@@ -235,8 +238,6 @@ pub struct PointerTarget {
 pub enum ComputerError {
     #[error("computer use is disabled in settings")]
     Disabled,
-    #[error("this conversation has not been allowed to control the computer yet")]
-    ConsentRequired,
     #[error("the user stopped computer control")]
     Stopped,
     #[error("computer control was cancelled")]
@@ -262,7 +263,6 @@ impl ComputerError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::Disabled => "COMPUTER_DISABLED",
-            Self::ConsentRequired => "CONSENT_REQUIRED",
             Self::Stopped => "CONTROL_STOPPED",
             Self::Cancelled => "CANCELLED",
             Self::Unsupported(_) => "UNSUPPORTED",

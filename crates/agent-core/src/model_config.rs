@@ -801,6 +801,7 @@ impl ResolvedModel {
                     context_window: self.context_window(),
                     extra_headers,
                     include_usage: true,
+                    echo_reasoning_content: self.echoes_reasoning_content(),
                     request_timeout: std::time::Duration::from_secs(300),
                     connect_timeout: std::time::Duration::from_secs(20),
                 };
@@ -830,6 +831,19 @@ impl ResolvedModel {
                 Ok(Arc::new(OpenAiResponsesProvider::new(config)?))
             }
         }
+    }
+
+    /// DeepSeek's thinking mode treats the reasoning trace as protocol state:
+    /// a request that carries `tools` is rejected with HTTP 400 unless every
+    /// assistant turn in the history echoes its `reasoning_content`. Other
+    /// OpenAI-compatible endpoints may not know the field, so it is only
+    /// enabled for endpoints that speak DeepSeek's dialect.
+    fn echoes_reasoning_content(&self) -> bool {
+        let base = self.provider.base_url.trim().to_ascii_lowercase();
+        let model = self.model.id.to_ascii_lowercase();
+        self.provider.id == DEFAULT_PROVIDER_ID
+            || base.contains("deepseek")
+            || model.contains("deepseek")
     }
 
     /// Configured provider headers plus the ones a gateway expects. A
@@ -1538,6 +1552,22 @@ mod tests {
         let selection = file.default_selection.expect("default selection");
         assert_eq!(selection.provider_id, DEFAULT_PROVIDER_ID);
         assert_eq!(selection.model_id, DEFAULT_MODEL_ID);
+    }
+
+    #[test]
+    fn reasoning_content_echo_is_limited_to_deepseek_endpoints() {
+        let file = ModelConfigFile::with_builtins();
+        let deepseek = file.resolve(Some("deepseek"), Some("deepseek-flash"), None);
+        assert!(deepseek.echoes_reasoning_content());
+
+        // Gateways that serve a DeepSeek model need the same dialect.
+        let gateway = file.resolve(Some("opencode-go"), Some("deepseek-v4.1-flash"), None);
+        assert!(gateway.echoes_reasoning_content());
+        let gateway_other = file.resolve(Some("opencode-go"), Some("kimi-k3.1-pro"), None);
+        assert!(!gateway_other.echoes_reasoning_content());
+
+        let openai = file.resolve(Some("openai"), Some("gpt-5.1"), None);
+        assert!(!openai.echoes_reasoning_content());
     }
 
     #[test]

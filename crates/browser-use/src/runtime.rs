@@ -1,4 +1,4 @@
-//! Per-session consent, snapshot bookkeeping, policy and action orchestration.
+//! Snapshot bookkeeping, policy, pause/stop and action orchestration.
 //!
 //! The backend is stateless with respect to the agent. Every decision about who
 //! may drive the browser, which snapshot a `ref` belongs to, whether a URL is
@@ -54,7 +54,6 @@ pub enum OverlayEventKind {
 pub type ConsoleQuery = JournalQuery;
 
 struct SessionRuntime {
-    granted: bool,
     paused: bool,
     stopped: bool,
     notify: Arc<Notify>,
@@ -68,9 +67,8 @@ struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    fn new(granted: bool) -> Self {
+    fn new() -> Self {
         Self {
-            granted,
             paused: false,
             stopped: false,
             notify: Arc::new(Notify::new()),
@@ -217,32 +215,8 @@ impl BrowserRuntime {
         self.backend.clone()
     }
 
-    pub fn is_granted(&self, session_id: &str) -> bool {
-        self.sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(session_id)
-            .map(|session| session.granted && !session.stopped)
-            .unwrap_or(false)
-    }
-
-    /// Grant browser control for one conversation (called by the approval gate
-    /// after the user consents).
-    pub fn grant(&self, session_id: &str) {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session = sessions
-            .entry(session_id.to_string())
-            .or_insert_with(|| SessionRuntime::new(false));
-        session.granted = true;
-        session.stopped = false;
-        session.paused = false;
-        session.notify.notify_waiters();
-    }
-
-    /// Revoke control and release anything the session was holding.
+    /// Release anything the session was holding and stop the drive. Approval
+    /// lives in the tool permission system, so nothing is revoked here.
     pub fn stop(&self, session_id: &str) {
         {
             let mut sessions = self
@@ -251,7 +225,6 @@ impl BrowserRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(session) = sessions.get_mut(session_id) {
                 session.stopped = true;
-                session.granted = false;
                 session.paused = false;
                 session.snapshots.clear();
                 session.frames.clear();
@@ -311,30 +284,27 @@ impl BrowserRuntime {
     }
 
     pub async fn status(&self, session_id: &str) -> Value {
-        let (granted, stopped, paused, snapshot, previous_url) = {
+        let (stopped, paused, snapshot, previous_url) = {
             let sessions = self
                 .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match sessions.get(session_id) {
                 Some(session) => (
-                    session.granted,
                     session.stopped,
                     session.paused,
                     session.snapshots.back().cloned(),
                     session.last_url.clone(),
                 ),
-                None => (false, false, false, None, String::new()),
+                None => (false, false, None, String::new()),
             }
         };
         let info = self.backend.info();
         let mut value = json!({
             "mode": match self.mode() {
                 BrowserUseMode::Off => "off",
-                BrowserUseMode::Session => "session",
-                BrowserUseMode::Always => "always",
+                BrowserUseMode::On => "on",
             },
-            "granted": granted,
             "stopped": stopped,
             "paused": paused,
             "backend": info,
@@ -374,12 +344,9 @@ impl BrowserRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let session = sessions
                 .entry(session_id.to_string())
-                .or_insert_with(|| SessionRuntime::new(false));
+                .or_insert_with(SessionRuntime::new);
             if session.stopped {
                 return Err(BrowserError::Stopped);
-            }
-            if !session.granted {
-                return Err(BrowserError::ConsentRequired);
             }
         }
 
@@ -392,7 +359,7 @@ impl BrowserRuntime {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 match sessions.get(session_id) {
                     Some(session) => (session.paused, session.notify.clone(), session.stopped),
-                    None => return Err(BrowserError::ConsentRequired),
+                    None => return Err(BrowserError::Stopped),
                 }
             };
             if stopped {
@@ -603,7 +570,7 @@ impl BrowserRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let session = sessions
                 .entry(session_id.to_string())
-                .or_insert_with(|| SessionRuntime::new(true));
+                .or_insert_with(SessionRuntime::new);
             session.record_snapshot(snapshot.clone())
         };
         snapshot.id = id;
@@ -623,7 +590,7 @@ impl BrowserRuntime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let session = sessions
             .get(session_id)
-            .ok_or(BrowserError::ConsentRequired)?;
+            .ok_or_else(|| BrowserError::Invalid("browser session is gone".to_string()))?;
         let snapshot = session.snapshot(snapshot_id)?;
         if snapshot.node(r#ref).is_none() {
             return Err(BrowserError::NotFound(format!(
@@ -681,7 +648,7 @@ impl BrowserRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let session = sessions
                 .get_mut(session_id)
-                .ok_or(BrowserError::ConsentRequired)?;
+                .ok_or_else(|| BrowserError::Invalid("browser session is gone".to_string()))?;
             // Resolve to CSS pixels using the same raster the model looked at.
             let (scale_x, scale_y, width, height) = {
                 let frame = session.frame(frame_id)?;
@@ -879,7 +846,7 @@ impl BrowserRuntime {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let session = sessions
                 .entry(session_id.to_string())
-                .or_insert_with(|| SessionRuntime::new(true));
+                .or_insert_with(SessionRuntime::new);
             session.record_frame(capture.frame.clone()).id
         };
         capture.frame.id = id;
@@ -1207,7 +1174,7 @@ mod tests {
 
     #[test]
     fn snapshot_registry_fails_closed_after_eviction() {
-        let mut session = SessionRuntime::new(true);
+        let mut session = SessionRuntime::new();
         for index in 0..(MAX_SNAPSHOTS + 1) {
             session.record_snapshot(Snapshot {
                 id: format!("n{index}"),
@@ -1230,7 +1197,7 @@ mod tests {
 
     #[test]
     fn frame_registry_requires_a_screenshot_first() {
-        let session = SessionRuntime::new(true);
+        let session = SessionRuntime::new();
         assert!(matches!(
             session.frame(None),
             Err(BrowserError::StaleFrame(_))

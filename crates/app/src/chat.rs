@@ -61,6 +61,19 @@ const ITEM_GAP: f32 = 40.0;
 /// chunks), matching the inter-block spacing inside a single document.
 const CHUNK_GAP: f32 = 9.0;
 const LIST_OVERDRAW: f32 = 560.0;
+/// First-frame height estimate for a virtual row (message block / markdown
+/// chunk) that has never been painted. Only affects scroll geometry before
+/// the first paint of each row; rows are re-measured as they render.
+pub(crate) const ESTIMATED_ROW_HEIGHT: f32 = 96.0;
+/// Fraction of the remaining distance a pinned transcript closes per frame when
+/// the tail grows by more than one smooth step (see `ChatList::follow_bottom`).
+const FOLLOW_FRACTION: f32 = 0.5;
+/// Largest single-frame follow step, in px. Bounds the speed so a big jump
+/// (a long block painted for the first time) slides instead of teleporting.
+const FOLLOW_MAX_STEP: f32 = 400.0;
+/// Gaps smaller than this are closed immediately, so routine streaming keeps
+/// the newest line glued to the bottom edge.
+const FOLLOW_SNAP_EPSILON: f32 = 48.0;
 const ENTER_ANIMATION: Duration = Duration::from_millis(260);
 const ENTER_WINDOW: Duration = Duration::from_millis(320);
 /// Assistant bodies larger than this are split into per-chunk virtual items.
@@ -177,6 +190,7 @@ pub(crate) struct TextChunk {
 /// rebuild; the previews are flattened and truncated at build time so a frame
 /// only clones ref-counted strings. Clicking a mark jumps straight to the
 /// stored slot index — the rail never searches the transcript.
+#[derive(Clone)]
 pub(crate) struct PromptMark {
     /// User message id; also keys the jump-flash animation.
     pub id: SharedString,
@@ -188,6 +202,11 @@ pub(crate) struct PromptMark {
     pub assistant_placeholder: bool,
     /// Newest query of a live run.
     pub running: bool,
+    /// Fingerprint of the query and every reply body that feeds the two
+    /// previews. An unchanged fingerprint lets a rebuild reuse the previous
+    /// mark verbatim instead of re-flattening every body it spans — on a long
+    /// transcript the rail then costs O(queries), not O(bytes).
+    pub fingerprint: u64,
 }
 
 /// Row footprint of one mark in the rail, in px. The rail is a compact index,
@@ -454,6 +473,8 @@ pub(crate) struct ChatList {
     glide: ScrollGlide,
     /// Guards against scheduling more than one glide frame at a time.
     pub glide_frame_scheduled: bool,
+    /// Guards against scheduling more than one smooth-follow frame at a time.
+    pub follow_frame_scheduled: bool,
     /// Turn 展开时刻；展开窗口内的新挂载内容做 stagger 渐显。
     turn_expand_at: HashMap<String, Instant>,
     /// 已经播过自动展开渐显的 turn。`turn_expand_at` 会按窗口过期清理，
@@ -475,8 +496,15 @@ pub(crate) struct ChatList {
 
 impl ChatList {
     pub fn new() -> Self {
+        let list_state = ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW));
+        // A transcript's rows are message blocks: user bubbles, tool rows,
+        // markdown chunks. A cold open resets the list before anything has been
+        // painted, so without this estimate every row would count as zero
+        // height and the scroll range would collapse to a single viewport
+        // (the wheel then jumps straight to the top of the history).
+        list_state.set_estimated_item_height(px(ESTIMATED_ROW_HEIGHT));
         Self {
-            list_state: ListState::new(0, ListAlignment::Top, px(LIST_OVERDRAW)),
+            list_state,
             items: Rc::new(Vec::new()),
             slots: Rc::new(Vec::new()),
             slot_keys: Rc::new(Vec::new()),
@@ -497,6 +525,7 @@ impl ChatList {
             reveal_frame_scheduled: false,
             glide: ScrollGlide::new(),
             glide_frame_scheduled: false,
+            follow_frame_scheduled: false,
             turn_expand_at: HashMap::new(),
             revealed_turns: HashSet::new(),
             turn_block_heights: Rc::new(RefCell::new(HashMap::new())),
@@ -588,6 +617,11 @@ impl ChatList {
     /// Rebuild the item snapshot from the session. Only invoked when a
     /// structural event happened, never on token deltas.
     pub fn rebuild(&mut self, session: &SessionState, run: &RunSnapshot) {
+        let trace = std::env::var_os("EFFIBUDDY_CHAT_TRACE").is_some();
+        // 分段计时（只在 `EFFIBUDDY_CHAT_TRACE=1` 时打印）：几次 `Instant::now()`
+        // 相对于整个重建可以忽略，所以无条件记账、按需输出。
+        let mut marks: Vec<(&'static str, f64)> = Vec::new();
+        let mut t0 = Instant::now();
         self.workspace = session.cwd.clone();
         let now = Instant::now();
         let old_items = self.items.clone();
@@ -595,7 +629,11 @@ impl ChatList {
 
         // Reuse tool result payloads that did not change; transcripts can hold
         // megabyte-sized observations and this runs on every tool boundary.
-        let mut results: ToolResults = HashMap::new();
+        // The comparison deliberately stays cheap (shape, not bytes): results
+        // are write-once in practice, and `message_signature` already keys on
+        // the same fields, so a byte-wise compare here would only add cost
+        // without catching anything the signature misses.
+        let mut results: ToolResults = HashMap::with_capacity(old_results.len());
         for message in &session.messages {
             for block in &message.blocks {
                 if let ContentBlock::ToolResult { result } = block {
@@ -612,6 +650,10 @@ impl ChatList {
         }
 
         let mut items: Vec<Rc<ChatItem>> = Vec::with_capacity(session.messages.len() + 3);
+        if trace {
+            marks.push(("results", elapsed_ms(t0)));
+            t0 = Instant::now();
+        }
         // Reuse lookups by id: with turn merging the item list no longer maps
         // 1:1 onto messages, so positional reuse would misfire after a merge.
         let old_by_id: HashMap<&str, &Rc<ChatItem>> = old_items
@@ -633,18 +675,29 @@ impl ChatList {
                 _ => {}
             }
         }
+        if trace {
+            marks.push(("index", elapsed_ms(t0)));
+            t0 = Instant::now();
+        }
 
         // A run of consecutive assistant messages (one per harness step) is
         // one turn; flush it whenever a different kind of message shows up.
         let mut group: Vec<(&Message, u64, Rc<AssistantItem>)> = Vec::new();
+        let mut sig_ms = 0.0;
         for message in session.messages.iter() {
             if message.role == Role::Tool {
                 continue;
             }
             let duration = self.durations.get(&message.id).copied();
+            let sig_started = Instant::now();
             let signature = message_signature(message, &results, duration);
+            sig_ms += elapsed_ms(sig_started);
             if message.role == Role::Assistant {
                 let assistant = match old_members.get(message.id.as_str()) {
+                    // The revision is bumped by every mutator and the signature
+                    // folds in the tool results / duration, so a match means the
+                    // snapshot (joined text, source key, chunk table) is still
+                    // valid and can be reused as-is.
                     Some((existing, old_signature)) if *old_signature == signature => {
                         existing.clone()
                     }
@@ -776,6 +829,11 @@ impl ChatList {
         for item in &items {
             next_entered.insert(item.id.clone(), item.entered_at);
         }
+        if trace {
+            marks.push(("items", elapsed_ms(t0) - sig_ms));
+            marks.push(("signatures", sig_ms));
+            t0 = Instant::now();
+        }
         // 已播过渐显的记录只跟着现存 turn 走：编辑/撤销把 turn 从尾部截掉后
         // 不必再为它保留记录，长期会话也不会无限增长。
         let turn_ids: HashSet<&str> = items
@@ -786,7 +844,15 @@ impl ChatList {
         self.revealed_turns
             .retain(|id| turn_ids.contains(id.as_str()));
 
-        self.prompt_marks = Rc::new(build_prompt_marks(&items, run.running));
+        self.prompt_marks = Rc::new(build_prompt_marks(
+            &items,
+            run.running,
+            self.prompt_marks.as_slice(),
+        ));
+        if trace {
+            marks.push(("prompt_marks", elapsed_ms(t0)));
+            t0 = Instant::now();
+        }
         self.items = Rc::new(items);
         self.results = Rc::new(results);
         self.entered = next_entered;
@@ -794,6 +860,19 @@ impl ChatList {
         // the live streaming chunk table and preserves measured heights.
         if self.pinned {
             self.scroll_to_bottom();
+        }
+        if trace {
+            marks.push(("publish", elapsed_ms(t0)));
+            let total: f64 = marks.iter().map(|(_, ms)| *ms).sum();
+            let detail: Vec<String> = marks
+                .iter()
+                .map(|(label, ms)| format!("{label} {ms:.2}"))
+                .collect();
+            eprintln!(
+                "[chat-trace] rebuild {total:.2}ms ({} msgs) | {}",
+                session.messages.len(),
+                detail.join(" · ")
+            );
         }
     }
 
@@ -956,6 +1035,13 @@ impl ChatList {
         let new_len = new_slots.len();
         if self.first_sync {
             self.list_state.reset(new_len);
+            // `reset` clears the logical scroll top, so a transcript that was
+            // following the tail would land on row 0 — a cold open of a long
+            // session would show its opening instead of the newest messages.
+            // Re-arm the tail chase now that the row count is known.
+            if self.pinned {
+                self.scroll_to_bottom();
+            }
         } else {
             let prefix = self
                 .slot_keys
@@ -1196,8 +1282,50 @@ impl ChatList {
             }
         }
         if self.pinned {
-            self.scroll_to_bottom();
+            self.follow_bottom();
         }
+    }
+
+    /// Keep a pinned transcript at the bottom.
+    ///
+    /// Contrary to a hard `scroll_to(item_count)` this eases the last stretch:
+    /// when the tail grows by a viewport or more in one frame (a big delta, a
+    /// tool result, the first paint of a long block) the viewport is moved by
+    /// at most [`FOLLOW_MAX_STEP`] toward the new bottom and the rest is left
+    /// for the following frames. The result reads as a smooth follow instead of
+    /// a jump, and small growth (normal streaming) is still applied in the same
+    /// frame so the typing indicator never leaves the bottom edge.
+    fn follow_bottom(&mut self) {
+        let max = f32::from(self.list_state.max_offset_for_scrollbar().height);
+        let offset = -f32::from(self.list_state.scroll_px_offset_for_scrollbar().y);
+        if offset > max {
+            // A previous `scroll_to(item_count)` parks the anchor *past* the
+            // last row; layout clamps it back to the bottom every frame, so the
+            // viewport looks right but the anchor is not a real row, and the
+            // next growth is applied all at once. Normalising to a real anchor
+            // at exactly the bottom is visually identical (the clamp already
+            // put it there) and lets the follow ease from a stable position.
+            self.list_state.scroll_by(px(max - offset));
+            return;
+        }
+        let remaining = max - offset;
+        if remaining <= 0.0 {
+            // Already at the end, or the geometry shrank under us.
+            self.list_state.scroll_by(px(max - offset));
+            return;
+        }
+        // Close at most a fixed fraction of the gap per frame, and never more
+        // than one viewport: a huge jump (long block first painted, a tool
+        // result, a session switch) then reads as a fast but smooth slide,
+        // while routine streaming growth (a few pixels) is fully applied in the
+        // same frame so the last line never drifts below the bottom edge.
+        let step = (remaining * FOLLOW_FRACTION).clamp(0.0, FOLLOW_MAX_STEP);
+        if remaining - step <= FOLLOW_SNAP_EPSILON {
+            self.list_state.scroll_by(px(remaining));
+            return;
+        }
+        self.list_state.scroll_by(px(step));
+        self.follow_frame_scheduled = true;
     }
 
     pub fn mark_scrolled(&mut self) {
@@ -1205,6 +1333,21 @@ impl ChatList {
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        // Prefer a pixel-exact move to the end over parking the anchor past the
+        // last row. Both look identical, but an anchor past the end is only
+        // clamped into place during layout, so the list has no real scroll
+        // position to ease from and the next growth is applied in one jump.
+        let max = f32::from(self.list_state.max_offset_for_scrollbar().height);
+        if max > 0.0 {
+            let offset = -f32::from(self.list_state.scroll_px_offset_for_scrollbar().y);
+            let delta = max - offset;
+            if delta.abs() > 0.01 {
+                self.list_state.scroll_by(px(delta));
+            }
+            return;
+        }
+        // Nothing measured yet (cold open): park the anchor past the last row so
+        // the first layout clamps to the tail.
         self.list_state.scroll_to(ListOffset {
             item_ix: self.list_state.item_count(),
             offset_in_item: px(0.0),
@@ -1429,17 +1572,35 @@ fn unresolved_call<'a>(session: &'a SessionState, results: &ToolResults) -> Opti
 }
 
 fn same_result(left: &ToolResult, right: &ToolResult) -> bool {
+    // Byte-comparing every observation on every rebuild is O(transcript) and
+    // measurable on a long session (tens of KB per result × thousands of
+    // results). Length plus the cheap discriminators is enough: a tool result
+    // is written once when the tool finishes and never edited in place, and
+    // `message_signature` keys on the same triple, so a false "reuse" here
+    // cannot hide a change the signature would have noticed.
     left.call_id == right.call_id
         && left.is_error == right.is_error
         && left.duration_ms == right.duration_ms
-        && left.content == right.content
+        && left.content.len() == right.content.len()
+        && left.images.len() == right.images.len()
 }
 
 /// One rail mark per real user query, in transcript order. The reply preview
 /// for a query spans every assistant message until the next query, so a
 /// multi-step turn shows the same text the user remembers answering.
-fn build_prompt_marks(items: &[Rc<ChatItem>], running: bool) -> Vec<PromptMark> {
-    let mut marks = Vec::new();
+fn build_prompt_marks(
+    items: &[Rc<ChatItem>],
+    running: bool,
+    previous: &[PromptMark],
+) -> Vec<PromptMark> {
+    // Marks are keyed by the user message id: a rebuild that only appended a
+    // reply reuses every unchanged mark instead of re-flattening its bodies.
+    let old_marks: HashMap<&str, &PromptMark> = previous
+        .iter()
+        .map(|mark| (mark.id.as_ref(), mark))
+        .collect();
+
+    let mut marks = Vec::with_capacity(previous.len() + 2);
     let mut index = 0;
     while index < items.len() {
         let ChatItemKind::User {
@@ -1449,6 +1610,50 @@ fn build_prompt_marks(items: &[Rc<ChatItem>], running: bool) -> Vec<PromptMark> 
             index += 1;
             continue;
         };
+        // Walk to the next query once; each assistant body is visited by
+        // exactly one mark, so building the entire rail stays O(items).
+        //
+        // The fingerprint deliberately keys on revisions and lengths instead of
+        // hashing body text: a rebuild that only touched the tail must not pay
+        // for re-reading every byte of a megabyte transcript.
+        let mut end = index + 1;
+        let mut signature = DefaultHasher::new();
+        text.hash(&mut signature);
+        (items[index].id.as_str(), attachments.len()).hash(&mut signature);
+        while end < items.len() {
+            match &items[end].kind {
+                ChatItemKind::User { .. } | ChatItemKind::AgentMessage { .. } => break,
+                ChatItemKind::Assistant(assistant) => {
+                    assistant.message.revision.hash(&mut signature);
+                    assistant.text.len().hash(&mut signature);
+                }
+                ChatItemKind::Turn(turn) => {
+                    for member in &turn.members {
+                        member.message.revision.hash(&mut signature);
+                        member.text.len().hash(&mut signature);
+                    }
+                }
+                _ => {}
+            }
+            end += 1;
+        }
+        let fingerprint = signature.finish();
+
+        // Unchanged since the last rebuild: reuse the flattened previews
+        // verbatim (the only field that can differ is `running`, set below).
+        if let Some(existing) = old_marks
+            .get(items[index].id.as_str())
+            .filter(|mark| mark.fingerprint == fingerprint)
+        {
+            marks.push(PromptMark {
+                item_ix: index,
+                running: false,
+                ..(**existing).clone()
+            });
+            index = end;
+            continue;
+        }
+
         let mut user_source = text.to_string();
         if user_source.trim().is_empty() && !attachments.is_empty() {
             user_source = format!(
@@ -1467,20 +1672,19 @@ fn build_prompt_marks(items: &[Rc<ChatItem>], running: bool) -> Vec<PromptMark> 
             PROMPT_PREVIEW_PARAGRAPHS,
         );
 
-        // Walk to the next query once; each assistant body is visited by
-        // exactly one mark, so building the entire rail stays O(items).
-        let mut end = index + 1;
+        // Only the first two paragraphs of the first few bodies can survive the
+        // budget, so stop flattening once the preview is known to be full.
         let mut bodies: Vec<&str> = Vec::new();
-        while end < items.len() {
-            match &items[end].kind {
-                ChatItemKind::User { .. } | ChatItemKind::AgentMessage { .. } => break,
+        let mut start = index + 1;
+        while start < end {
+            match &items[start].kind {
                 ChatItemKind::Assistant(assistant) => bodies.push(assistant.text.as_ref()),
                 ChatItemKind::Turn(turn) => {
-                    bodies.extend(turn.members.iter().map(|member| member.text.as_ref()));
+                    bodies.extend(turn.members.iter().map(|member| member.text.as_ref()))
                 }
                 _ => {}
             }
-            end += 1;
+            start += 1;
         }
         let assistant_preview = if bodies.iter().any(|body| !body.trim().is_empty()) {
             preview_text(&bodies, "", PROMPT_PREVIEW_CHARS, PROMPT_PREVIEW_PARAGRAPHS)
@@ -1494,6 +1698,7 @@ fn build_prompt_marks(items: &[Rc<ChatItem>], running: bool) -> Vec<PromptMark> 
             assistant_placeholder: assistant_preview.is_empty(),
             assistant_preview: assistant_preview.into(),
             running: false,
+            fingerprint,
         });
         index = end;
     }
@@ -1691,8 +1896,13 @@ fn message_signature(
     results: &ToolResults,
     reasoning_duration: Option<Duration>,
 ) -> u64 {
+    // The revision alone identifies the message's own content (every mutator
+    // bumps it), but two inputs live outside the message: the tool results its
+    // calls resolve to, and the execution duration the UI prints. Those are
+    // small (a hash lookup per call), while the text is not — hashing the
+    // transcript used to dominate a rebuild of a long session.
     let mut hasher = DefaultHasher::new();
-    message.id.hash(&mut hasher);
+    message.revision.hash(&mut hasher);
     message.interrupted.hash(&mut hasher);
     message.mid_turn.hash(&mut hasher);
     reasoning_duration
@@ -1700,13 +1910,11 @@ fn message_signature(
         .hash(&mut hasher);
     for block in &message.blocks {
         match block {
-            ContentBlock::Text { text } => {
-                0u8.hash(&mut hasher);
-                text.hash(&mut hasher);
-            }
-            ContentBlock::Reasoning { text } => {
-                1u8.hash(&mut hasher);
-                text.hash(&mut hasher);
+            ContentBlock::Text { text } | ContentBlock::Reasoning { text } => {
+                // Cheap staleness guard for a message that was mutated without
+                // going through a `Message` method (a reloaded transcript, or a
+                // caller that reached into `blocks` directly).
+                text.len().hash(&mut hasher);
             }
             ContentBlock::ToolCall { call } => {
                 2u8.hash(&mut hasher);
@@ -1756,6 +1964,11 @@ fn hash_values(values: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Milliseconds elapsed since `started`, for the env-gated rebuild trace.
+fn elapsed_ms(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1000.0
 }
 
 // --- reveal ----------------------------------------------------------------
@@ -5068,6 +5281,63 @@ mod tests {
         // transcript that has nowhere to go.
         chat.wheel(120.0);
         assert!(chat.pinned());
+    }
+
+    /// Rebinding the same text must invalidate the cached assistant snapshot.
+    ///
+    /// The rebuild keys each assistant item on `Message::revision` (plus the
+    /// external tool-result inputs), so a mutator that forgot to bump the
+    /// revision would leave the UI showing stale text forever. This pins the
+    /// contract from both ends: a no-op rebuild reuses the item, and any real
+    /// mutation produces a fresh one.
+    #[test]
+    fn rebuild_reuses_snapshots_until_the_message_changes() {
+        let mut session = SessionState::new(std::env::temp_dir(), "cache");
+        session.push_message(Message::user("第一个问题"));
+        let mut assistant = Message::assistant();
+        assistant.push_reasoning("先想一想");
+        assistant.set_text("第一段答案");
+        session.push_message(assistant);
+        session.push_message(Message::user("第二个问题"));
+
+        let mut chat = ChatList::new();
+        let run = RunSnapshot::default();
+        chat.rebuild(&session, &run);
+        let before = chat.items.len();
+        let snapshot = match &chat.items[1].kind {
+            ChatItemKind::Assistant(item) => item.clone(),
+            _ => panic!("expected an assistant item"),
+        };
+
+        // Nothing changed: the exact same `Rc` snapshot must come back.
+        chat.rebuild(&session, &run);
+        assert_eq!(chat.items.len(), before);
+        let reused = match &chat.items[1].kind {
+            ChatItemKind::Assistant(item) => item.clone(),
+            _ => panic!("expected an assistant item"),
+        };
+        assert!(
+            Rc::ptr_eq(&snapshot, &reused),
+            "an unchanged message was re-derived instead of reused"
+        );
+
+        // A real mutation must produce a new snapshot with the new body.
+        let last = session.messages.len() - 2;
+        session.messages[last].push_text("，补充下一段");
+        chat.rebuild(&session, &run);
+        let updated = match &chat.items[1].kind {
+            ChatItemKind::Assistant(item) => item.clone(),
+            _ => panic!("expected an assistant item"),
+        };
+        assert!(
+            !Rc::ptr_eq(&snapshot, &updated),
+            "the snapshot was reused after its message changed"
+        );
+        assert!(
+            updated.text.ends_with("补充下一段"),
+            "the rebuilt snapshot still shows the old body: {}",
+            updated.text
+        );
     }
 
     /// A finished turn often ends on a tool-only step; the answer text lives in

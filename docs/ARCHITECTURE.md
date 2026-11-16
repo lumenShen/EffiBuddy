@@ -224,7 +224,8 @@ sequenceDiagram
 - 逐块解析 SSE，支持 CRLF、跨块行边界与 `[DONE]`；
 - 累加 tool-call 参数片段，按 index/item 重组，参数非法时保留 `argument_parse_error`；
 - 解析 usage 与 prompt cache 命中；区分可重试错误（超时、连接失败、408/409/425/429/5xx）与永久错误（4xx 其他）；
-- `ChatRequest.reasoning_effort` 只在模型显式配置推理档位时写入。
+- `ChatRequest.reasoning_effort` 只在模型显式配置推理档位时写入；
+- DeepSeek 方言端点的请求一旦携带 `tools`，所有 assistant 历史消息都会回传 `reasoning_content`（模型返回空串时也保留字段）；否则思考模式的工具回合会被 API 以 400 拒绝。其他 OpenAI 兼容端点不发送该字段。
 
 `DemoProvider` 用同一接口模拟一段带 reasoning、工具调用与结果的对话，保证无 Key 时 UI 可完整演示。`ModelConfigStore`（`app/model_config.rs`）负责把注册表持久化到 `providers.json`，首次启动时从旧 `config.json` 的 Base URL / Key / Model 迁移。
 
@@ -233,10 +234,12 @@ sequenceDiagram
 `context.rs` + `harness.rs`，按 ZCode 的链路实现：
 
 - **百分比策略**：触发阈值、保留原文比例、摘要上限都是上下文窗口的百分比（默认 80% / 20% / 10%），在设置 → 上下文中可改；模型窗口换算为 token 预算时还会扣掉输出预留。
+- **保留预算还要按历史自身夹紧**：窗口百分比在大窗口模型上可能远超当前历史（1M 窗口 × 20% = 200k，而历史只有 180k），此时每一轮都落进“保留原文”预算，压缩退化成只折叠开头一轮、用摘要换掉几乎等量的历史。`plan_compaction` 因此把保留预算再夹到可见历史 token 的 3/4，保证至少四分之一的历史落在摘要侧。
+- **收益门槛**：折叠后请求必须比折叠前小「被折叠区域 token 的 1/4」，否则回滚 `compacted_upto`、`cleared_tool_calls` 与旧记录，并把这次压缩当作空操作上报。否则用户会看到“减少 0”，甚至 token 反而变大。
 - **每个模型步都检查**：按 user/assistant 消息切分 round，长工具回合（只有 1 条用户消息、几十轮工具调用）也能压缩；边界永不落在孤立的 tool result 上。
 - **先微压缩**：达到阈值的 90% 时，把较早的读取/搜索/命令输出替换为占位符（transcript 与 UI 保留原文），避免为噪声付摘要成本。
 - **模型摘要**：让当前会话模型生成结构化摘要（`<analysis>` + `<summary>`），请求只带文本、不带工具；失败时回退到本地摘录取并标记 `SummarySource::Heuristic`。
-- **用量校准**：决策取“本地估算（含工具 schema）”与 provider 上报的 `last_prompt_tokens` 的较大值；压缩后把当前足迹改写成压缩后的估算值。
+- **用量校准**：决策取“本地估算（含工具 schema）”与 provider 上报的 `last_prompt_tokens` 的较大值；压缩后把当前足迹改写成压缩后的估算值。记录里的“压缩前 / 压缩后”一律用同一种本地估算，不再拿校准值当分子、估算值当分母，否则正常的压缩也会显示成变大。
 - **反应式兜底**：provider 报 context overflow 时强制压缩并重试一次；连续摘要失败达到上限后只走本地摘录。
 - **手动压缩 `AgentHarness::run_compaction`**：输入框的 `/compact` 命令走同一套链路（微压缩 + 模型摘要），但忽略触发阈值，因此上下文还没接近窗口上限时也能主动腾出空间；不进入 `run_loop`，不发新的模型请求，完成后直接把“折叠 N 条消息、约 X → Y tokens”写进提示行。仅当可见消息不足两轮（`plan_compaction` 返回 `None`）时是空操作。
 - **后台预压缩（试验，默认关）**：达到“预压缩起点”百分比时，用当前历史快照在后台写摘要，主会话的模型请求/工具调用继续跑；到达触发阈值时校验模型、`compacted_upto`、边界消息和快照后增长量（不超过阈值 40%），通过就直接换入，否则丢弃并正常重压。摘要未写完时最多等 15 秒；`HeldCompaction` 只在内存里，重启即丢。
@@ -259,8 +262,8 @@ sequenceDiagram
 
 主会话的审批门是 `ModeApprovalGate`（`agent-core/src/tool.rs`）包装 `BrokerApprovalGate`，`ApprovalGate` trait 与子代理的门不变：
 
-- `ToolClass` 按工具名分类：`read_file` / `list_dir` / `grep` / `todo_write` 只读，`write_file` / `edit_file` 编辑，`shell` / `run_js` / `workflow_run` 命令，其余（`agent`、消息类）归 Other；
-- 四档 `PermissionMode`（`default` / `accept_edits` / `plan` / `full_access`，Shift+Tab 循环）的本地决策：Default 全转发、AcceptEdits 编辑类本地批准、Plan 编辑与命令类本地拒绝且只读类本地放行、FullAccess 全放行；本地决策不触达内层门，也不产生审批卡；
+- `ToolClass` 按工具名分类：`read_file` / `list_dir` / `grep` / `todo_write` 只读，`write_file` / `edit_file` 编辑，`shell` / `run_js` / `workflow_run` 命令，`computer` / `browser` 设备类（由 `Tool::risk` 分只读/改写），其余（`agent`、消息类）归 Other；
+- 四档 `PermissionMode`（`default` / `accept_edits` / `plan` / `full_access`，Shift+Tab 循环）的本地决策：Default 全转发、AcceptEdits 编辑类本地批准、Plan 编辑/命令/改写类设备动作本地拒绝且只读类（含设备观察）本地放行、FullAccess 全放行（含电脑与浏览器）；本地决策不触达内层门，也不产生审批卡；
 - 模式闭包每次审批请求实时读 `SessionState.permission_mode`，运行中 Shift+Tab 对下一次工具调用即生效；
 - Plan 模式下 harness 对**所有**工具询问审批门，不受 `Auto` 策略与「本会话允许」缓存影响：只读工具零打断，编辑与命令被直接拒绝并附「先出计划」文案，`agent` 等其他类仍弹卡由用户决定；
 - 权限模式贯通整棵智能体树：`HarnessConfig.permission_mode` 携带主会话的模式闭包，子代理 harness 也装 `ModeApprovalGate` 包住自己的 `BrokerApprovalGate`（见 §10），因此主会话切到完全访问后子代理的编辑与命令同样不再弹卡，切到计划模式后子代理也会被本地拒绝。
@@ -522,6 +525,8 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 - **事件合帧**：前台泵每被唤醒一次就排空整个事件通道（`try_recv` 循环），一次 entity update 处理全部积压 → 每 token burst 至多一次整窗 notify；打字机 reveal 循环已排帧时 delta 不再额外 notify。面板关闭的子代理 delta 完全静默（transcript 在会话里，打开面板时重建）。
 - **Markdown 两段式渲染**（`ui/markdown.rs`）：pulldown 事件先归约为主题无关的 IR（`BlockIr`），再从 IR 逐帧构建元素。IR 是缓存的载体——完整文档按 (内容哈希, 长度, 主题高亮键) 整篇缓存（历史消息每帧零解析、零哈希，`chat.rs` 在 rebuild 时就算好 `text_key`）；流式文档切成 fence 安全的分块（空白行切分 + 列表/缩进续行回并，分块解析与整篇解析等价，有等价性测试兜底），每帧只重解析正在输入的那一块。
+- **重建按修订号复用**：`Message::revision` 由每个 mutator（`push_text` / `push_tool_call` / `set_reasoning` …）自增，`rebuild` 用它代替「重哈希整篇文本」判定消息是否变化；工具结果、执行时长这些消息外部输入仍参与指纹。提示栏（`prompt_marks`）同样按指纹复用已展平的预览，长会话的重建因此是 O(消息数) 而非 O(字节数)（10k 消息实测 10.4ms → 4.0ms）。
+- **首帧行高估算**：可变高虚拟列表在 `ListState::reset` 后没有任何已测量行，旧实现把估算高度取 0，整条历史只按一屏计算、滚轮一向上就跳回开头。`set_estimated_item_height` 让使用方声明首帧估算（对话流 96px），`splice` 在无邻行可继承时先借已知均值、再退回该估算；`reset` 之后重新贴底，长会话打开即停在最新消息。
 - **每帧分配削减**：助手项在 rebuild 时预计算 `text`/`reasoning`/`char_count`/`text_key`；思考正文只在展开时构建；工具行折叠时不再 `serde_json` 美化参数、不再整段克隆工具输出（MB 级）；工具组折叠时不构建内部行。
 - **侧板**：文件预览与文件树改用 `uniform_list` 虚拟化（预览行在 `open_file` 时一次性切好，树行按需缓存展开态快照）；diff 的解析 + 词级 diff + 折叠按内容哈希缓存，展开 hunk 状态在渲染期应用。
 - **UI 线程无阻塞 I/O**：会话持久化只在前台克隆 + 序列化快照，写盘走串行后台队列（`SessionStore::stage` → `PendingSave`，按发送顺序写保证最后赢）；会话列表扫描在后台线程执行，代际计数防止旧结果覆盖新结果；设置「智能体」页的档案目录扫描在打开期间缓存。
@@ -580,7 +585,7 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 
 - **`/` 菜单**：分组顺序是「命令 · 立即执行」→「技能」→「工具」→「子智能体」。命令（目前只有 `/compact`）选中即执行，不会把 `/compact` 插进输入框；技能插入 `$name` 并把 SKILL.md 作为附件；工具与子智能体只插入令牌作为提示。
 - **命令解析**：`commands::split_command` 只认整条消息的第一个 token，`/compact`、`/COMPACT`、`/compact 继续` 都算命令，`/compactor` 与 `/usr/bin/env` 是普通文本。命令后附带的其他文字会被放回输入框并提示重新发送，绝不静默丢弃。
-- **`/compact` 的行为**：运行中、正在编辑消息、或可见消息不足两轮时只给提示、不动数据；否则后台跑一次忽略阈值的压缩，提示行报告折叠条数与 token 变化，不唤醒模型、不污染队列。
+- **`/compact` 的行为**：运行中、正在编辑消息、或可见消息不足两轮时只给提示、不动数据；否则后台跑一次忽略阈值的压缩，提示行报告折叠条数与 token 变化，不唤醒模型、不污染队列。折叠如果省不下 token（摘要与被替换的历史等量，或保留预算吃掉了可见历史）就整体回滚，提示行明确说“省不下 token，历史保持原样”，不会出现“减少 0”。
 
 ### 自定义输入框
 
@@ -677,20 +682,19 @@ ComputerBackend（x11 / wayland / win32 / fake）
     │  窗口枚举、截图、输入注入、隔离桌面
 ```
 
-`effibuddy-computer` 不依赖 agent-core 或 UI。`computer` 工具只在主代理的 registry 里注册；`SubagentService::child_tools` 明确过滤掉它，所以子代理永远拿不到屏幕/输入权限。
+`effibuddy-computer` 不依赖 agent-core 或 UI。`computer` 工具是**普通工具**：只要能力开关为“开启”，主代理与子代理都注册它（`SubagentService::with_device_tools`），并且都走同一套 `ModeApprovalGate`。
 
-### 授权门
+### 授权
 
-主 harness 使用 app 层的 `ComputerApprovalGate` 包住 `ModeApprovalGate`：
+没有独立的授权层，`computer` 归入工具权限矩阵：
 
-- 非 `computer` 工具原样委托；
-- `Off` → 拒绝；
-- `Always` → 直接批准并写入会话授权；
-- `Session` 且本会话未授权 → **直接调用 BrokerApprovalGate 弹真实卡片**，不经过 ModeApprovalGate，因此 FullAccess 也无法跳过；
-- `ApproveForSession` → 写入 runtime 的会话授权表（跨 turn 有效，切换会话清除）；
-- Plan 模式 → 修改类 action 直接拒绝，只读截图/列表仍可询问。
+- 工具名为 `ToolClass::Device`，风险由 `Tool::risk` 按 action 声明——`screenshot` / `list_*` / `status` 是 `ReadOnly`，其余（含未知动作）是 `Mutating`；
+- `ApprovalPolicy` 固定为 `Ask`，于是 Default / AcceptEdits 会正常弹审批卡（“本会话允许”走 harness 既有的缓存），**FullAccess 在矩阵内本地批准、不弹卡**；
+- Plan 模式只放行只读动作，点击/输入/拖动/桌面切换等直接本地拒绝；
+- 能力开关为“关闭”时根本不注册工具，这属于能力开关而不是第二套权限；
+- runtime 不再维护会话授权表（`granted`），只保留 paused / stopped / 接管等运行状态。
 
-`computer` 的 `ApprovalPolicy` 固定为 `Ask`，这样 harness 一定会咨询上述门。
+`Off` 之外的一切审批都由 `PermissionMode` 表达，主代理与子代理一致。
 
 ## 15.1 Browser Use（浏览器操控）
 
@@ -723,14 +727,14 @@ CdpConnection（protocol）→ WebSocket → Chromium DevTools
 
 ### 授权门
 
-`BrowserApprovalGate` 包住 `ModeApprovalGate`，语义与 computer 一致，另外区分动作等级：
+`browser` 与 `computer` 同为 `ToolClass::Device`，没有独立授权门：
 
-- `snapshot` / `text` / `console` / `network` / `tabs` / `screenshot` / `wait_for`：只读；
+- `snapshot` / `text` / `console` / `network` / `tabs` / `screenshot` / `wait_for` /
+  `status`：`ReadOnly`；
 - `navigate` / `click` / `type` / `hover` / `press_key` / `scroll` / `select` /
-  `set_checked` / 标签页操作：改写类；
-- `eval` / `upload`：特权类（页面域脚本、工作区文件上传）。
+  `set_checked` / 标签页操作 / `eval` / `upload`：`Mutating`。
 
-计划模式下改写类与特权类直接拒绝，只读动作仍可询问。
+计划模式下只读动作本地放行、改写与特权动作本地拒绝；其余模式由 `PermissionMode` 决定是否弹卡，完全访问不再打断。
 
 ### Snapshot 与 frame
 

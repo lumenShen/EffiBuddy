@@ -67,6 +67,13 @@ struct StateInner {
     alignment: ListAlignment,
     overdraw: Pixels,
     reset: bool,
+    /// Height assumed for a row that has never been measured and has no
+    /// measured neighbour to inherit from. A variable-height list starts out
+    /// with every row at this estimate: without it a freshly reset list (a
+    /// cold open, a session switch) reports a total height of zero, so the
+    /// scroll range collapses to one viewport and the viewer lands at the top
+    /// of the history instead of the end it was following.
+    estimated_item_height: Pixels,
     #[allow(clippy::type_complexity)]
     scroll_handler: Option<Box<dyn FnMut(&ListScrollEvent, &mut Window, &mut App)>>,
     scrollbar_drag_start_height: Option<Pixels>,
@@ -217,6 +224,26 @@ struct Count(usize);
 #[derive(Clone, Debug, Default)]
 struct Height(Pixels);
 
+/// Average height the list's rows are currently accounting for, used as the
+/// estimate for rows that have never been measured. Returns zero for a list
+/// without any height information, which keeps a genuinely empty (or fully
+/// reset) list at zero; [`ListState::set_estimated_item_height`] lets the owner
+/// supply the fallback for that case.
+fn average_estimated_height(items: &SumTree<ListItem>) -> Pixels {
+    let summary = items.summary();
+    if summary.count > 0 && summary.height > px(0.) {
+        return summary.height / summary.count as f32;
+    }
+    // Rows below the changed prefix are still known, so a list whose *first*
+    // measured row changed can borrow from them instead of collapsing.
+    let mut tallest = px(0.);
+    let mut cursor = items.cursor::<Count>(());
+    for item in cursor.by_ref() {
+        tallest = tallest.max(item.estimated_height());
+    }
+    tallest
+}
+
 impl ListState {
     /// Construct a new list state, for storage on a view.
     ///
@@ -234,6 +261,7 @@ impl ListState {
             overdraw,
             scroll_handler: None,
             reset: false,
+            estimated_item_height: px(0.),
             scrollbar_drag_start_height: None,
             measuring_behavior: ListMeasuringBehavior::default(),
         })));
@@ -308,6 +336,20 @@ impl ListState {
                 .item()
                 .map(|item| item.estimated_height())
                 .unwrap_or_default();
+        }
+        // A splice that replaces rows without a neighbour to inherit from — a
+        // cold open (`reset`), or the first changed row being row 0 — has no
+        // height information at all. Zero would make the whole list account for
+        // no height, collapsing the scroll range to a single viewport and
+        // snapping the viewer to the top of the history. Borrow the mean of
+        // whatever is already known, then the owner's declared estimate.
+        if fallback_height <= px(0.) {
+            let known = average_estimated_height(&state.items);
+            fallback_height = if known > px(0.) {
+                known
+            } else {
+                state.estimated_item_height
+            };
         }
         let mut replaced_heights = VecDeque::new();
         let mut position = old_items.start().0;
@@ -523,6 +565,36 @@ impl ListState {
         let offset = summary.height + logical_scroll_top.offset_in_item - drag_offset;
 
         Point::new(px(0.), -offset)
+    }
+
+    /// `(index, height, measured)` for every row, for diagnostics and tests
+    /// that need to assert on row heights before they are painted.
+    pub fn debug_rows(&self) -> Vec<(usize, f32, bool)> {
+        let state = self.0.borrow();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut rows = Vec::new();
+        for (index, item) in cursor.by_ref().enumerate() {
+            rows.push((index, f32::from(item.estimated_height()), item.size().is_some()));
+        }
+        rows
+    }
+
+    /// Declare the height to assume for rows that have never been measured.
+    ///
+    /// A variable-height list has no way to know how tall a row will be before
+    /// painting it. It seeds that first estimate from its neighbours, but a
+    /// cold open (`ListState::reset`) has no neighbours: every row would count
+    /// as zero pixels, the whole list would report one viewport of content, and
+    /// the scroll range would be unusable until each row happened to be painted.
+    ///
+    /// Owners that know their row shape (a transcript's message blocks, a file
+    /// list's rows) pass a representative height here so the first frame
+    /// already has a plausible scroll range. Rows are re-measured as they are
+    /// painted, so a poor estimate costs a little scrollbar drift, never
+    /// correctness.
+    pub fn set_estimated_item_height(&self, height: Pixels) {
+        let state = &mut *self.0.borrow_mut();
+        state.estimated_item_height = height.max(px(0.));
     }
 
     /// Return the bounds of the viewport in pixels.

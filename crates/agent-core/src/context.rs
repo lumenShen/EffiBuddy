@@ -39,6 +39,29 @@ const COMPACTABLE_TOOL_NAMES: &[&str] = &[
 /// mutation. Prevents churn when every result is tiny.
 const MIN_TOOL_CLEAR_SAVINGS: usize = 512;
 
+/// Smallest token drop a compaction must produce to be worth keeping, derived
+/// from the size of the region it replaces.
+///
+/// A summary that is nearly as large as the history it removes buys nothing:
+/// it churns `compacted_upto`, pays for a summary request, and reports "减少 0"
+/// (the case a 1M-token window produced when only one leading round was
+/// folded). Requiring a quarter-sized drop keeps the rule scale-free, so it
+/// behaves the same on a 4k test transcript and a 200k real one.
+pub fn required_compaction_savings(summarized_tokens: usize) -> usize {
+    (summarized_tokens / 4).max(1)
+}
+
+/// Largest share of the visible transcript a compaction may keep verbatim,
+/// expressed as `numerator / DENOMINATOR`. The configured keep budget is a
+/// percentage of the model window, which on a 1M-token model (20% = 200k) can
+/// exceed a transcript that is far from full: every round then counted as
+/// "kept", the plan fell back to folding a single leading round, and `/compact`
+/// replaced ~2k tokens of history with a ~700-token summary while reporting
+/// "减少 0". Capping the budget keeps at least a quarter of the transcript on
+/// the summarized side, so the pass always has something worth folding.
+const KEEP_BUDGET_NUMERATOR: usize = 3;
+const KEEP_BUDGET_DENOMINATOR: usize = 4;
+
 pub fn estimate_tokens(text: &str) -> usize {
     let mut ascii = 0usize;
     let mut wide = 0usize;
@@ -299,7 +322,12 @@ pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<C
                 if text.is_empty() && calls.is_empty() {
                     continue;
                 }
-                messages.push(ChatMessage::assistant(text, calls));
+                // Keep the trace on the wire model even when it is empty:
+                // DeepSeek rejects a tool-enabled request whose assistant
+                // turns omit `reasoning_content`. Adapters that do not speak
+                // that protocol simply ignore the field.
+                messages
+                    .push(ChatMessage::assistant(text, calls).with_reasoning(message.reasoning()));
             }
             Role::Tool => {
                 if let Some(result) = message.tool_result() {
@@ -563,6 +591,19 @@ pub fn plan_compaction(session: &SessionState, keep_tokens: usize) -> Option<Com
         return None;
     }
     let cleared: HashSet<String> = session.cleared_tool_calls.iter().cloned().collect();
+
+    // The configured budget is a window percentage, so on a large-window model
+    // it can swallow the entire visible transcript. Clamp it against the
+    // transcript itself: at least a quarter of what the model currently sees
+    // must land on the summarized side, otherwise the pass replaces history
+    // with a summary of comparable size and saves nothing.
+    let visible_tokens: usize = session.messages[start..]
+        .iter()
+        .map(|message| estimate_message_tokens_with_cleared(message, &cleared))
+        .sum();
+    let keep_tokens = keep_tokens
+        .min(visible_tokens * KEEP_BUDGET_NUMERATOR / KEEP_BUDGET_DENOMINATOR)
+        .max(1);
 
     let mut first_kept = rounds.len();
     let mut budget_used = 0usize;
@@ -1040,6 +1081,44 @@ mod tests {
     }
 
     #[test]
+    fn keep_budget_never_swallows_the_whole_visible_transcript() {
+        // The regression behind "压缩后反而变大了": on a 1M-window model the
+        // keep budget is 20% of the window (200k), larger than a transcript
+        // that is nowhere near full. Every round then landed in the keep
+        // budget, the plan fell back to folding the single leading round, and
+        // `/compact` replaced ~2k tokens of history with a ~700-token summary.
+        let session = session_with_tool_rounds(40, "line of output\n");
+        let cleared = HashSet::new();
+        let visible: usize = session
+            .messages
+            .iter()
+            .map(|message| estimate_message_tokens_with_cleared(message, &cleared))
+            .sum();
+
+        // A budget far above the transcript must still fold most of it.
+        let plan = plan_compaction(&session, 200_000).expect("a plan inside budget");
+        assert!(
+            plan.summarized_tokens * 4 >= visible,
+            "at least a quarter of the transcript must be folded, folded {} of {}",
+            plan.summarized_tokens,
+            visible
+        );
+        assert!(
+            plan.kept_tokens * 4 <= visible * 3 + visible / 4,
+            "the verbatim tail must stay under the clamped budget"
+        );
+        assert!(plan.kept_messages > 0, "the newest round stays verbatim");
+    }
+
+    #[test]
+    fn required_savings_scale_with_the_folded_region() {
+        assert_eq!(required_compaction_savings(0), 1);
+        assert_eq!(required_compaction_savings(4), 1);
+        assert_eq!(required_compaction_savings(400), 100);
+        assert_eq!(required_compaction_savings(20_000), 5_000);
+    }
+
+    #[test]
     fn thresholds_are_percentages_of_the_model_window() {
         let config = CompactionConfig::default();
         let thresholds = config.thresholds(128_000, Some(8192));
@@ -1150,6 +1229,24 @@ mod tests {
     fn estimates_wide_characters_conservatively() {
         assert!(estimate_tokens("你好世界") >= 4);
         assert!(estimate_tokens("hello world") >= 2);
+    }
+
+    #[test]
+    fn assistant_reasoning_is_carried_to_the_wire_even_when_empty() {
+        let mut session = SessionState::new(PathBuf::from("."), "test-model");
+        session.push_message(Message::user("hello"));
+        let mut assistant = Message::assistant();
+        assistant.set_reasoning("weigh the options");
+        assistant.set_text("hi");
+        session.push_message(assistant);
+        let mut plain = Message::assistant();
+        plain.set_text("again");
+        session.push_message(plain);
+        let messages = build_chat_messages(&session, "system");
+        assert_eq!(messages[2].reasoning.as_deref(), Some("weigh the options"));
+        // History turns from a non-thinking model still carry the field so a
+        // DeepSeek request with tools does not reject the whole history.
+        assert_eq!(messages[3].reasoning.as_deref(), Some(""));
     }
 
     #[test]

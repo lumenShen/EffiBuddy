@@ -55,7 +55,7 @@ pub enum AppEvent {
         info: AgentMessageDeliveredInfo,
     },
     /// Floating computer-use control bar state. Sent from the tool runtime on
-    /// the same pump as harness events so consent/overlay updates stay ordered
+    /// the same pump as harness events so approval/overlay updates stay ordered
     /// with tool results.
     ComputerOverlay(OverlayEvent),
     /// Update check finished. `Ok(None)` = the repository has no published

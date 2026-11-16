@@ -11,6 +11,10 @@ mod attachments;
 mod browser;
 mod chat;
 mod chat_agent;
+#[cfg(test)]
+mod chat_bench;
+#[cfg(test)]
+mod chat_scroll_tests;
 mod checkpoint;
 mod commands;
 mod composer_menu;
@@ -179,7 +183,7 @@ fn main() {
 /// ```
 ///
 /// On Wayland the first screenshot triggers the desktop portal permission
-/// dialog; this bypasses the agent/consent UI on purpose.
+/// dialog; this bypasses the agent approval UI on purpose.
 fn run_computer_probe() {
     let args: Vec<String> = std::env::args().collect();
     let action = args.get(2).map(String::as_str).unwrap_or("status");

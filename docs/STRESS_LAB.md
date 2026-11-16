@@ -93,6 +93,8 @@ cargo run --release -p effibuddy-stress -- \
 | 子代理转发器**每个结构事件** clone+序列化+保存整个子会话 | 800ms 节流 + 尾随刷新（对齐主会话持久化模式） |
 | 每次 spawn 重扫 profile 目录（真实磁盘） | `refresh_catalog` 2s TTL |
 | 侧栏摘要每次刷新全量解析全部 JSON | `(mtime, size)` 缓存，只解析变更文件 |
+| 消息重建每次重哈希全部文本（`message_signature` / 提示栏预览） | `Message::revision` 自增指纹替代全量哈希；提示栏按指纹复用已展平预览（10k 消息 rebuild 10.4ms → 4.0ms） |
+| 冷启动 `ListState::reset` 后行高估算为 0 → 历史滚不上去 | `set_estimated_item_height` 首帧估算 + `splice` 无邻居时借已知均值/估算；`reset` 后重新贴底 |
 | **子代理审批卡死**：children 的 write_file/edit_file 走 `BrokerApprovalGate`，审批卡片等用户点击 → 子代理挂起 600s（压测中 750/1000 卡死、UI 审批卡片堆积） | 压测子代理设为只读（`read_only: Some(true)`）— 变更类工具被过滤，剩余工具全部 `ApprovalPolicy::Auto`，零审批往返（修复后：取消 750→0、完成 419→1497） |
 
 ## 已验证基准（release，32 核 / 38G）
@@ -106,6 +108,51 @@ cargo run --release -p effibuddy-stress -- \
 | 极限内存（上文） | RSS 3.71G，水位分布精准，零泄漏零失败 |
 
 **隔离验证**：真实会话目录逐次 md5 不变；`/dev/shm/effibuddy-stress-*` 每次退出即清空；仓库零污染。
+
+## 消息流基准（10k 消息滚动）
+
+`crates/app/src/chat_bench.rs`：用**真实 `ChatList`**（虚拟行、分块 markdown、前缀
+splice）在无窗口的 GPUI 测试环境里排版并绘制一份 2500 回合 / 10000 条消息的
+transcript，每回合都是「用户输入 → 思考 + 工具调用 → 工具结果 → 思考 + 正文」。
+
+```bash
+EFFIBUDDY_BENCH_10K=1 cargo test --release -p effibuddy-app --bin effibuddy \
+    chat_bench -- --nocapture
+```
+
+可选：`EFFIBUDDY_BENCH_N`（消息数，默认 10000）、`EFFIBUDDY_BENCH_FRAMES`
+（滚动屏数，默认 600）；`EFFIBUDDY_CHAT_TRACE=1` 打印 `rebuild` 的分段耗时
+（results / index / items / signatures / prompt_marks / publish）。
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 冷启动可滚动范围（20625 行） | **649px**（约一屏，历史滚不上去） | 1.98M px |
+| 冷启动落点 | 第 0 行（会话开头） | 第 822/825 行（最新消息） |
+| 零高估算行 | 809 / 825 | 0 |
+| 追加消息后 `rebuild` | 10.4ms p50（p95 11.9ms） | **3.99ms p50**（p95 4.26ms） |
+| 滚动帧 `prepare_frame` | 0.38ms | 0.38ms（与内容量无关） |
+| 滚动帧 `draw` | 0.51ms | 0.51ms（每屏约 11 行） |
+| 流式帧 `prepare_frame` | 0.45ms | 0.45ms |
+
+> 测试环境用 GPUI 的 `NoopTextSystem`（等宽近似），换行宽度与真实字体有差异，
+> 所以「文字排版」成本偏乐观；结构性成本（重建、槽位计划、markdown 块构建）
+> 与真实运行一致。
+
+### 基准暴露并修掉的缺陷
+
+1. **冷启动后无法回看历史**（用户可见）。`ListState::reset` 之后每一行都没有测量
+   过，旧实现把「无前邻行可继承」的估算高度取 0：整条历史的估算总高只剩一屏，
+   `max_offset` 塌到 649px，滚轮一向上就被夹回会话开头，中间的几千条消息永远
+   滚不到。修复：`ListState::set_estimated_item_height` 由使用方声明首帧估算
+   （对话流 96px），`splice` 在无邻居可继承时先借已知均值、再退回该估算。
+2. **长会话打开后停在开头而不是最新消息**。`reset` 会清空逻辑滚动位置，`rebuild`
+   里的 `scroll_to_bottom` 发生在行数更新之前，于是又被清掉。修复：
+   `prepare_frame` 在 `first_sync` 分支 `reset` 之后重新贴底。
+3. **`rebuild` 每个工具边界都重哈希全部文本**。300 万字符的 transcript 上
+   `message_signature` 单项 3.7ms、`build_prompt_marks` 另有 2.4ms。修复：
+   `Message::revision`（所有 mutator 经 `touch()` 自增）替代全量哈希，外部输入
+   （工具结果、执行时长）仍然参与指纹；前端提示栏改为按指纹复用已展平的预览；
+   工具结果复用比较改为形状（长度）而非逐字节。
 
 ## 呈现节奏（垂直同步）
 

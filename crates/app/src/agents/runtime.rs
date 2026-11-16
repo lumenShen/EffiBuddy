@@ -20,7 +20,9 @@ use effibuddy_agent_core::{
     SubagentReport, SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry,
     extract_json_value, lock_session, new_shared_session, validate_json,
 };
-use effibuddy_agent_tools::builtin_tools_with_roots;
+use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_roots};
+use effibuddy_browser::BrowserRuntime;
+use effibuddy_computer::ComputerRuntime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +69,22 @@ pub struct SubagentService {
     /// governs the whole agent tree instead of leaving children on a bare
     /// broker gate that keeps asking (or keeps denying) in the old mode.
     permission_mode: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+    /// Device tools shared with the main conversation. When present, children
+    /// register `computer` / `browser` exactly like the main agent does and the
+    /// same permission matrix decides every call.
+    devices: Option<DeviceTools>,
+}
+
+/// Handles a child needs to register the device tools. The runtimes are the
+/// main conversation's, so a child's calls reach the same screen and browser
+/// and share the same pause/stop state.
+#[derive(Clone)]
+pub struct DeviceTools {
+    pub computer: Arc<ComputerRuntime>,
+    pub browser: Arc<BrowserRuntime>,
+    /// Whether the owning conversation's model can read screenshots; per-child
+    /// model overrides win over this.
+    pub vision: bool,
 }
 
 /// Minimum spacing between profile-directory scans per service.
@@ -132,7 +150,15 @@ impl SubagentService {
             catalog_refreshed_at,
             models,
             permission_mode,
+            devices: None,
         }
+    }
+
+    /// Let subagents register the same device tools as the main agent. Without
+    /// this they keep a workspace-only tool surface.
+    pub fn with_device_tools(mut self, devices: DeviceTools) -> Self {
+        self.devices = Some(devices);
+        self
     }
 
     /// Main conversation this service belongs to. Runs from other sessions
@@ -299,7 +325,14 @@ impl SubagentService {
         // Persist before announcing so the child always exists on disk.
         let _ = self.store.save(&session);
 
-        let tools = self.child_tools(request, &profile, allow_spawn, read_only)?;
+        // Device tools follow the child's own model: a profile that pins a
+        // non-vision model must not receive screenshots it cannot read.
+        let vision = model_override
+            .as_ref()
+            .map(|resolved| resolved.model.capabilities.vision)
+            .or_else(|| self.devices.as_ref().map(|devices| devices.vision))
+            .unwrap_or(false);
+        let tools = self.child_tools(request, &profile, allow_spawn, read_only, vision)?;
 
         let mut config = self.base_config.clone();
         config.system_prompt_extra.clear();
@@ -345,9 +378,30 @@ impl SubagentService {
         profile: &SubagentProfile,
         allow_spawn: bool,
         read_only: bool,
+        vision: bool,
     ) -> Result<ToolRegistry, ToolError> {
         let mut registry =
             builtin_tools_with_roots(&request.workspace, &request.additional_workspaces)?;
+        // Device tools are ordinary tools: register them for children whenever
+        // the capability is on. `filtered()` below then applies the profile
+        // allow/deny lists and the read-only contract exactly as for files.
+        if let Some(devices) = &self.devices {
+            if devices.computer.mode().is_enabled() {
+                registry.register(ComputerTool::new(devices.computer.clone(), vision));
+            }
+            if devices.browser.mode().is_enabled()
+                && let Ok(sandbox) = Workspace::with_roots(
+                    &request.workspace,
+                    &request.additional_workspaces,
+                )
+            {
+                registry.register(BrowserTool::new(
+                    devices.browser.clone(),
+                    vision,
+                    sandbox,
+                ));
+            }
+        }
         let explicit: Option<HashSet<String>> = request
             .tools
             .clone()
@@ -361,12 +415,6 @@ impl SubagentService {
                 }
             });
         registry = registry.filtered(|tool| {
-            // Computer Use is a main-agent-only capability. Even if a future
-            // change registers it globally, children never inherit screen and
-            // input control.
-            if tool == "computer" {
-                return false;
-            }
             if tool == "agent" || tool == "workflow_run" {
                 return allow_spawn;
             }
@@ -568,6 +616,18 @@ impl SubagentService {
         drop(harness);
         drop(broker);
         drop(child_tx);
+        // A child may have driven the desktop or the browser under this
+        // session id. Release whatever it parked so the next run starts clean
+        // and the main conversation's own state is untouched.
+        if let Some(devices) = &self.devices {
+            let child_session_id = lock_session(&prepared.shared).id.clone();
+            devices
+                .computer
+                .restore_isolation(&child_session_id)
+                .await;
+            devices.computer.forget_session(&child_session_id);
+            devices.browser.forget(&child_session_id);
+        }
         {
             let mut gates = self
                 .gates

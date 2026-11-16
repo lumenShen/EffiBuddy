@@ -16,7 +16,7 @@
 - **完整 agent loop**：流式思考与正文、工具审批、四档权限、上下文压缩、中断与重试；消息编辑/撤销带文件检查点，不需要 Git。
 - **PTC 工具编排**：模型写一段同步 JavaScript，通过 `tools.*` 一次编排多次工具调用，只把聚合结果带回上下文。
 - **子代理与智能体组**：代理可命名、可通信、可派生；DAG 工作流带类型化输入输出，关系图可平移缩放。
-- **Computer Use**：截图、找窗口、模拟键鼠；独立的授权门，顶部悬浮条可随时接管或停止。
+- **Computer Use**：截图、找窗口、模拟键鼠；与其它工具共用权限矩阵，顶部悬浮条可随时接管或停止。
 - **本地优先**：会话、检查点、模型注册表都留在本机；11 家预置供应商、三种流式协议。
 
 ## 快速开始
@@ -115,7 +115,7 @@ cargo run -p effibuddy-app -- --settings                    # 设置 → 通用
 
 `read_file` · `write_file` · `edit_file` · `list_dir` · `grep` · `shell` · `todo_write` · `run_js` · `agent` · `agent_send` · `agent_list` · `workflow_run` · `computer`
 
-文件工具被限制在工作区内；写文件、改文件与 shell 默认需要审批，`computer` 首次使用由独立授权门控制。
+文件工具被限制在工作区内；写文件、改文件、shell、`computer` 与 `browser` 都走同一套权限矩阵：默认询问、计划模式只放行只读动作、完全访问直接放行（主代理与子代理一致）。
 
 ## 工作区结构
 
@@ -124,7 +124,7 @@ crates/
   agent-core/   消息、会话、Provider 抽象、agent loop、子代理、工作流与上下文压缩
   agent-tools/  内置工具、路径沙箱、PTC、代理委派与 workflow_run
   agent-js/     Boa 沙箱与工具桥
-  computer-use/ X11 / Wayland / Windows 后端与授权状态机
+  computer-use/ X11 / Wayland / Windows 后端与暂停/接管状态机
   ui/           设计系统、Markdown、输入框与通用组件
   app/          GPUI 应用壳：聊天流、侧栏、设置、关系图、检查点与持久化
 ```
@@ -154,10 +154,10 @@ cargo build --workspace
 
 - API Key 只存于本地文件或环境变量；设置页不回显明文，仓库不提交 `.env`。
 - 会话与配置只写入本机数据目录，没有遥测或外部上报。
-- 写文件、改文件、shell 与电脑操作默认需要显式批准；审批超时按拒绝处理。
+- 写文件、改文件、shell、电脑操作与浏览器操作默认需要显式批准；审批超时按拒绝处理。
 - Wayland 仅支持全屏读图/输入；macOS 发布包未签名，且暂不支持 Computer Use。
 - 默认 DeepSeek 模型不支持视觉输入，使用 Computer Use 截图前需要切换到支持图片的模型。
-- 项目仍在早期（0.2.6），接口与数据格式可能变化。
+- 项目仍在早期（0.2.7），接口与数据格式可能变化。
 
 ## 许可证
 

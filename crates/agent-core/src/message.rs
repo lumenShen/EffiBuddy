@@ -242,6 +242,27 @@ pub struct Message {
     /// them into `<file>` / `<skill>` blocks and provider image parts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<UserAttachment>,
+    /// Bumped by every content mutation: `push_text`, `push_reasoning`,
+    /// `push_tool_call`, `set_text`, `set_reasoning`, and the flags that change
+    /// how the UI presents the message.
+    ///
+    /// Consumers that derive something expensive from the message (the chat
+    /// list builds a joined text, a markdown source key and a chunk table per
+    /// message) cache it against this number, which turns a rebuild that used
+    /// to re-hash every transcript byte into an integer comparison.
+    ///
+    /// Not persisted: a reloaded session restarts at 0. Consumers must
+    /// therefore treat a revision as meaningful only when comparing against a
+    /// snapshot taken from the *same* in-memory message (the chat list also
+    /// compares block lengths, so a reload cannot produce a false hit).
+    ///
+    /// Note that this counter takes part in the derived `PartialEq`: a message
+    /// deserialized from disk compares unequal to the in-memory original it was
+    /// written from, even though its content is identical. Compare the fields
+    /// you actually care about (`id`, `blocks`, …) rather than whole `Message`
+    /// values across a persistence boundary.
+    #[serde(skip)]
+    pub revision: u64,
 }
 
 /// UI-facing metadata for an inter-agent message. The text itself lives in the
@@ -274,6 +295,7 @@ impl Message {
             agent_message: None,
             mid_turn: false,
             attachments: Vec::new(),
+            revision: 0,
         }
     }
 
@@ -281,6 +303,16 @@ impl Message {
         let mut message = Self::new(Role::User);
         message.push_text(text.into());
         message
+    }
+
+    /// Mark this message's derived snapshot stale.
+    ///
+    /// Every mutator funnels through here so consumers can key an expensive
+    /// derived cache (the chat list's joined text, markdown source key and
+    /// chunk table) on [`Message::revision`] instead of re-hashing the whole
+    /// transcript on every rebuild.
+    pub fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// A user message carrying composer attachments (dropped files, picked
@@ -291,6 +323,7 @@ impl Message {
     ) -> Self {
         let mut message = Self::user(text);
         message.attachments = attachments;
+        message.touch();
         message
     }
 
@@ -300,6 +333,7 @@ impl Message {
     pub fn synthetic_user(text: impl Into<String>) -> Self {
         let mut message = Self::user(text);
         message.synthetic = true;
+        message.touch();
         message
     }
 
@@ -309,6 +343,7 @@ impl Message {
     pub fn mid_turn_user(text: impl Into<String>) -> Self {
         let mut message = Self::user(text);
         message.mid_turn = true;
+        message.touch();
         message
     }
 
@@ -320,6 +355,7 @@ impl Message {
     ) -> Self {
         let mut message = Self::user_with_attachments(text, attachments);
         message.mid_turn = true;
+        message.touch();
         message
     }
 
@@ -338,6 +374,7 @@ impl Message {
             text: message.text.clone(),
             data: message.data.clone(),
         });
+        delivered.touch();
         delivered
     }
 
@@ -348,6 +385,7 @@ impl Message {
     pub fn from_tool_result(result: ToolResult) -> Self {
         let mut message = Self::new(Role::Tool);
         message.blocks.push(ContentBlock::ToolResult { result });
+        message.touch();
         message
     }
 
@@ -362,6 +400,7 @@ impl Message {
                 text: delta.to_string(),
             }),
         }
+        self.touch();
     }
 
     pub fn push_reasoning(&mut self, delta: impl AsRef<str>) {
@@ -375,10 +414,12 @@ impl Message {
                 text: delta.to_string(),
             }),
         }
+        self.touch();
     }
 
     pub fn push_tool_call(&mut self, call: ToolCall) {
         self.blocks.push(ContentBlock::ToolCall { call });
+        self.touch();
     }
 
     pub fn set_text(&mut self, value: impl Into<String>) {
@@ -392,6 +433,7 @@ impl Message {
         } else if !value.is_empty() {
             self.blocks.insert(0, ContentBlock::Text { text: value });
         }
+        self.touch();
     }
 
     pub fn set_reasoning(&mut self, value: impl Into<String>) {
@@ -406,6 +448,7 @@ impl Message {
             self.blocks
                 .insert(0, ContentBlock::Reasoning { text: value });
         }
+        self.touch();
     }
 
     pub fn text(&self) -> String {

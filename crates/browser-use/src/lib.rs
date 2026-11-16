@@ -1,12 +1,12 @@
 //! EffiBuddy Browser Use: CDP-driven browser control.
 //!
 //! The crate has no dependency on `agent-core` or the UI. `agent-tools` adapts
-//! [`BrowserRuntime`] to a `Tool`, and the app handles consent + the overlay.
+//! [`BrowserRuntime`] to a `Tool`; the app only renders the overlay.
 //!
 //! Layering:
 //!
 //! ```text
-//! runtime   consent, snapshot/stale bookkeeping, policy, screenshot files
+//! runtime   snapshot/stale bookkeeping, policy, screenshot files, pause/stop
 //!   ↓
 //! cdp       BrowserBackend impl over the Chrome DevTools Protocol
 //!   ↓

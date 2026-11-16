@@ -41,6 +41,10 @@ zip = { version = "2.4", default-features = false }
 stress = ["effibuddy-agent-core/stress", "effibuddy-agent-tools/stress"]
 
 [dev-dependencies]
+# Headless UI tests: `gpui::test` / `TestAppContext` let the chat list be laid
+# out and painted without a window, so scroll-geometry regressions are caught
+# by `cargo test` instead of by hand.
+gpui = { workspace = true, features = ["test-support"] }
 effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
 effibuddy-browser = { path = "../browser-use", features = ["testing"] }
 effibuddy-computer = { path = "../computer-use", features = ["testing"] }

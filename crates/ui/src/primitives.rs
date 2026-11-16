@@ -4,6 +4,8 @@ use std::f32::consts::TAU;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "windows"))]
+use gpui::MouseButton;
 use gpui::{
     Animation, AnimationExt, AnyElement, AnyView, App, Bounds, BoxShadow, ClickEvent, Div, Element,
     ElementId, FontWeight, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
@@ -332,6 +334,62 @@ pub fn shadow_float(theme: &Theme) -> Vec<BoxShadow> {
 
 pub fn divider(theme: &Theme) -> Div {
     div().h(px(1.0)).w_full().bg(theme.border)
+}
+
+/// What a press on a custom titlebar does on platforms where the app — not the
+/// window manager — has to start the drag itself.
+#[cfg(not(target_os = "windows"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitlebarPress {
+    /// Start an interactive window move.
+    Drag,
+    /// Double click: maximize / restore.
+    Zoom,
+}
+
+/// Map the click count of a titlebar press to its action. Only `click_count`
+/// distinguishes a drag from the double-click-to-maximize gesture, so it gets
+/// its own function to stay testable without a window.
+#[cfg(not(target_os = "windows"))]
+pub fn titlebar_press_action(click_count: usize) -> TitlebarPress {
+    if click_count >= 2 {
+        TitlebarPress::Zoom
+    } else {
+        TitlebarPress::Drag
+    }
+}
+
+/// Turn `region` into a draggable window handle for a custom titlebar.
+///
+/// `WindowControlArea::Drag` alone is not enough: GPUI only implements
+/// `on_hit_test_window_control` for the Windows backend (it answers
+/// `WM_NCHITTEST` with `HTCAPTION`), while the Wayland/X11/macOS backends
+/// leave that hook empty. So each platform gets the mechanism it actually
+/// supports:
+///
+/// - Windows: the control-area hit-test, letting the OS own both the drag and
+///   double-click-to-maximize. This is the only path that works there, because
+///   `start_window_move()` is a no-op on Windows.
+/// - Wayland/X11: a mouse-down listener calling `start_window_move()`, which
+///   asks the compositor to move the toplevel with the last pointer-press
+///   serial. The control-area hit-test is inert on those backends.
+///
+/// Usage: `div().flex_1().h_full().map(window_drag_region)`.
+pub fn window_drag_region(region: Div) -> Div {
+    #[cfg(target_os = "windows")]
+    let region = region.window_control_area(gpui::WindowControlArea::Drag);
+
+    #[cfg(not(target_os = "windows"))]
+    let region =
+        region.on_mouse_down(
+            MouseButton::Left,
+            |event, window, _| match titlebar_press_action(event.click_count) {
+                TitlebarPress::Zoom => window.zoom_window(),
+                TitlebarPress::Drag => window.start_window_move(),
+            },
+        );
+
+    region
 }
 
 pub fn vertical_divider(theme: &Theme) -> Div {
@@ -762,4 +820,39 @@ pub fn empty_state(theme: &Theme, title: &str, body: &str, icon_path: &'static s
                 .text_color(theme.text_muted)
                 .child(body.to_string()),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: 0.2.3 swapped the titlebar drag region over to
+    /// `WindowControlArea::Drag`, which only the Windows backend turns into a
+    /// drag. On Wayland/X11 the hook is empty, so dragging stopped working.
+    /// The press mapping must keep the compositor path alive off Windows.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn single_click_drags_and_double_click_zooms() {
+        assert_eq!(titlebar_press_action(1), TitlebarPress::Drag);
+        assert_eq!(titlebar_press_action(2), TitlebarPress::Zoom);
+        // Triple clicks (and anything above) collapse into the zoomable case
+        // rather than trying to drag again.
+        assert_eq!(titlebar_press_action(3), TitlebarPress::Zoom);
+    }
+
+    /// The fallback must not swallow clicks: a zero count still yields a drag,
+    /// so a platform that omits the count cannot leave the titlebar dead.
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn missing_click_count_still_drags() {
+        assert_eq!(titlebar_press_action(0), TitlebarPress::Drag);
+    }
+
+    #[test]
+    fn drag_region_builds_on_every_platform() {
+        // Compiles and lays out on all backends; on Windows it carries the
+        // control-area hit-test, elsewhere the mouse-down handler.
+        let region = window_drag_region(div().flex_1().h_full());
+        let _ = region;
+    }
 }

@@ -55,8 +55,14 @@ pub(crate) fn can_address(viewer_id: &str, target: &AgentDescriptor) -> bool {
     }
 }
 
+/// Tools a read-only agent must never receive. Device tools count as mutating:
+/// a read-only profile has no business driving the user's screen or a browser
+/// even though some of their actions only observe.
 pub(crate) fn is_mutating_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "shell")
+    matches!(
+        name,
+        "write_file" | "edit_file" | "shell" | "computer" | "browser"
+    )
 }
 
 pub(crate) fn descriptor_for(agent_id: &str, prepared: &PreparedChild) -> AgentDescriptor {

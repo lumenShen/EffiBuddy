@@ -97,8 +97,8 @@ pub use subagent::{
 pub use sys_metrics::{SysMonitor, SysSample};
 pub use tool::{
     ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovalRequest, AutoApprovalGate,
-    BrokerApprovalGate, DenyApprovalGate, NestedToolInvoker, Tool, ToolContext, ToolEffect,
-    ToolOutput, ToolRegistry,
+    BrokerApprovalGate, DenyApprovalGate, ModeApprovalGate, NestedToolInvoker, PermissionMode, Tool,
+    ToolClass, ToolContext, ToolEffect, ToolOutput, ToolRegistry, ToolRisk,
 };
 pub use workflow_spec::{
     WorkflowEdge, WorkflowNodeSpec, WorkflowSpec, render_node_prompt, render_template,

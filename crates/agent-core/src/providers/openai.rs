@@ -31,6 +31,11 @@ pub struct OpenAiCompatConfig {
     pub context_window: usize,
     pub extra_headers: Vec<(String, String)>,
     pub include_usage: bool,
+    /// Echo assistant `reasoning_content` on tool-enabled requests. DeepSeek's
+    /// thinking mode rejects such a request with HTTP 400 when history turns
+    /// dropped their trace, so this is only enabled for endpoints that speak
+    /// that protocol.
+    pub echo_reasoning_content: bool,
     pub request_timeout: Duration,
     pub connect_timeout: Duration,
 }
@@ -43,6 +48,7 @@ impl OpenAiCompatConfig {
             context_window: 128_000,
             extra_headers: Vec::new(),
             include_usage: true,
+            echo_reasoning_content: true,
             request_timeout: Duration::from_secs(300),
             connect_timeout: Duration::from_secs(20),
         }
@@ -94,7 +100,10 @@ impl ModelProvider for OpenAiCompatProvider {
     ) -> Result<Completion, ProviderError> {
         let mut body = json!({
             "model": request.model,
-            "messages": wire_messages(&request.messages),
+            "messages": wire_messages(
+                &request.messages,
+                self.config.echo_reasoning_content && !request.tools.is_empty(),
+            ),
             "stream": true,
         });
         if self.config.include_usage {
@@ -246,7 +255,7 @@ impl ModelProvider for OpenAiCompatProvider {
     }
 }
 
-fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
+fn wire_messages(messages: &[ChatMessage], echo_reasoning_content: bool) -> Vec<Value> {
     let mut wire = Vec::with_capacity(messages.len());
     for message in messages {
         match message.role.as_str() {
@@ -275,6 +284,14 @@ fn wire_messages(messages: &[ChatMessage]) -> Vec<Value> {
                     "role": "assistant",
                     "content": content,
                 });
+                // DeepSeek's thinking mode requires the field on every
+                // assistant turn once the request carries `tools`; a trace
+                // that was empty still counts as present and must not be
+                // dropped.
+                if echo_reasoning_content {
+                    value["reasoning_content"] =
+                        Value::String(message.reasoning.clone().unwrap_or_default());
+                }
                 if !calls.is_empty() {
                     value["tool_calls"] = Value::Array(calls);
                 }
@@ -585,9 +602,32 @@ mod tests {
             "",
             vec![ToolCall::new("read_file", json!({"path": "a"}))],
         )];
-        let wire = wire_messages(&messages);
+        let wire = wire_messages(&messages, false);
         assert!(wire[0]["content"].is_null());
         assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "read_file");
+        assert!(wire[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn wire_messages_echo_reasoning_content_including_empty_traces() {
+        let messages = vec![
+            ChatMessage::assistant("calling", vec![ToolCall::new("read_file", json!({}))])
+                .with_reasoning("I need the file first."),
+            // A thinking turn that produced no trace still has to carry the
+            // field; omitting it makes DeepSeek answer 400.
+            ChatMessage::assistant("done", Vec::new()).with_reasoning(""),
+        ];
+        let wire = wire_messages(&messages, true);
+        assert_eq!(wire[0]["reasoning_content"], "I need the file first.");
+        assert_eq!(wire[0]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(wire[1]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn wire_messages_do_not_echo_reasoning_content_without_tools() {
+        let messages = vec![ChatMessage::assistant("done", Vec::new()).with_reasoning("a trace")];
+        let wire = wire_messages(&messages, false);
+        assert!(wire[0].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -596,7 +636,7 @@ mod tests {
             "screenshot",
             vec![crate::message::ImageAttachment::png("YWJj", 640, 480)],
         )];
-        let wire = wire_messages(&messages);
+        let wire = wire_messages(&messages, false);
         assert_eq!(wire[0]["content"][0]["type"], "text");
         assert_eq!(wire[0]["content"][1]["type"], "image_url");
         assert_eq!(
@@ -631,16 +671,142 @@ mod tests {
     }
 
     fn test_provider(base_url: String) -> OpenAiCompatProvider {
+        test_provider_with_echo(base_url, false)
+    }
+
+    fn test_provider_with_echo(
+        base_url: String,
+        echo_reasoning_content: bool,
+    ) -> OpenAiCompatProvider {
         OpenAiCompatProvider::new(OpenAiCompatConfig {
             base_url,
             api_key: "test-key".to_string(),
             context_window: 8_192,
             extra_headers: Vec::new(),
             include_usage: false,
+            echo_reasoning_content,
             request_timeout: Duration::from_secs(5),
             connect_timeout: Duration::from_secs(2),
         })
         .unwrap()
+    }
+
+    /// Like [`serve_sse_once`], but hands the raw request body back so a test
+    /// can assert what actually went over the wire.
+    fn serve_sse_capturing_body(sse: &'static str) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let body_start = loop {
+                let Ok(read) = socket.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break index + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..body_start]).to_string();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < body_start + length {
+                let Ok(read) = socket.read(&mut chunk) else {
+                    return;
+                };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let _ = sender.send(String::from_utf8_lossy(&request[body_start..]).to_string());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            let _ = socket.write_all(response.as_bytes());
+            let _ = socket.flush();
+        });
+        (format!("http://{addr}"), receiver)
+    }
+
+    fn tool_spec(name: &str) -> crate::provider::ToolSpec {
+        crate::provider::ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: json!({"type": "object", "properties": {}}),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_requests_carry_reasoning_content_on_the_wire() {
+        let (base_url, captured) = serve_sse_capturing_body(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let provider = test_provider_with_echo(base_url, true);
+        let request = ChatRequest {
+            model: "deepseek-flash".to_string(),
+            messages: vec![
+                ChatMessage::user("read the file"),
+                ChatMessage::assistant("", vec![ToolCall::new("read_file", json!({"path": "a"}))])
+                    .with_reasoning("I should read it."),
+                ChatMessage::tool("call_1", "contents"),
+            ],
+            tools: vec![tool_spec("read_file")],
+            temperature: None,
+            max_tokens: None,
+            reasoning_effort: None,
+        };
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        provider
+            .stream(request, CancellationToken::new(), sender)
+            .await
+            .unwrap();
+
+        let body: Value = serde_json::from_str(&captured.recv().unwrap()).unwrap();
+        assert_eq!(
+            body["messages"][1]["reasoning_content"],
+            "I should read it."
+        );
+        assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+    }
+
+    #[tokio::test]
+    async fn plain_chat_requests_omit_reasoning_content() {
+        let (base_url, captured) = serve_sse_capturing_body(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        );
+        let provider = test_provider_with_echo(base_url, true);
+        let mut request = test_request();
+        request.messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello", Vec::new()).with_reasoning("a trace"),
+        ];
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        provider
+            .stream(request, CancellationToken::new(), sender)
+            .await
+            .unwrap();
+
+        let body: Value = serde_json::from_str(&captured.recv().unwrap()).unwrap();
+        assert!(body["messages"][1].get("reasoning_content").is_none());
     }
 
     fn test_request() -> ChatRequest {

@@ -1,6 +1,6 @@
 //! The browser backend boundary.
 //!
-//! A backend knows how to talk to one browser engine. Consent, snapshot
+//! A backend knows how to talk to one browser engine. Snapshot
 //! bookkeeping, policy checks, pause/stop and screenshot persistence live in
 //! [`crate::runtime`], so every backend (CDP, fake, future WebKit bridge)
 //! shares the same safety behavior.

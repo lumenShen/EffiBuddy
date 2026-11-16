@@ -212,10 +212,10 @@ EffiBuddy v1 的取舍：
 | 最新 raster 坐标 | `frame_id` + `FrameInfo`（图像/原生尺寸、原点、缩放）；stale frame 失败关闭 |
 | 动作后观察 | 工具描述强制“截图→动作→再截图”；不自动附加截图，避免每步双倍图片 |
 | a11y/event strategy | v1 用 `auto/background/foreground`；Windows 停车窗口走后台消息，忽略消息时回退前台 SendInput |
-| 单一控制器 | 只有一个主代理 `computer` 工具；子代理被显式过滤；运行时有 stopped/paused |
-| 随时停止 | 悬浮条“接管操作 / 我帮你点好了 / 停止操作”；停止撤销授权并 `interrupt` |
+| 单一控制器 | 设备工具进统一的工具权限矩阵（`ToolClass::Device`）；主代理与子代理同一套审批；运行时有 stopped/paused |
+| 随时停止 | 悬浮条“接管操作 / 我帮你点好了 / 停止操作”；停止结束本轮驱动并 `interrupt` |
 | 后台不打扰 | X11 专用 EWMH workspace；Windows 后台停车位；Wayland 当前桌面（无法隔离） |
-| 授权 | 独立 `ComputerApprovalGate`：Session 首次必弹卡，FullAccess 也不能绕过；Plan 拒绝修改类动作 |
+| 授权 | 无独立授权门：`PermissionMode` 决定（FullAccess 直接批准电脑/浏览器）；Plan 只放行只读动作 |
 
 刻意没做的：
 

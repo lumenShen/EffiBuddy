@@ -17,7 +17,6 @@ use effibuddy_agent_core::{
     ToolResult, Usage, UserAttachment, lock_session, new_shared_session,
 };
 use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_roots};
-use effibuddy_browser::BrowserUseMode;
 use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, CONTROL_MOTION, IconButton, MotionController,
@@ -28,21 +27,20 @@ use effibuddy_ui::{
 use gpui::{
     Animation, AnimationExt, AnyElement, App, Bounds, ClipboardItem, Context, DispatchPhase, Div,
     Entity, IntoElement, MouseButton, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels,
-    Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowControlArea,
-    WindowHandle, WindowKind, WindowOptions, actions, anchored, div, img, linear_color_stop,
-    linear_gradient, list, point, prelude::*, px, size, svg, transparent_black,
+    Point, Render, SharedString, Stateful, WeakEntity, Window, WindowBounds, WindowHandle,
+    WindowKind, WindowOptions, actions, anchored, div, img, linear_color_stop, linear_gradient,
+    list, point, prelude::*, px, size, svg, transparent_black,
 };
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
-use crate::browser::BrowserApprovalGate;
 use crate::chat::{
     AgentCard, ChatList, JumpFlash, PromptRailState, RunSnapshot, agent_color, render_chat_item,
     render_prompt_rail as render_prompt_rail_element, render_scroll_to_bottom, render_scrollbar,
 };
 use crate::checkpoint::{RestoreAction, RestorePlan};
 use crate::composer_menu::ComposerMenuState;
-use crate::computer::{ComputerApprovalGate, ComputerOverlayView, composer_hint};
+use crate::computer::{ComputerOverlayView, composer_hint};
 use crate::config::{AppConfig, MAX_UI_ZOOM, MIN_UI_ZOOM};
 use crate::context_meter::{ContextUsage, SubagentUsage};
 use crate::draft_store::{DraftStore, TASK_SCOPE};
@@ -486,10 +484,10 @@ pub struct AppView {
     /// Update check state (see `update.rs`); results arrive via `AppEvent`.
     pub(crate) update: crate::update::UpdateState,
 
-    /// Shared browser-use runtime: consent, CDP session, snapshot refs.
+    /// Shared browser-use runtime: CDP session, snapshot refs, policy.
     pub(crate) browser: Arc<effibuddy_browser::BrowserRuntime>,
-    /// Shared computer-use runtime: consent, frames, pause/stop and the
-    /// platform backend. One per app; only the main agent gets the tool.
+    /// Shared computer-use runtime: frames, pause/stop and the
+    /// platform backend. One per app; children share it through `DeviceTools`.
     pub(crate) computer: Arc<effibuddy_computer::ComputerRuntime>,
     /// Floating top-center control bar, open only while computer access is in
     /// progress.
@@ -772,7 +770,7 @@ impl AppView {
         let (app_tx, mut app_rx) = unbounded_channel::<AppEvent>();
 
         // Computer use shares the same foreground pump as harness events so
-        // consent cards, tool results and overlay updates keep their order.
+        // approval cards, tool results and overlay updates keep their order.
         let self_weak = cx.entity().downgrade();
         let computer = Arc::new(effibuddy_computer::ComputerRuntime::with_artifact_dir(
             effibuddy_computer::create_backend(),
@@ -865,6 +863,34 @@ impl AppView {
             .chain(archived_sessions.iter())
             .filter_map(|summary| summary.project.clone())
             .collect();
+        // Sessions that still carry a `project_id` the registry no longer knows
+        // would otherwise be stranded in the tasks list forever, because
+        // reconciling legacy paths can never mint that exact id again.
+        let dangling_projects: Vec<(String, PathBuf)> = sessions
+            .iter()
+            .chain(archived_sessions.iter())
+            .filter_map(|summary| {
+                let id = summary.project_id.as_ref()?;
+                if projects.by_id(id).is_some() {
+                    return None;
+                }
+                // The registry only needs one folder to rebuild the row; the
+                // legacy `project` path is the only folder a summary carries.
+                let folder = summary.project.clone()?;
+                Some((id.clone(), folder))
+            })
+            .collect();
+        // Restore ids the registry lost but sessions still reference. This runs
+        // before `reconcile`/`migrate_legacy` so those passes see the restored
+        // roots and do not mint a duplicate project for the same folder. It also
+        // keeps the sidebar complete without waiting for a brand-new project to
+        // be created, which is what users previously had to do.
+        let mut restored_any = false;
+        for (id, folder) in &dangling_projects {
+            if projects.restore(id, std::slice::from_ref(folder)) {
+                restored_any = true;
+            }
+        }
         if !projects_file_existed {
             let mapping = projects.migrate_legacy(&config.projects, &legacy_project_paths);
             let mut config_changed = false;
@@ -892,6 +918,9 @@ impl AppView {
             }
             let _ = projects.save();
         } else if projects.reconcile(&legacy_project_paths) {
+            restored_any = true;
+        }
+        if restored_any {
             let _ = projects.save();
         }
         let project_editor_name = cx.new(|cx| {
@@ -2777,14 +2806,19 @@ impl AppView {
                         }
                     };
                     format!(
-                        "已压缩上下文：{} 条消息折叠为摘要（{label}），约 {} → {} tokens（减少 {}）。",
+                        "已压缩上下文：{} 条消息折叠为摘要（{label}），约 {} → {} tokens（减少 {}，仍在窗口内 {}/{}）。",
                         record.summarized_messages,
                         crate::commands::format_tokens(record.pre_tokens),
                         crate::commands::format_tokens(record.post_tokens),
-                        crate::commands::format_tokens(saved)
+                        crate::commands::format_tokens(saved),
+                        crate::commands::format_tokens(record.post_tokens),
+                        crate::commands::format_tokens(record.auto_threshold)
                     )
                 }
-                None => "没有可压缩的内容：当前上下文已经足够短。".to_string(),
+                // The harness rolls back a fold that does not shrink the
+                // request (a summary as large as the rounds it replaces), so the
+                // honest message is "nothing gained", never "减少 0".
+                None => "没有可压缩的内容：这次折叠省不下 token，历史保持原样。".to_string(),
             },
         }
     }
@@ -3441,17 +3475,17 @@ impl AppView {
                 return;
             }
         };
-        // Computer use is a main-agent-only capability: child_tools() builds a
-        // fresh registry from builtin_tools(), so subagents never inherit it.
+        // Device tools are ordinary tools: registered for the main agent here,
+        // and for children by `SubagentService` with the same permission matrix.
         if self.config.computer_use_mode.is_enabled() {
             tools.register(ComputerTool::new(
                 self.computer.clone(),
                 resolved.model.capabilities.vision,
             ));
         }
-        // Browser use is likewise main-agent-only for the same reason:
-        // `child_tools()` rebuilds the registry from `builtin_tools()`
-        // without it. Uploads reuse the same workspace sandbox as file tools.
+        // Browser use follows the same rule: registered here for the main agent,
+        // and by `child_tools()` for children when the capability is on.
+        // Uploads reuse the same workspace sandbox as file tools.
         if self.config.browser_use_mode.is_enabled() {
             // `builtin_tools_with_roots` already validated the workspace, so
             // this reuses the same roots for upload sandboxing.
@@ -3463,8 +3497,6 @@ impl AppView {
                 ));
             }
         }
-        let computer_session_id = session_id.clone();
-
         // Project instructions belong to the session's own workspace, not the
         // global task default: a project session must see its own AGENTS.md.
         let project_instructions = crate::config::project_instructions_for(&workspace);
@@ -3520,7 +3552,14 @@ impl AppView {
             runtime_handle.clone(),
             workspace.clone(),
             std::sync::Arc::new(self.models.file().clone()),
-        );
+        )
+        // Children get the same device tools and therefore the same permission
+        // matrix: FullAccess means "nobody stops for a card", for the whole tree.
+        .with_device_tools(crate::agents::runtime::DeviceTools {
+            computer: self.computer.clone(),
+            browser: self.browser.clone(),
+            vision: resolved.model.capabilities.vision,
+        });
 
         let (harness_tx, mut harness_rx) = unbounded_channel::<HarnessEvent>();
         let approval = Arc::new(BrokerApprovalGate::new(
@@ -3531,28 +3570,13 @@ impl AppView {
         // a Shift+Tab mid-run takes effect on the next tool call. The UI keeps
         // responding to the inner broker gate; locally decided calls never
         // reach it and never show an approval card.
-        let mode_gate = Arc::new(ModeApprovalGate::new(
+        // One permission system for the whole tool surface: files, commands and
+        // the device tools (`computer`, `browser`). FullAccess approves every
+        // class locally, so neither the main agent nor its subagents stop for a
+        // computer/browser consent card; Plan mode still denies the mutating
+        // device actions through `ToolRisk`.
+        let approval_gate = Arc::new(ModeApprovalGate::new(
             approval.clone(),
-            permission_mode_provider.clone(),
-        ));
-        // Computer consent is layered *outside* the mode gate: FullAccess must
-        // not silently grant screen control, and Plan mode must block mutating
-        // computer actions even if the user would approve the card.
-        let mode_gate = Arc::new(ComputerApprovalGate::new(
-            mode_gate,
-            approval.clone(),
-            self.computer.clone(),
-            computer_session_id,
-            permission_mode_provider.clone(),
-        ));
-        // Browser consent is layered on top for the same reason: FullAccess
-        // must not silently grant browser control, and Plan mode must block
-        // navigation, clicks, script execution and uploads.
-        let approval_gate = Arc::new(BrowserApprovalGate::new(
-            mode_gate,
-            approval.clone(),
-            self.browser.clone(),
-            session_id.clone(),
             permission_mode_provider,
         ));
         let harness = AgentHarness::new(
@@ -3939,7 +3963,7 @@ impl AppView {
                 self.pending_approvals
                     .retain(|pending| pending.agent_id.is_some());
                 // Hide the control bar and restore parked windows/workspace.
-                // Consent is retained for the conversation unless the user hit
+                // The device session is retained unless the user hit
                 // Stop (which revokes it in runtime.stop()).
                 if let Some((session_id, _)) = &finished {
                     if let Some(runtime) = &self.runtime {
@@ -4431,8 +4455,8 @@ impl AppView {
     }
 
     /// Leaving a conversation ends its computer session: parked windows and
-    /// the isolated workspace are restored, and the one-time consent is
-    /// revoked so another conversation cannot inherit it.
+    /// the isolated workspace are restored and the session's transient device
+    /// state is dropped, so another conversation cannot inherit it.
     fn retire_computer_session(&mut self, cx: &mut Context<Self>) {
         self.close_computer_overlay(cx);
         let Some(session_id) = self
@@ -4446,10 +4470,10 @@ impl AppView {
         if let Some(runtime) = &self.runtime {
             runtime.spawn(async move {
                 computer.restore_isolation(&session_id).await;
-                computer.forget_consent(&session_id);
+                computer.forget_session(&session_id);
             });
         } else {
-            computer.forget_consent(&session_id);
+            computer.forget_session(&session_id);
         }
     }
 
@@ -5995,7 +6019,7 @@ impl AppView {
         };
         let had_stash = self.background_sessions.contains_key(id);
         // Leaving a conversation normally ends its computer session. A running
-        // turn must keep its consent and isolation until it finishes, though.
+        // turn must keep its device session and isolation until it finishes, though.
         // The overlay belongs to the outgoing transcript either way: its stop
         // button must never interrupt the newly active session.
         self.close_computer_overlay(cx);
@@ -6934,8 +6958,8 @@ impl AppView {
     /// touching the real desktop (`--preview-computer`).
     pub fn seed_computer_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview_mode = true;
-        self.config.computer_use_mode = ComputerUseMode::Always;
-        self.computer.set_mode(ComputerUseMode::Always);
+        self.config.computer_use_mode = ComputerUseMode::On;
+        self.computer.set_mode(ComputerUseMode::On);
         let Some(session_id) = self
             .active
             .as_ref()
@@ -6943,7 +6967,6 @@ impl AppView {
         else {
             return;
         };
-        self.computer.grant(&session_id);
         self.handle_computer_overlay(
             OverlayEvent {
                 session_id,
@@ -7399,17 +7422,16 @@ impl AppView {
                             }),
                     ),
             )
-            // Drag region. `start_window_move()` is a no-op on Windows (it is
-            // implemented only for Wayland/X11), which is why dragging here did
-            // nothing and the hand-rolled double-click test never matched.
-            // `window_control_area(Drag)` is the portable path: GPUI records a
-            // hit-test hitbox and Windows answers WM_NCHITTEST with HTCAPTION,
-            // so the OS handles both dragging and double-click-to-maximize.
+            // Drag region. `window_control_area(Drag)` alone is not portable:
+            // only the Windows backend implements the hit-test hook, so on
+            // Wayland/X11 it silently did nothing (0.2.3 dropped the previous
+            // `start_window_move()` fallback). `window_drag_region` keeps the
+            // OS-owned path on Windows and the compositor path elsewhere.
             .child(
                 div()
                     .flex_1()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .map(effibuddy_ui::window_drag_region),
             )
             .when(self.sidebar_p < 0.999, |element| {
                 element.child(
@@ -8890,6 +8912,16 @@ impl AppView {
             });
         }
 
+        // 贴底跟随：尾部一次长高超过单帧步长时，`sync_scroll` 只靠近一部分，
+        // 剩下的留到后续帧继续缓动，否则会变成一次生硬的跳变。
+        if self.chat.follow_frame_scheduled {
+            self.chat.follow_frame_scheduled = false;
+            cx.on_next_frame(window, |this, _, cx| {
+                this.chat.mark_scrolled();
+                cx.notify();
+            });
+        }
+
         // Turn 展开高度渐显：进度在渲染期按时刻计算，需要逐帧重绘（主会话
         // 与侧栏子代理会话共用同一个泵标记）。
         let turn_height_animating = self.chat.turn_height_animating()
@@ -9721,24 +9753,10 @@ impl AppView {
             .gap(px(10.0));
 
         let computer_mode = self.config.computer_use_mode;
-        let computer_granted = self
-            .active_shared()
-            .map(|shared| {
-                let session = lock_session(&shared);
-                self.computer.is_granted(&session.id)
-            })
-            .unwrap_or(false);
         let computer_vision = resolved.model.capabilities.vision;
-        let computer_hint = composer_hint(computer_mode, computer_granted, computer_vision);
+        let computer_hint = composer_hint(computer_mode, computer_vision, permission_mode);
         let browser_mode = self.config.browser_use_mode;
-        let browser_granted = self
-            .active_shared()
-            .map(|shared| {
-                let session = lock_session(&shared);
-                self.browser.is_granted(&session.id)
-            })
-            .unwrap_or(false);
-        let browser_hint = crate::browser::composer_hint(browser_mode, browser_granted);
+        let browser_hint = crate::browser::composer_hint(browser_mode, permission_mode);
 
         let mut footer_left = div().flex().items_center().gap(px(8.0)).child(
             if permission_mode == PermissionMode::Plan {
@@ -9752,7 +9770,7 @@ impl AppView {
         if let Some((label, tooltip_text)) = computer_hint {
             let (hint_color, hint_bg) = if !computer_vision {
                 (theme.warning, theme.warning_soft)
-            } else if computer_granted || computer_mode == ComputerUseMode::Always {
+            } else if permission_mode == PermissionMode::FullAccess {
                 (theme.success, theme.success_soft)
             } else {
                 (theme.text_muted, theme.surface_alt)
@@ -9788,8 +9806,7 @@ impl AppView {
         }
 
         if let Some((label, tooltip_text)) = browser_hint {
-            let (hint_color, hint_bg) = if browser_granted || browser_mode == BrowserUseMode::Always
-            {
+            let (hint_color, hint_bg) = if permission_mode == PermissionMode::FullAccess {
                 (theme.success, theme.success_soft)
             } else {
                 (theme.text_muted, theme.surface_alt)
@@ -11307,9 +11324,11 @@ fn permission_mode_hint(mode: PermissionMode) -> Option<&'static str> {
             Some("自动编辑模式：文件编辑已自动批准，shell 等命令仍需确认。")
         }
         PermissionMode::Plan => {
-            Some("计划模式：编辑与命令会被自动拒绝。请先让 EffiBuddy 输出计划，再切换模式执行。")
+            Some("计划模式：编辑、命令与电脑/浏览器的改写类动作会被自动拒绝；只读动作照常放行。请先让 EffiBuddy 输出计划，再切换模式执行。")
         }
-        PermissionMode::FullAccess => Some("完全访问模式：主会话与子代理的工具调用都不会打断你。"),
+        PermissionMode::FullAccess => {
+            Some("完全访问模式：主会话与子代理的工具调用（含电脑操作、浏览器）都不会打断你。")
+        }
     }
 }
 
@@ -11856,6 +11875,15 @@ fn sidebar_icon_button(
         .child(svg().path(icon).size(px(11.0)).text_color(color))
 }
 
+/// Whether a section header's collapse chevron stays hidden until the row is
+/// hovered.
+///
+/// 折叠状态下箭头必须常显：整段内容被隐藏后，若唯一的状态指示也要悬停才
+/// 出现，界面看上去就是"项目凭空消失了"。展开时保持悬停显隐。
+fn section_chevron_hover_gated(group: &str, collapsed: bool) -> bool {
+    group != "pinned" && !collapsed
+}
+
 /// Collapsible section header (`置顶` / `全部项目` / `任务`). `trailing` holds
 /// an optional action such as the projects section's "添加工作区" button.
 ///
@@ -11871,7 +11899,7 @@ fn sidebar_section_header(
     cx: &mut Context<AppView>,
 ) -> AnyElement {
     let row_group = SharedString::from(format!("sidebar-section-{group}"));
-    let chevron_hover_gated = group != "pinned";
+    let chevron_hover_gated = section_chevron_hover_gated(group, collapsed);
     div()
         .id(row_group.clone())
         .group(row_group.clone())
@@ -13049,6 +13077,21 @@ mod tests {
             &[PathBuf::from("/code/alpha")],
         );
         assert_eq!(members.len(), 2);
+    }
+
+    /// 回归：折叠某一段后必须仍有可见的状态指示，否则该段内容（例如全部
+    /// 项目）会像"凭空消失"一样，只有再次新建项目（会清掉折叠记录）才回来。
+    #[test]
+    fn collapsed_section_keeps_its_chevron_visible() {
+        // 折叠时箭头常显，用户能看见"这里被折叠了"并点开。
+        assert!(!section_chevron_hover_gated("projects", true));
+        assert!(!section_chevron_hover_gated("tasks", true));
+        // 展开时保持悬停显隐，避免常驻视觉噪声。
+        assert!(section_chevron_hover_gated("projects", false));
+        assert!(section_chevron_hover_gated("tasks", false));
+        // 置顶段箭头本来就常显。
+        assert!(!section_chevron_hover_gated("pinned", false));
+        assert!(!section_chevron_hover_gated("pinned", true));
     }
 
     fn report_with(status: SubagentStatus, error: Option<&str>, text: &str) -> SubagentReport {

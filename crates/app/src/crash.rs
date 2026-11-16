@@ -26,7 +26,7 @@ use std::time::Duration;
 use effibuddy_ui::{Button, ButtonVariant, EffiBuddyAssets, IconButton, Theme, icons};
 use gpui::{
     App, Application, Bounds, ClipboardItem, Context, IntoElement, Render, SharedString, Window,
-    WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, size, svg,
+    WindowBounds, WindowOptions, div, prelude::*, px, size, svg,
 };
 
 use crate::config::AppConfig;
@@ -432,13 +432,13 @@ impl CrashReportView {
                     .text_color(theme.text_muted)
                     .child("EffiBuddy 崩溃报告"),
             )
-            // Same drag region as the main titlebar: `start_window_move()` is a
-            // no-op on Windows, so the portable hit-test path is used instead.
+            // Same drag region as the main titlebar; `window_drag_region` picks
+            // the mechanism each platform actually implements.
             .child(
                 div()
                     .flex_1()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .map(effibuddy_ui::window_drag_region),
             )
             .child(
                 IconButton::new("crash-titlebar-close", icons::X, theme)
