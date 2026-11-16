@@ -555,3 +555,53 @@ fn cold_open_transcript_opens_at_the_tail_with_a_usable_scroll_range(
         "上滚一屏就从第 {before_ix} 行跳到第 {after_ix}/{total} 行：滚动刻度失真"
     );
 }
+
+// --- 滚轮累加回归 ----------------------------------------------------------
+
+/// 连续滚 10 格滚轮，合计应当移动约 10 格的距离。
+///
+/// 旧实现里 `ScrollGlide::tick` 把「读回的偏移与内部记录的位置不一致」一律
+/// 当成外部滚动（滚动条拖拽 / 程序化跳转），于是把 `target` 重置成当前帧的
+/// 偏移。结果是每一格滚轮都从「现在这一帧的位置」重新起步，滚 10 格只走 1 格
+/// 的距离——手感上就是「使劲滚却滚不动」。
+#[gpui::test]
+fn wheel_notches_accumulate_instead_of_restarting(cx: &mut gpui::TestAppContext) {
+    let cx = cx.add_empty_window();
+    let mut sim = Sim::new(2000);
+    sim.rebuild();
+    sim.frame(cx);
+    sim.frame(cx);
+
+    // 对齐到会话中段，留出上下两个方向的余量。
+    let total = sim.chat.list_state.item_count();
+    sim.chat.list_state.scroll_to(ListOffset {
+        item_ix: total / 2,
+        offset_in_item: px(0.0),
+    });
+    sim.chat.mark_scrolled();
+    sim.frame(cx);
+    sim.frame(cx);
+
+    const NOTCHES: usize = 10;
+    const NOTCH_PX: f32 = 20.0;
+    let before = sim.offset();
+    for _ in 0..NOTCHES {
+        sim.chat.wheel(NOTCH_PX);
+    }
+    let mut frames = 0;
+    while sim.chat.tick_scroll() && frames < 4000 {
+        sim.frame(cx);
+        frames += 1;
+    }
+    sim.frame(cx);
+
+    let travelled = before - sim.offset();
+    let expected = NOTCHES as f32 * NOTCH_PX;
+    println!(
+        "[wheel] {NOTCHES} 格 × {NOTCH_PX}px → 实际 {travelled:.1}px（期望 ≈{expected:.0}px，{frames} 帧）"
+    );
+    assert!(
+        travelled > expected * 0.8,
+        "滚了 {NOTCHES} 格只移动了 {travelled:.1}px（期望 ≈{expected:.0}px）：滚轮增量被丢掉了"
+    );
+}

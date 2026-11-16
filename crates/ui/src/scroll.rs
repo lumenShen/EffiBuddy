@@ -144,13 +144,19 @@ impl ScrollGlide {
         self.target = self.target.clamp(0.0, max);
 
         if (offset - self.current).abs() > 1.0 {
-            // Something else moved the viewport (scrollbar, reset): resync
-            // instead of fighting it.
+            // The list quantizes our own motion: `scroll_by` seeks in the
+            // height tree and the next layout snaps the logical top to a row
+            // boundary, so the read-back can legitimately differ from what we
+            // asked for by up to a row. Treating that as "something else moved
+            // the viewport" used to reset `target` to the current offset, which
+            // threw away every accumulated wheel notch — flicking the wheel ten
+            // times moved the list by a single notch.
+            //
+            // The caller cancels explicitly for the movements that really are
+            // external (scrollbar drag, jump to prompt, reset), so the only safe
+            // thing to do here is accept the read-back as the new position and
+            // keep chasing the target the user asked for.
             self.current = offset;
-            self.target = offset;
-            self.active = false;
-            self.goal_bottom = false;
-            return GlideTick::Cancelled;
         }
 
         let k = 1.0 - (-(dt / SCROLL_GLIDE_TAU)).exp();

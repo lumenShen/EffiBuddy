@@ -591,6 +591,9 @@ impl ChatList {
     /// Drop every cached snapshot. Called when switching sessions so the next
     /// rebuild starts from a clean slate and nothing entry-animates.
     pub fn reset_session(&mut self) {
+        // A glide points at offsets of the *previous* transcript; keeping it
+        // would drag the new session around as soon as it lays out.
+        self.cancel_glide();
         self.items = Rc::new(Vec::new());
         self.slots = Rc::new(Vec::new());
         self.slot_keys = Rc::new(Vec::new());
