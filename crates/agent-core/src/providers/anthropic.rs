@@ -269,7 +269,12 @@ fn build_body(request: &ChatRequest) -> Value {
 
     let mut body = json!({
         "model": request.model,
-        "max_tokens": request.max_tokens.unwrap_or(8192),
+        // Anthropic requires the field on every request. The harness always
+        // sends the per-model budget; the fallback only covers direct callers
+        // (tests, probes) that build a request by hand.
+        "max_tokens": request
+            .max_tokens
+            .unwrap_or(crate::model_config::DEFAULT_MAX_OUTPUT_TOKENS),
         "messages": messages,
         "stream": true,
     });

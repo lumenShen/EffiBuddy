@@ -51,6 +51,7 @@ pub mod icons {
     pub const EXTERNAL_LINK: &str = "icons/external-link.svg";
     pub const IMAGE: &str = "icons/image.svg";
     pub const MEMORY: &str = "icons/memory.svg";
+    pub const GLOBE: &str = "icons/globe.svg";
 }
 
 /// Raster assets served through the same `AssetSource`, so `img()` can load
@@ -81,6 +82,7 @@ const X: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" f
 const SPARKLES: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 2.6 11 5.7l3.1 1.1-3.1 1.1L9.9 11 8.8 7.9 5.7 6.8l3.1-1.1z"/><path d="M18 5l.6 1.7 1.7.6-1.7.6L18 9.6l-.6-1.7-1.7-.6 1.7-.6z"/><path d="M18 14l.8 2.2 2.2.8-2.2.8L18 20l-.8-2.2-2.2-.8 2.2-.8z"/></svg>"#;
 const WRENCH: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>"#;
 const MOUSE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="12" height="20" rx="6"/><path d="M12 2v7"/></svg>"#;
+const GLOBE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>"#;
 const ALERT: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/></svg>"#;
 const LOADER: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>"#;
 const MORE: &str = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg>"#;
@@ -147,6 +149,7 @@ fn svg_for(path: &str) -> Option<&'static str> {
         icons::ARCHIVE_RESTORE => ARCHIVE_RESTORE,
         icons::UNDO => UNDO,
         icons::MOUSE => MOUSE,
+        icons::GLOBE => GLOBE,
         icons::GAUGE => GAUGE,
         icons::DOWNLOAD => DOWNLOAD,
         icons::MAIL => MAIL,

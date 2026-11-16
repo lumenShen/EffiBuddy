@@ -270,7 +270,13 @@ fn write_archive(
     write_bytes(
         &mut zip,
         "README.md",
-        readme(main, children.len(), manifest.files.len(), manifest.missing.len()).as_bytes(),
+        readme(
+            main,
+            children.len(),
+            manifest.files.len(),
+            manifest.missing.len(),
+        )
+        .as_bytes(),
         options,
     )?;
     write_json(&mut zip, "manifest.json", manifest, options)?;
@@ -540,8 +546,8 @@ fn write_json<T: Serialize + ?Sized>(
     value: &T,
     options: SimpleFileOptions,
 ) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(value)
-        .map_err(|error| format!("无法序列化 {name}：{error}"))?;
+    let bytes =
+        serde_json::to_vec_pretty(value).map_err(|error| format!("无法序列化 {name}：{error}"))?;
     write_bytes(zip, name, &bytes, options)
 }
 
@@ -694,7 +700,9 @@ fn unique_entry_name(used: &mut HashSet<String>, candidate: String) -> String {
         return candidate;
     }
     let path = Path::new(&candidate);
-    let parent = path.parent().map(|parent| parent.to_string_lossy().into_owned());
+    let parent = path
+        .parent()
+        .map(|parent| parent.to_string_lossy().into_owned());
     let stem = path
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -746,7 +754,10 @@ mod tests {
     fn safe_relative_rejects_traversal() {
         assert_eq!(safe_relative("src/main.rs").as_deref(), Some("src/main.rs"));
         assert_eq!(safe_relative("../secret"), None);
-        assert_eq!(safe_relative("C:\\Users\\a.txt").as_deref(), Some("C_/Users/a.txt"));
+        assert_eq!(
+            safe_relative("C:\\Users\\a.txt").as_deref(),
+            Some("C_/Users/a.txt")
+        );
     }
 
     #[test]
@@ -843,9 +854,21 @@ mod tests {
             .map(|index| archive.by_index(index).unwrap().name().to_string())
             .collect();
         assert!(names.contains(&"session.json".to_string()));
-        assert!(names.iter().any(|name| name.starts_with("agents/01-explore-")));
-        assert!(names.iter().any(|name| name.ends_with("files/attachments/notes.md")));
-        assert!(names.iter().any(|name| name.ends_with("files/mentions/mentioned.md")));
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("agents/01-explore-"))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("files/attachments/notes.md"))
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name.ends_with("files/mentions/mentioned.md"))
+        );
         let manifest = archive.by_name("manifest.json").unwrap();
         let manifest: serde_json::Value = serde_json::from_reader(manifest).unwrap();
         assert_eq!(manifest["agents"].as_array().unwrap().len(), 1);
@@ -853,10 +876,7 @@ mod tests {
 
         let session = archive.by_name("session.json").unwrap();
         let session: serde_json::Value = serde_json::from_reader(session).unwrap();
-        assert_eq!(
-            session["messages"][0]["attachments"][0]["name"],
-            "notes.md"
-        );
+        assert_eq!(session["messages"][0]["attachments"][0]["name"], "notes.md");
         {
             let mut attachment = archive
                 .by_name("files/attachments/notes.md")

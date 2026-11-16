@@ -644,10 +644,7 @@ mod tests {
         );
         // Legacy sessions resolve through the project roots.
         assert_eq!(
-            store
-                .project_for_session(None, Some(&beta))
-                .unwrap()
-                .id,
+            store.project_for_session(None, Some(&beta)).unwrap().id,
             both.id
         );
         assert!(store.project_for_session(None, None).is_none());

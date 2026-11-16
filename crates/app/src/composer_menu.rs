@@ -87,7 +87,7 @@ impl ComposerTrigger {
 
     fn empty_hint(self) -> &'static str {
         match self {
-            Self::Command => "技能 / 智能体 / 工具",
+            Self::Command => "命令 / 技能 / 智能体 / 工具",
             Self::Mention => "工作区文件 / 子智能体",
             Self::Skill => "技能",
         }
@@ -400,6 +400,9 @@ fn walk_workspace_files(root: &Path) -> Vec<FileEntry> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuGroup {
+    /// Host-side slash commands (`/compact`). Listed first because they are
+    /// actions, not references: picking one runs it.
+    Command,
     Skill,
     Tool,
     Agent,
@@ -409,6 +412,7 @@ pub(crate) enum MenuGroup {
 impl MenuGroup {
     fn title(self, trigger: ComposerTrigger) -> &'static str {
         match self {
+            Self::Command => "命令 · 立即执行",
             Self::Skill => "技能",
             Self::Tool => "工具",
             Self::Agent if trigger == ComposerTrigger::Mention => "子智能体",
@@ -419,6 +423,7 @@ impl MenuGroup {
 
     fn icon(self) -> &'static str {
         match self {
+            Self::Command => icons::TERMINAL,
             Self::Skill => icons::SPARKLES,
             Self::Tool => icons::WRENCH,
             Self::Agent => icons::BRANCH,
@@ -428,6 +433,7 @@ impl MenuGroup {
 
     fn tint(self, theme: &Theme) -> gpui::Hsla {
         match self {
+            Self::Command => theme.accent,
             Self::Skill => theme.agent_purple,
             Self::Tool => theme.text_muted,
             Self::Agent => theme.agent_blue,
@@ -445,11 +451,16 @@ pub(crate) struct MenuItem {
     pub detail: String,
     /// Present for skills so selection can stage the body immediately.
     skill: Option<Skill>,
+    /// Present for host commands: selection runs it instead of inserting text.
+    command: Option<crate::commands::SlashCommand>,
 }
 
 impl MenuItem {
     fn title(&self) -> String {
         match self.group {
+            // Commands keep their sigil in the row so `/compact` reads exactly
+            // like what the user would type.
+            MenuGroup::Command => format!("/{}", self.insert),
             MenuGroup::File | MenuGroup::Agent => format!("@{}", self.insert),
             MenuGroup::Tool => format!("/{}", self.insert),
             MenuGroup::Skill => format!("${}", self.insert),
@@ -464,6 +475,7 @@ fn build_items(catalog: &ComposerCatalog, trigger: ComposerTrigger, query: &str)
             append_skills(&mut items, &catalog.skills, query, &catalog.workspace);
         }
         ComposerTrigger::Command => {
+            append_commands(&mut items, query);
             append_skills(&mut items, &catalog.skills, query, &catalog.workspace);
             append_tools(&mut items, &catalog.tools, query);
             append_agents(&mut items, &catalog.agents, query);
@@ -479,6 +491,24 @@ fn build_items(catalog: &ComposerCatalog, trigger: ComposerTrigger, query: &str)
         }
     }
     items
+}
+
+/// Host commands come first: they act immediately, so they are the shortest
+/// path from "type /" to "context shrunk".
+fn append_commands(items: &mut Vec<MenuItem>, query: &str) {
+    for command in crate::commands::SlashCommand::ALL {
+        if fuzzy_score(query, command.name()).is_none() {
+            continue;
+        }
+        items.push(MenuItem {
+            group: MenuGroup::Command,
+            insert: command.name().to_string(),
+            description: command.description().to_string(),
+            detail: command.detail().to_string(),
+            skill: None,
+            command: Some(*command),
+        });
+    }
 }
 
 fn append_skills(items: &mut Vec<MenuItem>, catalog: &[Skill], query: &str, workspace: &Path) {
@@ -504,6 +534,7 @@ fn append_skills(items: &mut Vec<MenuItem>, catalog: &[Skill], query: &str, work
                 skill.display_path(workspace)
             ),
             skill: Some(skill.clone()),
+            command: None,
         });
     }
 }
@@ -527,6 +558,7 @@ fn append_tools(items: &mut Vec<MenuItem>, catalog: &[ToolEntry], query: &str) {
             description: truncate(&tool.description, 90),
             detail: String::new(),
             skill: None,
+            command: None,
         });
     }
 }
@@ -555,6 +587,7 @@ fn append_agents(items: &mut Vec<MenuItem>, catalog: &[AgentEntry], query: &str)
                 ""
             ),
             skill: None,
+            command: None,
         });
     }
 }
@@ -581,6 +614,7 @@ fn ranked_files(files: &[FileEntry], query: &str, limit: usize) -> Vec<MenuItem>
             description: String::new(),
             detail: parent_dir(&file.path),
             skill: None,
+            command: None,
         })
         .collect()
 }
@@ -945,6 +979,19 @@ impl AppView {
         let range = self.composer_menu.token_range.clone();
         if range.end > self.composer_state.read(cx).content().len() {
             self.composer_menu.close();
+            return;
+        }
+        // A command is an action, not a reference: run it now and drop the
+        // half-typed token instead of inserting `/compact` for the user to send.
+        if let Some(command) = item.command {
+            self.composer_state.update(cx, |state, cx| {
+                state.replace_byte_range(range, "", window, cx);
+            });
+            self.composer_menu.dismissed = None;
+            self.composer_menu.close();
+            self.composer_focus_handle(cx).focus(window);
+            self.run_slash_command(command, String::new(), window, cx);
+            cx.notify();
             return;
         }
         let insert = format!("{} ", item.insert);
@@ -1510,17 +1557,34 @@ mod tests {
         assert_eq!(
             groups,
             vec![
+                MenuGroup::Command,
                 MenuGroup::Skill,
                 MenuGroup::Skill,
                 MenuGroup::Tool,
                 MenuGroup::Agent
             ]
         );
-        assert_eq!(items[0].insert, "lint");
-        assert_eq!(items[0].title(), "$lint");
-        assert_eq!(items[2].title(), "/read_file");
-        assert_eq!(items[3].title(), "@explore");
-        assert!(items[0].skill.is_some());
+        assert_eq!(items[0].insert, "compact");
+        assert_eq!(items[0].title(), "/compact");
+        assert!(items[0].command.is_some());
+        assert_eq!(items[1].insert, "lint");
+        assert_eq!(items[1].title(), "$lint");
+        assert_eq!(items[3].title(), "/read_file");
+        assert_eq!(items[4].title(), "@explore");
+        assert!(items[1].skill.is_some());
+    }
+
+    #[test]
+    fn command_menu_filters_commands_by_query() {
+        // Typing `/com` narrows to the command; typing `/read` does not.
+        let items = build_items(&catalog(), ComposerTrigger::Command, "com");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group, MenuGroup::Command);
+        assert_eq!(items[0].insert, "compact");
+
+        let items = build_items(&catalog(), ComposerTrigger::Command, "read");
+        assert!(items.iter().all(|item| item.group != MenuGroup::Command));
+        assert_eq!(items[0].title(), "/read_file");
     }
 
     #[test]
@@ -1617,11 +1681,20 @@ mod tests {
     fn menu_row_index_counts_headers() {
         let items = vec![
             MenuItem {
+                group: MenuGroup::Command,
+                insert: "c".into(),
+                description: String::new(),
+                detail: String::new(),
+                skill: None,
+                command: None,
+            },
+            MenuItem {
                 group: MenuGroup::Skill,
                 insert: "a".into(),
                 description: String::new(),
                 detail: String::new(),
                 skill: None,
+                command: None,
             },
             MenuItem {
                 group: MenuGroup::Tool,
@@ -1629,9 +1702,11 @@ mod tests {
                 description: String::new(),
                 detail: String::new(),
                 skill: None,
+                command: None,
             },
         ];
         assert_eq!(menu_row_index(&items, 0), 1);
         assert_eq!(menu_row_index(&items, 1), 3);
+        assert_eq!(menu_row_index(&items, 2), 5);
     }
 }

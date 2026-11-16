@@ -4,9 +4,11 @@ use std::rc::Rc;
 
 use effibuddy_agent_core::tool::PermissionMode;
 use effibuddy_agent_core::{
-    ApiFormat, ChatMessage, ChatRequest, ModelCapabilities, ModelConfig, ProfileSource,
-    ProviderConfig, ResolvedModel, SubagentProfile, list_models, merged_subagent_profiles,
+    ApiFormat, ChatMessage, ChatRequest, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS,
+    ModelCapabilities, ModelConfig, ProfileSource, ProviderConfig, ResolvedModel, SubagentProfile,
+    list_models, merged_subagent_profiles,
 };
+use effibuddy_browser::BrowserUseMode;
 use effibuddy_computer::ComputerUseMode;
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, IconButton, Spinner, TextInputOptions,
@@ -107,6 +109,7 @@ pub(crate) struct SettingsState {
     pub workspace_view: Entity<TextInputView>,
     pub default_mode: PermissionMode,
     pub computer_use_mode: ComputerUseMode,
+    pub browser_use_mode: BrowserUseMode,
     pub demo: bool,
     pub status: Option<(bool, String)>,
     /// Settings → 上下文 drafts. All compaction thresholds are percentages of
@@ -176,7 +179,8 @@ impl SettingsState {
         let (model_id, model_id_view) = input(cx, "", "例如 claude-sonnet-4-5");
         let (model_name, model_name_view) = input(cx, "", "显示名称（可选）");
         let (model_context, model_context_view) = input(cx, "", "例如 200000");
-        let (model_max, model_max_view) = input(cx, "", "例如 8192");
+        let (model_max, model_max_view) =
+            input(cx, "", &format!("例如 {DEFAULT_MAX_OUTPUT_TOKENS}"));
         let (model_levels, model_levels_view) = input(cx, "", "low, medium, high（可选）");
 
         let mut state = Self {
@@ -218,6 +222,7 @@ impl SettingsState {
             workspace_view,
             default_mode: config.effective_default_mode(),
             computer_use_mode: config.computer_use_mode,
+            browser_use_mode: config.browser_use_mode,
             demo: config.use_demo,
             status: None,
             compact_enabled: config.compaction.enabled,
@@ -304,6 +309,7 @@ impl AppView {
         self.settings.section = section;
         self.settings.default_mode = self.config.effective_default_mode();
         self.settings.computer_use_mode = self.config.computer_use_mode;
+        self.settings.browser_use_mode = self.config.browser_use_mode;
         self.settings.demo = self.config.use_demo;
         self.settings.compact_enabled = self.config.compaction.enabled;
         self.settings.compact_clear_tools = self.config.compaction.clear_tool_outputs;
@@ -367,8 +373,10 @@ impl AppView {
         // now goes through ModeApprovalGate.
         self.config.auto_approve_tools = self.settings.default_mode == PermissionMode::FullAccess;
         self.config.computer_use_mode = self.settings.computer_use_mode;
+        self.config.browser_use_mode = self.settings.browser_use_mode;
         self.config.use_demo = self.settings.demo;
         self.computer.set_mode(self.settings.computer_use_mode);
+        self.browser.set_mode(self.settings.browser_use_mode);
         match self.config.save() {
             Ok(()) => {
                 self.settings.status = Some((true, "已保存。新任务会使用这些设置。".to_string()));
@@ -814,7 +822,7 @@ impl AppView {
                     model.id.clone(),
                     model.name.clone(),
                     model.context_window.to_string(),
-                    model.max_output_tokens.to_string(),
+                    model.effective_max_output_tokens().to_string(),
                     model
                         .reasoning_levels
                         .iter()
@@ -830,8 +838,8 @@ impl AppView {
                 (
                     String::new(),
                     String::new(),
-                    "128000".to_string(),
-                    "8192".to_string(),
+                    DEFAULT_CONTEXT_WINDOW.to_string(),
+                    DEFAULT_MAX_OUTPUT_TOKENS.to_string(),
                     String::new(),
                     true,
                     true,
@@ -891,6 +899,15 @@ impl AppView {
             cx.notify();
             return;
         }
+        // The output budget is drawn from the same window as the input, so a
+        // value above the context window can never be satisfied.
+        if let (Ok(context_window), Ok(max_output_tokens)) = (&context, &max_output)
+            && *max_output_tokens as usize > *context_window
+        {
+            self.settings.model_editor.error = Some("最大输出不能超过上下文窗口。".to_string());
+            cx.notify();
+            return;
+        }
         let levels: Vec<String> = editor
             .levels
             .read(cx)
@@ -907,8 +924,8 @@ impl AppView {
             return;
         }
         let mut model = default_model_metadata(&model_id, &name);
-        model.context_window = context.unwrap_or(128_000);
-        model.max_output_tokens = max_output.unwrap_or(8_192);
+        model.context_window = context.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        model.max_output_tokens = max_output.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
         model.enabled = editor.enabled;
         model.capabilities = ModelCapabilities {
             tool_call: editor.tool_call,
@@ -1121,6 +1138,7 @@ impl AppView {
                     settings_card(theme, "行为", "默认安全优先")
                         .child(permission_mode_row(theme, self.settings.default_mode, cx))
                         .child(computer_use_row(theme, self.settings.computer_use_mode, cx))
+                        .child(browser_use_row(theme, self.settings.browser_use_mode, cx))
                         .child(toggle_row(
                             theme,
                             "强制离线 Demo",
@@ -1183,7 +1201,7 @@ impl AppView {
                     resolved.max_output_tokens() as usize,
                 )
             })
-            .unwrap_or((128_000, 8_192));
+            .unwrap_or((DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS as usize));
         centered_settings_column(
             div()
                 .child(settings_page_header(
@@ -2151,15 +2169,34 @@ impl AppView {
                             .flex_wrap()
                             .items_center()
                             .gap_1()
+                            // Both budgets are per model and edited through the
+                            // model editor. Name them after what the user
+                            // controls: the input budget is what is left of the
+                            // window after reserving the output budget.
                             .child(badge(
                                 theme,
-                                &format!("ctx {}", format_context_window(model.context_window)),
+                                &format!(
+                                    "输入 {}",
+                                    format_context_window(
+                                        model
+                                            .context_window
+                                            .saturating_sub(
+                                                model.effective_max_output_tokens() as usize
+                                            )
+                                            .max(1)
+                                    )
+                                ),
                                 BadgeTone::Neutral,
                             ))
                             .child(badge(
                                 theme,
-                                &format!("max {}", model.max_output_tokens),
-                                BadgeTone::Neutral,
+                                &format!(
+                                    "输出 {}",
+                                    format_context_window(
+                                        model.effective_max_output_tokens() as usize
+                                    )
+                                ),
+                                BadgeTone::Accent,
                             ))
                             .children(
                                 model
@@ -2204,10 +2241,10 @@ impl AppView {
                             .child(
                                 Button::new(
                                     SharedString::from(format!("model-edit-{}", model.id)),
-                                    "编辑",
+                                    "编辑参数",
                                     theme,
                                 )
-                                .variant(ButtonVariant::Ghost)
+                                .variant(ButtonVariant::Secondary)
                                 .size(ButtonSize::Sm)
                                 .icon(icons::EDIT)
                                 .on_click(cx.listener(
@@ -2456,7 +2493,18 @@ impl AppView {
                                 .child("还没有模型。点击「添加模型」或「获取模型」开始。"),
                         )
                     })
-                    .children(model_rows),
+                    .children(model_rows)
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .line_height(px(16.0))
+                            .text_color(theme.text_faint)
+                            .child(
+                                "输入上限与输出上限按模型单独配置：点任一模型的「编辑参数」即可修改。\
+                                 输出上限即请求里的 max_tokens，输入上限是剩余可用上下文；\
+                                 两者都会参与上下文压缩阈值计算，修改后对新任务生效。",
+                            ),
+                    ),
             )
             .into_any_element()
     }
@@ -2538,33 +2586,25 @@ impl AppView {
                                 .child(editor.id_view.clone())
                                 .child(field_label(&theme, "显示名称", "留空则使用模型 ID"))
                                 .child(editor.name_view.clone())
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(field_label(&theme, "上下文窗口", ""))
-                                                .child(editor.context_view.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(field_label(
-                                                    &theme,
-                                                    "最大输出",
-                                                    "单次请求上限（每模型）",
-                                                ))
-                                                .child(editor.max_output_view.clone()),
-                                        ),
-                                )
+                                // Both budgets are full-width rows like every
+                                // other field in this modal. Side-by-side
+                                // columns overflow the 520px panel: the two
+                                // labels plus their right-aligned hints are
+                                // wider than one half, and flex text does not
+                                // shrink, so the right column was pushed
+                                // outside the panel and became invisible.
+                                .child(field_label(
+                                    &theme,
+                                    "输入上限（上下文窗口）",
+                                    "模型能读入的 token",
+                                ))
+                                .child(editor.context_view.clone())
+                                .child(field_label(
+                                    &theme,
+                                    "输出上限（max_tokens）",
+                                    "单次响应最多生成的 token",
+                                ))
+                                .child(editor.max_output_view.clone())
                                 .child(field_label(
                                     &theme,
                                     "推理档位",
@@ -2791,16 +2831,24 @@ pub(crate) fn field_label(theme: &Theme, label: &str, hint: &str) -> AnyElement 
         .flex()
         .items_baseline()
         .justify_between()
+        .gap_2()
         .mt_2()
         .child(
             div()
+                .flex_none()
                 .text_size(px(12.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(label.to_string()),
         )
+        // The hint is the part that may be long; let it shrink instead of
+        // pushing the row (and anything beside it) past the panel edge.
         .child(
             div()
+                .flex_1()
+                .min_w(px(0.0))
+                .text_right()
+                .truncate()
                 .text_size(px(11.0))
                 .text_color(theme.text_faint)
                 .child(hint.to_string()),
@@ -2971,6 +3019,94 @@ fn computer_use_row(
                         .text_color(theme.warning)
                         .child("需要模型开启视觉能力，截图才能发给模型；Wayland 仅支持全屏。"),
                 ),
+        )
+        .into_any_element()
+}
+
+/// Browser-use preference row. Mirrors `computer_use_row`, but the warning is
+/// about untrusted page content rather than vision capability: the ref pipeline
+/// works without a vision model.
+fn browser_use_row(
+    theme: &Theme,
+    selected: BrowserUseMode,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    const MODES: [(BrowserUseMode, &str); 3] = [
+        (BrowserUseMode::Off, "关闭"),
+        (BrowserUseMode::Session, "会话内准许"),
+        (BrowserUseMode::Always, "默认准许"),
+    ];
+    let description = match selected {
+        BrowserUseMode::Off => "不注册 browser 工具；模型无法打开或读取任何网页。",
+        BrowserUseMode::Session => {
+            "首次使用时弹一次审批卡；允许后本会话内免打扰。计划模式仍禁止改写类动作。"
+        }
+        BrowserUseMode::Always => "所有新会话默认允许；随时可在设置里关闭并结束会话。",
+    };
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .py_1()
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child("浏览器操作（Chromium / DevTools）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_faint)
+                        .child("结构树 + [ref] 句柄 · 仅主代理可用"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .children(MODES.map(|(mode, label)| {
+                    let active = selected == mode;
+                    Button::new(
+                        SharedString::from(format!("browser-mode-{label}")),
+                        label,
+                        theme,
+                    )
+                    .size(ButtonSize::Sm)
+                    .variant(if active {
+                        ButtonVariant::Primary
+                    } else {
+                        ButtonVariant::Secondary
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.settings.browser_use_mode = mode;
+                        cx.notify();
+                    }))
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_faint)
+                        .child(description),
+                )
+                .child(div().text_size(px(11.0)).text_color(theme.warning).child(
+                    "页面内容是不可信输入：不要把它直接当作命令或文件路径执行；\
+                             首次使用会启动独立的浏览器实例。",
+                )),
         )
         .into_any_element()
 }

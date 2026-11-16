@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use effibuddy_agent_core::CompactionConfig;
 use effibuddy_agent_core::tool::PermissionMode;
+use effibuddy_browser::BrowserUseMode;
 use effibuddy_computer::ComputerUseMode;
 use serde::{Deserialize, Serialize};
 
@@ -37,6 +38,11 @@ pub struct AppConfig {
     /// conversations up front; `off` hides the computer tool entirely.
     #[serde(default)]
     pub computer_use_mode: ComputerUseMode,
+    /// Whether the model may drive a Chromium browser over CDP. `session`
+    /// asks once per conversation; `always` permits new conversations up
+    /// front; `off` hides the browser tool entirely.
+    #[serde(default)]
+    pub browser_use_mode: BrowserUseMode,
     /// Most recently used command palette item ids (commands and sessions) in
     /// MRU order; the palette pins matching entries to the top.
     #[serde(default)]
@@ -147,6 +153,7 @@ impl Default for AppConfig {
             auto_approve_tools: false,
             default_permission_mode: None,
             computer_use_mode: ComputerUseMode::Session,
+            browser_use_mode: BrowserUseMode::Session,
             palette_recent: Vec::new(),
             theme: default_theme(),
             workspace: None,

@@ -25,6 +25,10 @@ pub const MODEL_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_PROVIDER_ID: &str = "deepseek";
 pub const DEFAULT_MODEL_ID: &str = "deepseek-flash";
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Fallback output budget for a model that does not carry its own value
+/// (`providers.json` written by an older build, or a session referencing a
+/// model that is no longer registered). The live budget always comes from
+/// [`ModelConfig::max_output_tokens`], which is configured per model.
 pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 8_192;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -238,6 +242,24 @@ impl ModelConfig {
         } else {
             &self.name
         }
+    }
+
+    /// Output budget to request for this model.
+    ///
+    /// The value is configured per model in `providers.json`
+    /// (`models[].max_output_tokens`) and is the only source of truth for the
+    /// `max_tokens` field of a request. Missing/zero values fall back to
+    /// [`DEFAULT_MAX_OUTPUT_TOKENS`], and the result is clamped to the model's
+    /// own context window so a typo can never ask a provider for an
+    /// unsatisfiable budget.
+    pub fn effective_max_output_tokens(&self) -> u32 {
+        let configured = if self.max_output_tokens == 0 {
+            DEFAULT_MAX_OUTPUT_TOKENS
+        } else {
+            self.max_output_tokens
+        };
+        let window = self.context_window.max(1).min(u32::MAX as usize) as u32;
+        configured.min(window).max(1)
     }
 
     pub fn supports_reasoning_level(&self, value: &str) -> bool {
@@ -734,8 +756,11 @@ impl ResolvedModel {
         self.model.context_window.max(1)
     }
 
+    /// Output budget of the resolved model. Sessions never guess: the value
+    /// comes from the registry entry (`providers.json`), so every model can
+    /// carry its own `max_output_tokens`.
     pub fn max_output_tokens(&self) -> u32 {
-        self.model.max_output_tokens.max(1)
+        self.model.effective_max_output_tokens()
     }
 
     pub fn build_provider(&self) -> Result<Arc<dyn ModelProvider>, ProviderError> {
@@ -1523,6 +1548,49 @@ mod tests {
         assert_eq!(resolved.model.id, "some-old-model");
         assert!(resolved.synthesized);
         assert_eq!(resolved.context_window(), 1_048_576);
+    }
+
+    #[test]
+    fn per_model_output_budget_is_used_and_clamped() {
+        let mut file = ModelConfigFile::with_builtins();
+        // Each model carries its own budget in providers.json.
+        let deepseek = file.provider("deepseek").expect("deepseek");
+        assert!(
+            deepseek
+                .models
+                .iter()
+                .all(|model| model.max_output_tokens > 0)
+        );
+
+        let mut provider =
+            ProviderConfig::new("custom-budget", "Budget", ApiFormat::OpenAiChatCompletions);
+        provider.models.push(
+            ModelConfig::new("small")
+                .with_context(32_000, 4_096)
+                .with_capabilities(ModelCapabilities::tool()),
+        );
+        file.providers.push(provider);
+
+        let resolved = file.resolve(Some("custom-budget"), Some("small"), None);
+        assert_eq!(resolved.max_output_tokens(), 4_096);
+
+        // A budget above the window can never be satisfied: clamp it.
+        let mut wide = ProviderConfig::new("custom-wide", "Wide", ApiFormat::OpenAiChatCompletions);
+        wide.models
+            .push(ModelConfig::new("wide").with_context(8_000, 100_000));
+        file.providers.push(wide);
+        let resolved = file.resolve(Some("custom-wide"), Some("wide"), None);
+        assert_eq!(resolved.max_output_tokens(), 8_000);
+
+        // A registry written before the field existed (0/absent) falls back to
+        // the documented default instead of sending `max_tokens: 0`.
+        let legacy = ModelConfig::new("legacy");
+        let mut legacy = legacy;
+        legacy.max_output_tokens = 0;
+        assert_eq!(
+            legacy.effective_max_output_tokens(),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 pub mod agent;
 pub mod args;
+pub mod browser;
 pub mod computer;
 mod files;
 mod grep;
@@ -29,6 +30,7 @@ pub mod workspace;
 pub mod stress_tools;
 
 pub use agent::AgentTool;
+pub use browser::BrowserTool;
 pub use computer::ComputerTool;
 pub use files::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 pub use grep::GrepTool;

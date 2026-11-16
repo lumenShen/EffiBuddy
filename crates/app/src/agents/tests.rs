@@ -5,8 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use effibuddy_agent_core::testing::ScriptedProvider;
+use effibuddy_agent_core::tool::PermissionMode;
 use effibuddy_agent_core::{
     AgentVisibility, Completion, HarnessConfig, SubagentRequest, SubagentSpawner, SubagentStatus,
+    ToolCall,
 };
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
@@ -354,6 +356,123 @@ async fn messaging_to_main_is_forwarded_to_the_ui() {
         }
         _ => panic!("unexpected event"),
     }
+}
+
+/// Regression: a child harness must follow the owning conversation's permission
+/// mode instead of running on a bare broker gate. Before this, FullAccess on the
+/// main conversation still popped a card for every child edit, and Plan mode did
+/// not stop a child from trying.
+#[tokio::test]
+async fn subagents_follow_the_parent_permission_mode() {
+    use std::sync::Mutex;
+
+    let directory = tempfile::tempdir().unwrap();
+    let mode = Arc::new(Mutex::new(PermissionMode::FullAccess));
+
+    // FullAccess: the child's write runs, and no approval card is surfaced.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        Completion::default().with_tool_call(ToolCall::new(
+            "write_file",
+            serde_json::json!({"path": "full.txt", "content": "hi"}),
+        )),
+        Completion::text("wrote it"),
+    ]));
+    let (tx, mut rx) = unbounded_channel();
+    let mode_for_gate = mode.clone();
+    let service = SubagentService::new(
+        provider,
+        "parent-session".to_string(),
+        "deepseek".to_string(),
+        "test-model".to_string(),
+        None,
+        HarnessConfig::default(),
+        String::new(),
+        SessionStore::with_directory(directory.path().join("sessions")),
+        tx,
+        tokio::runtime::Handle::current(),
+        directory.path().to_path_buf(),
+        Arc::new(effibuddy_agent_core::ModelConfigFile::with_builtins()),
+    )
+    .with_permission_mode(Arc::new(move || *mode_for_gate.lock().unwrap()));
+
+    let mut child_request = request(directory.path(), false);
+    // A general-purpose child may mutate the workspace; `explore` is read-only
+    // and would strip the write tool entirely.
+    child_request.profile = "general-purpose".to_string();
+    child_request.read_only = Some(false);
+    let report = service
+        .run(child_request, tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.status,
+        SubagentStatus::Completed,
+        "{:?}",
+        report.error
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("full.txt")).unwrap(),
+        "hi",
+        "FullAccess must let a child edit run without a card"
+    );
+    let mut cards = 0;
+    while let Ok(event) = rx.try_recv() {
+        if let AppEvent::SubagentHarness {
+            event: effibuddy_agent_core::HarnessEvent::ApprovalRequested { .. },
+            ..
+        } = event
+        {
+            cards += 1;
+        }
+    }
+    assert_eq!(
+        cards, 0,
+        "FullAccess must not surface a child approval card"
+    );
+
+    // Plan: the same child write is denied locally, so the file never appears
+    // and the model is told to plan instead.
+    *mode.lock().unwrap() = PermissionMode::Plan;
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        Completion::default().with_tool_call(ToolCall::new(
+            "write_file",
+            serde_json::json!({"path": "planned.txt", "content": "hi"}),
+        )),
+        Completion::text("here is the plan"),
+    ]));
+    let (tx, _rx) = unbounded_channel();
+    let mode_for_gate = mode.clone();
+    let service = SubagentService::new(
+        provider,
+        "parent-session".to_string(),
+        "deepseek".to_string(),
+        "test-model".to_string(),
+        None,
+        HarnessConfig::default(),
+        String::new(),
+        SessionStore::with_directory(directory.path().join("sessions")),
+        tx,
+        tokio::runtime::Handle::current(),
+        directory.path().to_path_buf(),
+        Arc::new(effibuddy_agent_core::ModelConfigFile::with_builtins()),
+    )
+    .with_permission_mode(Arc::new(move || *mode_for_gate.lock().unwrap()));
+
+    let mut child_request = request(directory.path(), false);
+    child_request.profile = "general-purpose".to_string();
+    child_request.read_only = Some(false);
+    let report = service
+        .run(child_request, tokio_util::sync::CancellationToken::new())
+        .await;
+    assert_eq!(
+        report.status,
+        SubagentStatus::Completed,
+        "{:?}",
+        report.error
+    );
+    assert!(
+        !directory.path().join("planned.txt").exists(),
+        "Plan mode must stop a child from writing"
+    );
 }
 
 #[tokio::test]

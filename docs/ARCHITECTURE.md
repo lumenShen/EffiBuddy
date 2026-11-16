@@ -73,7 +73,7 @@ enum ContentBlock {
 | `last_error` | 最近一次失败原因 |
 | `parent_id` | 子代理会话指向父会话；顶层会话为 `None` |
 | `agent_name` / `agent_description` | 子代理档案名与任务描述 |
-| `permission_mode` | 主会话权限模式（`default` / `accept_edits` / `plan` / `full_access`）；旧会话文件缺字段回落 `default` |
+| `permission_mode` | 权限模式（`default` / `accept_edits` / `plan` / `full_access`）；主会话由用户 Shift+Tab 切换，子会话在创建时快照当时档位仅作展示，实际判定走 `HarnessConfig.permission_mode` 闭包；旧会话文件缺字段回落 `default` |
 
 `Message` 额外有 `synthetic` 标记：后台任务通知以 user 角色发送给模型，但 UI 渲染为系统通知而不是用户气泡。`ToolResult.metadata` 保存只给 UI 用的结构化信息（如子代理 id），不会进入请求。
 
@@ -204,6 +204,13 @@ sequenceDiagram
 - `ModelConfigFile`：带 `schema_version` 的注册表、供应商顺序与默认选择；`normalize()` 补齐内置供应商并修正悬空默认值；`resolve()` 对旧会话里已删除的模型生成保守的临时元数据；
 - `ResolvedModel::build_provider()` 按 `ApiFormat` 构造适配器，并把模型上下文窗口注入 `ModelProvider::context_window()`。
 
+输出上限（`max_tokens` / `max_output_tokens`）**不再是全局常量**，而是每个模型自己的字段：
+
+- 唯一来源是 `providers.json` 的 `models[].max_output_tokens`；`ModelConfig::effective_max_output_tokens()` 负责取值：为 0/缺省时回退到 `DEFAULT_MAX_OUTPUT_TOKENS`（8192），并钳制到该模型自己的 `context_window`；
+- 主会话在 `app.rs` 里写入 `HarnessConfig.max_tokens = resolved.max_output_tokens()`，压缩阈值、摘要预算、续写提示都读这一个值；
+- 子代理若在 profile 里固定了另一个模型，会一并采用那个模型的输出预算，而不是沿用父会话的；
+- 适配器只做兜底：`AnthropicMessagesProvider` 因协议要求必须携带 `max_tokens`，仅在请求未给出时使用 `DEFAULT_MAX_OUTPUT_TOKENS`（原先硬编码 8192）；Chat Completions / Responses 在请求缺省时不发送该字段。
+
 三种适配器都实现 `ModelProvider::stream`：
 
 | 适配器 | 请求 | 流式协议 |
@@ -231,10 +238,11 @@ sequenceDiagram
 - **模型摘要**：让当前会话模型生成结构化摘要（`<analysis>` + `<summary>`），请求只带文本、不带工具；失败时回退到本地摘录取并标记 `SummarySource::Heuristic`。
 - **用量校准**：决策取“本地估算（含工具 schema）”与 provider 上报的 `last_prompt_tokens` 的较大值；压缩后把当前足迹改写成压缩后的估算值。
 - **反应式兜底**：provider 报 context overflow 时强制压缩并重试一次；连续摘要失败达到上限后只走本地摘录。
+- **手动压缩 `AgentHarness::run_compaction`**：输入框的 `/compact` 命令走同一套链路（微压缩 + 模型摘要），但忽略触发阈值，因此上下文还没接近窗口上限时也能主动腾出空间；不进入 `run_loop`，不发新的模型请求，完成后直接把“折叠 N 条消息、约 X → Y tokens”写进提示行。仅当可见消息不足两轮（`plan_compaction` 返回 `None`）时是空操作。
 - **后台预压缩（试验，默认关）**：达到“预压缩起点”百分比时，用当前历史快照在后台写摘要，主会话的模型请求/工具调用继续跑；到达触发阈值时校验模型、`compacted_upto`、边界消息和快照后增长量（不超过阈值 40%），通过就直接换入，否则丢弃并正常重压。摘要未写完时最多等 15 秒；`HeldCompaction` 只在内存里，重启即丢。
 - 摘要以 system message 附加，`compacted_upto` 只移动模型可见窗口，transcript 始终完整可追溯。
 
-`CompactionRecord` 额外记录触发器（auto/reactive）、摘要来源、压缩前后 token 与消息数，概览页和诊断可以直接读取。
+`CompactionRecord` 额外记录触发器（auto/reactive/manual）、摘要来源、压缩前后 token 与消息数，概览页和诊断可以直接读取。
 
 ## 8. 工具执行管线
 
@@ -255,7 +263,7 @@ sequenceDiagram
 - 四档 `PermissionMode`（`default` / `accept_edits` / `plan` / `full_access`，Shift+Tab 循环）的本地决策：Default 全转发、AcceptEdits 编辑类本地批准、Plan 编辑与命令类本地拒绝且只读类本地放行、FullAccess 全放行；本地决策不触达内层门，也不产生审批卡；
 - 模式闭包每次审批请求实时读 `SessionState.permission_mode`，运行中 Shift+Tab 对下一次工具调用即生效；
 - Plan 模式下 harness 对**所有**工具询问审批门，不受 `Auto` 策略与「本会话允许」缓存影响：只读工具零打断，编辑与命令被直接拒绝并附「先出计划」文案，`agent` 等其他类仍弹卡由用户决定；
-- 权限模式只装配在主会话上；子代理 harness 用裸 `BrokerApprovalGate`（见 §10），审批卡对子代理请求单独注明「不受主会话权限模式影响」。
+- 权限模式贯通整棵智能体树：`HarnessConfig.permission_mode` 携带主会话的模式闭包，子代理 harness 也装 `ModeApprovalGate` 包住自己的 `BrokerApprovalGate`（见 §10），因此主会话切到完全访问后子代理的编辑与命令同样不再弹卡，切到计划模式后子代理也会被本地拒绝。
 
 工具拿到的 `ToolContext` 包含：工作区 `cwd`、会话 id、调用 id、取消令牌，以及可选的 `NestedToolInvoker`（仅 PTC 使用）与 `FileCheckpointSink`（消息编辑/撤销的文件快照）。
 
@@ -423,11 +431,14 @@ AgentHarness (child) ── HarnessEvent ──▶ AppEvent::SubagentHarness
 
 ### 审批
 
-子 harness 使用自己的裸 `BrokerApprovalGate`（不包模式门：权限模式只对主会话生效，见 §8），事件被转发到同一条 UI 泵：
+子 harness 的审批门是 `ModeApprovalGate` 包住自己的 `BrokerApprovalGate`，模式闭包来自 `HarnessConfig.permission_mode`（主会话注入的那个），所以模式切换对子代理同样实时生效；事件被转发到同一条 UI 泵：
 
 - `AppEvent::SubagentHarness { agent_id, event }` 把 `ApprovalRequested` 标上来源；
 - `AppView.pending_approvals` 是队列，第一项渲染在主输入区；查看子会话时也会在底部渲染同一张卡片；
-- 响应按 `agent_id` 路由回 `SubagentService::respond_approval`。
+- 响应按 `agent_id` 路由回 `SubagentService::respond_approval`；
+- 子会话 `permission_mode` 在创建时快照主会话当前档位，只用于 transcript 展示；判定始终走 config 里的闭包，因此运行中 Shift+Tab 会立刻改变子代理的后续工具调用。
+
+没有 `permission_mode` 闭包时（测试、压测、独立嵌入），子 harness 回落到自己会话的字段，也就是 `default`。
 
 只读档案的工具全部是 `ApprovalPolicy::Auto`；可写子代理的写操作仍然逐次询问，不会因为“子代理”而绕过审批。`workflow_run` 本身是 `Ask`。
 
@@ -549,7 +560,7 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - `app/settings.rs`：左侧分区「通用 / 模型 / 外观 / 关于」。模型分区是供应商列表 + 详情；每个写操作立即原子落盘 `providers.json`；
 - 通用分区含默认权限模式四档分段选择器（保存写 `default_permission_mode` 并同步旧 `auto_approve_tools` 字段），作为新会话的初始档位；
 - 供应商详情：API 格式三选一、Base URL、API Key（留空不修改/清除）、保存、`max_tokens=1` 连通性测试、从 `/models` 拉取模型；
-- 模型列表：启用开关、上下文/最大输出/能力/推理档位、设为默认、编辑/删除；模型编辑器是根级模态框；
+- 模型列表：启用开关、上下文/最大输出/能力/推理档位、设为默认、编辑/删除；模型编辑器是根级模态框，最大输出按模型单独配置并校验为正整数且不超过上下文窗口；
 - `app/model_picker.rs`：点击输入框模型 chip 打开 `anchored()` 菜单，按供应商分组选择模型；切换只影响当前会话，运行中切换注明「下一轮生效」。
 
 ### 主题
@@ -564,6 +575,12 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - 不依赖任何图标字体：所有图标是内嵌 SVG，按 `text_color` 着色。
 
 组件：`Button`、`IconButton`、`Spinner`、`badge` / `small_badge`、`chip`、`dot`、`avatar`、`card`、`divider`、`kbd`、`section_label`、`switch`、`empty_state`、`tooltip`、自定义 `TextInputView`、`render_markdown` / `render_markdown_streaming`、`render_table`（GFM 表格真渲染：unicode-width 量宽、隔行底色与横向滚动，工具栏一键复制 Markdown / CSV）。
+
+### 输入框命令与提及（`app/composer_menu.rs`、`app/commands.rs`）
+
+- **`/` 菜单**：分组顺序是「命令 · 立即执行」→「技能」→「工具」→「子智能体」。命令（目前只有 `/compact`）选中即执行，不会把 `/compact` 插进输入框；技能插入 `$name` 并把 SKILL.md 作为附件；工具与子智能体只插入令牌作为提示。
+- **命令解析**：`commands::split_command` 只认整条消息的第一个 token，`/compact`、`/COMPACT`、`/compact 继续` 都算命令，`/compactor` 与 `/usr/bin/env` 是普通文本。命令后附带的其他文字会被放回输入框并提示重新发送，绝不静默丢弃。
+- **`/compact` 的行为**：运行中、正在编辑消息、或可见消息不足两轮时只给提示、不动数据；否则后台跑一次忽略阈值的压缩，提示行报告折叠条数与 token 变化，不唤醒模型、不污染队列。
 
 ### 自定义输入框
 
@@ -613,8 +630,9 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 | --- | --- | --- |
 | `agent-core` | 93 | loop、压缩、三种 provider 请求体/SSE 与图片 wire body、模型注册表与迁移、子代理档案、`run_pending` 唤醒、权限模式决策矩阵与会话 serde 往返、steer 注入/回合延长/中断回收、mid_turn wire 框架与 serde 默认值 |
 | `agent-js` | 7 | 工具桥、错误可捕获、日志、限额、取消、嵌套 run_js 禁止 |
-| `agent-tools` | 36 | 文件读写、多根路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具 |
+| `agent-tools` | 36 | 文件读写、多根路径越界、grep、shell、todo、PTC 端到端、`agent` 前台/后台、JSON 契约与工作流、`computer` 工具、`browser` 工具（答辩态与参数校验） |
 | `computer` | 17 | frame 坐标映射/缩放/过期、key chord、截图/点击/停车位/暂停/停止状态机、FakeBackend |
+| `browser` | 72 | CDP 传输（id 关联、事件广播、断连失败关闭）、DevToolsActivePort 解析、key chord → CDP key spec、快照剪枝/去重/ref 编号/文本渲染、console/network 环形缓冲与游标、URL/SSRF 策略、FakeBrowser |
 | `ui` | 42 | 表格事件收集、列宽测量、Markdown round-trip、CSV 转义与公式注入防护、motion |
 | `app` | 108 | reveal 的 UTF-8 边界、聊天项构建与工具结果配对、子代理生命周期与消息唤醒、关系图布局、页签/模型配置状态、命令面板评分与排序、diff 解析/词级高亮/折叠、数据目录解析与环境变量覆盖、项目注册表迁移与多根解析、电脑授权门 |
 | `deepseek_live` | 4（ignored） | 1-token 探针、单次聊天、工具 loop、PTC loop |
@@ -673,6 +691,67 @@ ComputerBackend（x11 / wayland / win32 / fake）
 - Plan 模式 → 修改类 action 直接拒绝，只读截图/列表仍可询问。
 
 `computer` 的 `ApprovalPolicy` 固定为 `Ask`，这样 harness 一定会咨询上述门。
+
+## 15.1 Browser Use（浏览器操控）
+
+### 分层
+
+```
+browser 工具（agent-tools）
+    │  参数校验 / 输出 JSON / 截图转 ImageAttachment
+    ▼
+BrowserRuntime（effibuddy-browser::runtime）
+    │  会话授权 / snapshot 与 frame 登记 / URL 策略 / overlay 文案
+    ▼
+BrowserBackend（cdp / fake）
+    │  AX 快照、ref 动作、console/network journal、等待策略
+    ▼
+CdpConnection（protocol）→ WebSocket → Chromium DevTools
+```
+
+`effibuddy-browser` 不依赖 agent-core 或 UI，和 `computer-use` 平行。`browser` 同样只在
+主代理 registry 中注册。
+
+### 为什么是结构树
+
+默认模型没有视觉能力，纯截图路线在默认配置下不可用。快照脚本在页面里遍历 DOM，
+按 ARIA/标签推导 role/name/state 与 `getBoundingClientRect`，Rust 侧做剪枝（交互元素、
+标题、图片、live region）、去重（role+name+box 重叠 > 80%）与 `eN` 编号。
+
+每个节点在页面侧被打上 `data-effi-i="<n>"`，ref 直接映射到它。动作时通过该标记重新
+解析到**同一个元素**——不靠文本或坐标猜测，页面重渲染导致标记消失时失败关闭。
+
+### 授权门
+
+`BrowserApprovalGate` 包住 `ModeApprovalGate`，语义与 computer 一致，另外区分动作等级：
+
+- `snapshot` / `text` / `console` / `network` / `tabs` / `screenshot` / `wait_for`：只读；
+- `navigate` / `click` / `type` / `hover` / `press_key` / `scroll` / `select` /
+  `set_checked` / 标签页操作：改写类；
+- `eval` / `upload`：特权类（页面域脚本、工作区文件上传）。
+
+计划模式下改写类与特权类直接拒绝，只读动作仍可询问。
+
+### Snapshot 与 frame
+
+- runtime 保留最近 4 个 snapshot 与 4 张截图，`snapshot_id` / `frame_id` 过期即
+  `STALE_SNAPSHOT` / `STALE_FRAME`。
+- 页内动作不等待导航时只读 `readyState`；`wait=load` 会等到 `complete` 再静默 500ms，
+  避免在首帧未绘制时生成空快照。
+- 像素点击的坐标是截图像素，runtime 用 `PageFrame` 的缩放换算回 CSS 像素。
+
+### Journal
+
+`Journal` 是两个定长环形缓冲（console 2000 / network 2000）加游标：`next` 是最后写入
+的 seq，`dropped` 是累计被挤出的条数。网络请求在 `loadingFinished` 时才入 ring，因为
+状态码与耗时才是模型要看的；`data:`/`blob:`/favicon 直接丢弃。
+
+### 引擎
+
+不内嵌 WebView：优先复用系统 Chrome/Edge/Chromium，其次数据目录里的
+`chrome-headless-shell`，并支持 `EFFIBUDDY_BROWSER_PATH` 覆盖。每个会话用独立 profile，
+端口从 `DevToolsActivePort` 读取，退出时关闭自己启动的进程。详见
+[`BROWSER_USE.md`](BROWSER_USE.md)。
 
 ### Frame 与坐标
 

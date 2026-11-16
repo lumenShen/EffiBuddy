@@ -169,6 +169,26 @@ pub struct HarnessConfig {
     /// mutation here before/after writing; the host stores the original bytes
     /// so a user message can later be edited or undone without Git.
     pub checkpoint_sink: Option<crate::checkpoint::SharedFileCheckpointSink>,
+    /// Live permission-mode source. `None` means "read
+    /// [`crate::session::SessionState::permission_mode`] from this harness's own
+    /// session", which is right for the main session. Child harnesses get the
+    /// owning conversation's provider so one Shift+Tab applies to the whole
+    /// agent tree — a subagent must not keep asking (or keep refusing) after
+    /// the user switched mode.
+    pub permission_mode: Option<Arc<dyn Fn() -> PermissionMode + Send + Sync>>,
+}
+
+impl HarnessConfig {
+    /// Effective permission mode for a tool call in this harness.
+    pub fn effective_permission_mode(
+        &self,
+        session: &crate::session::SharedSession,
+    ) -> PermissionMode {
+        match &self.permission_mode {
+            Some(provider) => provider(),
+            None => lock_session(session).permission_mode,
+        }
+    }
 }
 
 impl Default for HarnessConfig {
@@ -193,6 +213,7 @@ impl Default for HarnessConfig {
             agent_name: None,
             agent_depth: 0,
             checkpoint_sink: None,
+            permission_mode: None,
         }
     }
 }
@@ -466,6 +487,77 @@ impl AgentHarness {
         self.run_turn_inner(None, Vec::new()).await
     }
 
+    /// Compact the transcript on demand — the composer's `/compact` command.
+    ///
+    /// Uses the same pipeline as the automatic path (microcompact, then a
+    /// model-written rolling summary with an extractive fallback) but ignores
+    /// the token threshold, so the user can shrink the context before the
+    /// window is full. The transcript itself is never rewritten: only
+    /// `compacted_upto` and the compaction record move, exactly like an
+    /// automatic pass. Returns immediately with no `ContextCompacted` event
+    /// when there is nothing summarizable (fewer than two conversation rounds
+    /// after the last compaction).
+    pub async fn run_compaction(&self) -> Result<RunOutcome, AgentError> {
+        let run_id = new_id();
+        let session_id = {
+            let mut session = lock_session(&self.session);
+            if session.status.is_busy() {
+                return Err(AgentError::Busy);
+            }
+            session.set_status(RunStatus::Running);
+            session.steps = 0;
+            session.last_error = None;
+            session.id.clone()
+        };
+
+        self.reset_cancel_token();
+        let cancel = self.cancel_token();
+        self.emit(HarnessEvent::RunStarted {
+            run_id: run_id.clone(),
+            session_id,
+        });
+
+        let outcome = self.compact_once(&cancel).await;
+
+        {
+            let mut session = lock_session(&self.session);
+            session.set_status(RunStatus::Idle);
+            session.touch();
+        }
+        self.reset_cancel_token();
+        self.emit(HarnessEvent::RunFinished {
+            run_id,
+            outcome: outcome.clone(),
+        });
+        Ok(outcome)
+    }
+
+    async fn compact_once(&self, cancel: &CancellationToken) -> RunOutcome {
+        let system_prompt = self.system_prompt();
+        let tool_tokens = context::estimate_tool_specs_tokens(&self.tools.specs());
+        match self
+            .compact_if_needed(
+                &system_prompt,
+                tool_tokens,
+                crate::session::CompactionTrigger::Manual,
+                true,
+                cancel,
+            )
+            .await
+        {
+            Some(record) => {
+                self.emit(HarnessEvent::ContextCompacted { record });
+                RunOutcome::Completed
+            }
+            // Cancelled mid-summary: the host already told the user it stopped.
+            None if cancel.is_cancelled() => RunOutcome::Interrupted,
+            // Nothing summarizable, or the summary request produced no text and
+            // the extractive fallback was empty too. Not an error: the caller
+            // reports "nothing to compact".
+            None => RunOutcome::Completed,
+        }
+    }
+
     async fn run_turn_inner(
         &self,
         input: Option<String>,
@@ -734,7 +826,9 @@ impl AgentHarness {
         cancel: &CancellationToken,
     ) -> Option<CompactionRecord> {
         let config = self.config.compaction.clone();
-        if !config.enabled {
+        // `force` is the manual (/compact) and reactive path: an explicit
+        // request still compacts when the automatic switch is off.
+        if !config.enabled && !force {
             return None;
         }
         let thresholds = config.thresholds(
@@ -1555,10 +1649,9 @@ impl ToolExecutor {
             return (result, false);
         }
 
-        let permission_mode = {
-            let session = lock_session(&self.session);
-            session.permission_mode
-        };
+        // `permission_mode` is resolved through the config so a child harness
+        // follows the owning conversation's mode (see `HarnessConfig`).
+        let permission_mode = self.config.effective_permission_mode(&self.session);
         let already_approved = self
             .approved
             .lock()
@@ -2300,6 +2393,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_compaction_ignores_the_threshold_and_records_its_trigger() {
+        // A small transcript far below the trigger: `/compact` must still
+        // summarize, and the record must say the user asked for it.
+        let (harness, handle, mut events, provider) = harness_with(
+            vec![Completion::text(
+                "<analysis>x</analysis><summary>manual summary</summary>",
+            )],
+            default_tools(),
+            HarnessConfig {
+                context_window_override: Some(1_000_000),
+                compaction: crate::context::CompactionConfig::default(),
+                ..HarnessConfig::default()
+            },
+        );
+        seed_long_turn(&harness, 4, "short output");
+
+        let outcome = harness.run_compaction().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        let record = session
+            .compaction
+            .as_ref()
+            .expect("manual compaction record");
+        assert_eq!(record.trigger, crate::session::CompactionTrigger::Manual);
+        assert_eq!(record.summary_source, crate::session::SummarySource::Model);
+        assert!(record.summary.contains("manual summary"));
+        assert!(record.compacted_messages > 0);
+        assert_eq!(session.status, RunStatus::Idle);
+        drop(session);
+
+        let mut saw_compaction = false;
+        let mut saw_finished = false;
+        while let Ok(event) = events.try_recv() {
+            match event {
+                HarnessEvent::ContextCompacted { .. } => saw_compaction = true,
+                HarnessEvent::RunFinished { .. } => saw_finished = true,
+                _ => {}
+            }
+        }
+        assert!(saw_compaction);
+        assert!(saw_finished);
+        // Exactly one summary request: the manual path never re-enters the step
+        // loop, so no follow-up main request is sent.
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_reports_nothing_to_do_on_an_empty_transcript() {
+        let (harness, handle, mut events, provider) =
+            harness_with(Vec::new(), default_tools(), HarnessConfig::default());
+
+        let outcome = harness.run_compaction().await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+
+        let shared = handle.session();
+        let session = lock_session(&shared);
+        assert!(session.compaction.is_none());
+        assert_eq!(session.status, RunStatus::Idle);
+        drop(session);
+        assert!(provider.requests().is_empty());
+        let mut saw_compaction = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, HarnessEvent::ContextCompacted { .. }) {
+                saw_compaction = true;
+            }
+        }
+        assert!(!saw_compaction);
+    }
+
+    #[tokio::test]
     async fn microcompact_avoids_a_model_summary_when_clearing_is_enough() {
         let (harness, handle, _, provider) = harness_with(
             vec![Completion::text("done")],
@@ -2694,6 +2859,83 @@ mod tests {
             result.content.contains("Plan"),
             "denial should explain plan mode: {}",
             result.content
+        );
+    }
+
+    /// Regression: a child harness resolves its permission mode through
+    /// `HarnessConfig::permission_mode`, not its own fresh session. Before this,
+    /// subagent harnesses ran on a bare broker gate, so FullAccess on the main
+    /// conversation still popped an approval card for every child edit.
+    #[tokio::test]
+    async fn config_permission_mode_provider_overrides_the_session_field() {
+        struct AskEditTool {
+            calls: Arc<Mutex<Vec<Value>>>,
+        }
+
+        #[async_trait]
+        impl Tool for AskEditTool {
+            fn name(&self) -> &str {
+                "write_file"
+            }
+            fn description(&self) -> &str {
+                "Write a file"
+            }
+            fn parameters(&self) -> Value {
+                json!({"type": "object"})
+            }
+            fn approval(&self) -> ApprovalPolicy {
+                ApprovalPolicy::Ask
+            }
+            async fn execute(
+                &self,
+                _ctx: ToolContext,
+                arguments: Value,
+            ) -> Result<ToolOutput, ToolError> {
+                self.calls.lock().unwrap().push(arguments);
+                Ok(ToolOutput::text("written"))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(AskEditTool {
+            calls: calls.clone(),
+        });
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        // The child's own session stays on the default mode; only the closure
+        // that the host installs decides.
+        assert_eq!(
+            lock_session(&session).permission_mode,
+            PermissionMode::Default
+        );
+        let mode = Arc::new(Mutex::new(PermissionMode::FullAccess));
+        let mode_for_gate = mode.clone();
+        let gate = Arc::new(crate::tool::ModeApprovalGate::new(
+            Arc::new(crate::tool::DenyApprovalGate),
+            Arc::new(move || *mode_for_gate.lock().unwrap()),
+        ));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            Completion::default().with_tool_call(ToolCall::new("write_file", json!({"path": "a"}))),
+            Completion::text("done"),
+        ]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session.clone(),
+            provider,
+            Arc::new(tools),
+            gate,
+            HarnessConfig {
+                permission_mode: Some(Arc::new(move || *mode.lock().unwrap())),
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+        let outcome = harness.run_turn("write it").await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "FullAccess must auto-approve child edits"
         );
     }
 

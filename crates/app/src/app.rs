@@ -16,7 +16,8 @@ use effibuddy_agent_core::{
     SubagentProfile, SubagentReport, SubagentSpawner, SubagentStatus, TodoStatus, ToolCall,
     ToolResult, Usage, UserAttachment, lock_session, new_shared_session,
 };
-use effibuddy_agent_tools::{ComputerTool, builtin_tools_with_roots};
+use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_roots};
+use effibuddy_browser::BrowserUseMode;
 use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, CONTROL_MOTION, IconButton, MotionController,
@@ -34,6 +35,7 @@ use gpui::{
 use serde_json::json;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
+use crate::browser::BrowserApprovalGate;
 use crate::chat::{
     AgentCard, ChatList, JumpFlash, PromptRailState, RunSnapshot, agent_color, render_chat_item,
     render_prompt_rail as render_prompt_rail_element, render_scroll_to_bottom, render_scrollbar,
@@ -229,6 +231,13 @@ pub(crate) struct ActiveRun {
     started_at: Instant,
     /// Bound to the user message that owns this run once `RunStarted` lands.
     checkpoint: Option<Arc<crate::checkpoint::CheckpointRecorder>>,
+    /// True for a `/compact` pass: it owns no user turn, must not resume the
+    /// queue when it ends, and reports its own result instead of the generic
+    /// "已停止当前任务" notice.
+    manual_compaction: bool,
+    /// The record produced by this manual pass, captured from
+    /// `ContextCompacted` so the completion notice can name the token drop.
+    compaction_record: Option<effibuddy_agent_core::CompactionRecord>,
 }
 
 /// UI state that belongs to one conversation but is not part of the transcript:
@@ -477,6 +486,8 @@ pub struct AppView {
     /// Update check state (see `update.rs`); results arrive via `AppEvent`.
     pub(crate) update: crate::update::UpdateState,
 
+    /// Shared browser-use runtime: consent, CDP session, snapshot refs.
+    pub(crate) browser: Arc<effibuddy_browser::BrowserRuntime>,
     /// Shared computer-use runtime: consent, frames, pause/stop and the
     /// platform backend. One per app; only the main agent gets the tool.
     pub(crate) computer: Arc<effibuddy_computer::ComputerRuntime>,
@@ -1045,6 +1056,14 @@ impl AppView {
             },
         );
 
+        // Browser use mirrors computer use: the runtime is created once and
+        // the mode is re-read from config so Settings changes apply live.
+        let browser = Arc::new(effibuddy_browser::BrowserRuntime::with_data_dir(
+            effibuddy_browser::create_backend(),
+            crate::config::base_dir().join("browser"),
+        ));
+        browser.set_mode(config.browser_use_mode);
+
         // Read the collapse flags before `config` moves into the struct.
         let sidebar_collapsed = config.sidebar_collapsed;
         let side_bar_open = config.side_bar_open;
@@ -1069,6 +1088,7 @@ impl AppView {
             edit_conflict: None,
             update: Default::default(),
             computer,
+            browser,
             computer_overlay: None,
             self_weak,
             _window_closed_subscription: window_closed_subscription,
@@ -2434,6 +2454,12 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let text = text.trim().to_string();
+        // A slash command is a host action, never a model turn. It runs before
+        // the empty-message check because `/compact` carries no prose.
+        if let Some((command, rest)) = crate::commands::split_command(&text) {
+            self.run_slash_command(command, rest, window, cx);
+            return;
+        }
         // A `$skill` reference may have been typed rather than picked from the
         // menu; stage/reconcile its attachment before deciding the message is
         // empty.
@@ -2484,6 +2510,283 @@ impl AppView {
             return;
         }
         self.start_run(Some(RunInput { text, attachments }), cx);
+    }
+
+    /// Run a `/command` typed into the composer. The composer is already empty
+    /// (submit takes the text out), so every early exit only needs to explain
+    /// itself in the notice line.
+    pub(crate) fn run_slash_command(
+        &mut self,
+        command: crate::commands::SlashCommand,
+        rest: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match command {
+            crate::commands::SlashCommand::Compact => {
+                if self.edit_message.is_some() {
+                    self.notice = Some("正在编辑消息，请先取消编辑再压缩上下文。".to_string());
+                    self.chat_dirty = true;
+                    cx.notify();
+                    return;
+                }
+                if !rest.is_empty() {
+                    // Do not silently drop the user's prose: ask for it again.
+                    let leftover = rest.clone();
+                    self.composer_state.update(cx, |state, cx| {
+                        state.set_content(leftover, window, cx);
+                    });
+                    self.notice = Some(
+                        "/compact 不接受参数。请输入 /compact 压缩上下文，再单独发送其他内容。"
+                            .to_string(),
+                    );
+                    self.chat_dirty = true;
+                    cx.notify();
+                    return;
+                }
+                self.compact_context(cx);
+            }
+        }
+    }
+
+    /// `/compact`: summarize the visible transcript and shrink the request
+    /// window immediately, without starting a model turn.
+    fn compact_context(&mut self, cx: &mut Context<Self>) {
+        // Compact the conversation in front. A parked conversation is compacted
+        // from its own row instead of pulling the UI away from what is shown.
+        let Some(shared) = self.active_shared() else {
+            self.last_error = Some("没有活动会话。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return;
+        };
+        let session_id = lock_session(&shared).id.clone();
+        if self.run_active_for(&session_id) {
+            self.notice = Some("当前任务仍在运行，结束后才能压缩上下文。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return;
+        }
+        // The summary is written by the session model, so an unusable provider
+        // must be reported before anything is spent.
+        if !self.run_ready(cx) {
+            return;
+        }
+        let Some(plan) = self.compaction_plan_preview(&shared) else {
+            self.notice = Some(
+                "没有可压缩的内容：至少需要两轮对话（当前及更早的问答）才能生成摘要。".to_string(),
+            );
+            self.chat_dirty = true;
+            cx.notify();
+            return;
+        };
+
+        let Some(runtime_handle) = self.runtime.as_ref().map(|runtime| runtime.handle()) else {
+            self.last_error = Some("后台运行时不可用。".to_string());
+            self.chat_dirty = true;
+            cx.notify();
+            return;
+        };
+        let resolved = self.active_resolved_model();
+        let demo_mode = self.models.demo_mode(self.config.use_demo, &resolved);
+        let provider: Arc<dyn ModelProvider> = if demo_mode {
+            Arc::new(DemoProvider::new())
+        } else {
+            match resolved.build_provider_for(Some(&session_id)) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    self.last_error = Some(format!("无法创建模型客户端：{error}"));
+                    self.chat_dirty = true;
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+
+        // The manual path only needs the prompt text and the tool schemas: no
+        // tool execution happens, so the registry is only measured. It mirrors
+        // the run path so the estimate matches what a real request would cost.
+        let (workspace, additional_workspaces) = self.workspace_roots_for_session(&shared);
+        let mut tools = match builtin_tools_with_roots(&workspace, &additional_workspaces) {
+            Ok(tools) => tools,
+            Err(error) => {
+                self.last_error = Some(format!("无法打开工作区 {}：{error}", workspace.display()));
+                self.chat_dirty = true;
+                cx.notify();
+                return;
+            }
+        };
+        if self.config.computer_use_mode.is_enabled() {
+            tools.register(ComputerTool::new(
+                self.computer.clone(),
+                resolved.model.capabilities.vision,
+            ));
+        }
+        if self.config.browser_use_mode.is_enabled()
+            && let Ok(sandbox) = Workspace::with_roots(&workspace, &additional_workspaces)
+        {
+            tools.register(BrowserTool::new(
+                self.browser.clone(),
+                resolved.model.capabilities.vision,
+                sandbox,
+            ));
+        }
+        let project_instructions = crate::config::project_instructions_for(&workspace);
+        let permission_mode = lock_session(&shared).permission_mode;
+        let system_prompt_extra = if permission_mode == PermissionMode::Plan {
+            format!("{}\n\n{}", project_instructions, PLAN_MODE_SYSTEM_PROMPT)
+        } else {
+            project_instructions
+        };
+        let harness_config = HarnessConfig {
+            max_tokens: Some(resolved.max_output_tokens()),
+            temperature: self.config.temperature,
+            reasoning_effort: resolved.reasoning_level.clone(),
+            context_window_override: if demo_mode {
+                None
+            } else {
+                Some(resolved.context_window())
+            },
+            auto_approve_tools: false,
+            compaction: self.config.compaction.clone(),
+            system_prompt_extra,
+            additional_workspaces: additional_workspaces.clone(),
+            project_id: lock_session(&shared).project_id.clone(),
+            tool_timeout: Duration::from_secs(180),
+            ..HarnessConfig::default()
+        };
+
+        let (harness_tx, mut harness_rx) = unbounded_channel::<HarnessEvent>();
+        // The summary request never runs a tool, so a deny-all gate is both
+        // correct and inert; it only keeps the harness constructor happy.
+        let approval = Arc::new(BrokerApprovalGate::new(
+            harness_tx.clone(),
+            Duration::from_secs(600),
+        ));
+        let harness = Arc::new(AgentHarness::new(
+            shared.clone(),
+            provider,
+            Arc::new(tools),
+            Arc::new(effibuddy_agent_core::DenyApprovalGate),
+            harness_config,
+            harness_tx,
+        ));
+        let handle = harness.handle();
+
+        {
+            let mut session = lock_session(&shared);
+            session.steps = 0;
+            session.last_error = None;
+        }
+
+        let forward_tx = self.app_tx.clone();
+        let forward_session_id = session_id.clone();
+        runtime_handle.spawn(async move {
+            while let Some(event) = harness_rx.recv().await {
+                if forward_tx
+                    .send(AppEvent::Main {
+                        session_id: forward_session_id.clone(),
+                        event,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let done_tx = self.app_tx.clone();
+        let done_session_id = session_id.clone();
+        let done_shared = shared.clone();
+        runtime_handle.spawn(async move {
+            let result = harness.run_compaction().await;
+            // `run_compaction` already restored Idle; repeat it on the error
+            // path so a failed spawn can never leave a pinned "working" ring.
+            if result.is_err() {
+                lock_session(&done_shared).set_status(RunStatus::Idle);
+            }
+            if let Err(error) = &result {
+                let _ = done_tx.send(AppEvent::Main {
+                    session_id: done_session_id,
+                    event: HarnessEvent::RunFinished {
+                        run_id: String::new(),
+                        outcome: RunOutcome::Failed(error.to_string()),
+                    },
+                });
+            }
+        });
+
+        self.session_shares
+            .insert(session_id.clone(), shared.clone());
+        let run = ActiveRun {
+            session_id: session_id.clone(),
+            shared: shared.clone(),
+            run_id: None,
+            handle,
+            approval,
+            started_at: Instant::now(),
+            checkpoint: None,
+            manual_compaction: true,
+            compaction_record: None,
+        };
+        self.active_run = Some(run);
+        self.pending_approvals
+            .retain(|pending| pending.agent_id.is_some());
+        self.last_error = None;
+        self.notice = Some(format!(
+            "正在压缩上下文（{} 条 → 保留 {} 条）…",
+            plan.summarized_messages, plan.kept_messages
+        ));
+        self.retry_status = None;
+        self.chat_dirty = true;
+        self.ensure_run_ticker(cx);
+        cx.notify();
+    }
+
+    /// What `/compact` would do right now, so the confirmation notice can name
+    /// the message counts. `None` means the pass would be a no-op.
+    fn compaction_plan_preview(
+        &self,
+        shared: &SharedSession,
+    ) -> Option<effibuddy_agent_core::context::CompactionPlan> {
+        let resolved = self.active_resolved_model();
+        let thresholds = self.config.compaction.thresholds(
+            resolved.context_window(),
+            Some(resolved.max_output_tokens() as usize),
+        );
+        let session = lock_session(shared);
+        effibuddy_agent_core::context::plan_compaction(&session, thresholds.keep_tokens)
+    }
+
+    /// The completion notice for a `/compact` pass. Shared with the
+    /// background path so both report the same numbers.
+    #[allow(clippy::wrong_self_convention)]
+    fn manual_compaction_notice(
+        outcome: &RunOutcome,
+        record: Option<effibuddy_agent_core::CompactionRecord>,
+    ) -> String {
+        match outcome {
+            RunOutcome::Failed(error) => format!("压缩失败：{error}"),
+            RunOutcome::Interrupted => "已取消压缩。".to_string(),
+            RunOutcome::Completed => match record {
+                Some(record) => {
+                    let saved = record.pre_tokens.saturating_sub(record.post_tokens);
+                    let label = match record.summary_source {
+                        effibuddy_agent_core::SummarySource::Model => "模型摘要",
+                        effibuddy_agent_core::SummarySource::Heuristic => {
+                            "本地摘录（摘要请求失败）"
+                        }
+                    };
+                    format!(
+                        "已压缩上下文：{} 条消息折叠为摘要（{label}），约 {} → {} tokens（减少 {}）。",
+                        record.summarized_messages,
+                        crate::commands::format_tokens(record.pre_tokens),
+                        crate::commands::format_tokens(record.post_tokens),
+                        crate::commands::format_tokens(saved)
+                    )
+                }
+                None => "没有可压缩的内容：当前上下文已经足够短。".to_string(),
+            },
+        }
     }
 
     /// Drop one pending input from the queue bar.
@@ -3146,6 +3449,20 @@ impl AppView {
                 resolved.model.capabilities.vision,
             ));
         }
+        // Browser use is likewise main-agent-only for the same reason:
+        // `child_tools()` rebuilds the registry from `builtin_tools()`
+        // without it. Uploads reuse the same workspace sandbox as file tools.
+        if self.config.browser_use_mode.is_enabled() {
+            // `builtin_tools_with_roots` already validated the workspace, so
+            // this reuses the same roots for upload sandboxing.
+            if let Ok(sandbox) = Workspace::with_roots(&workspace, &additional_workspaces) {
+                tools.register(BrowserTool::new(
+                    self.browser.clone(),
+                    resolved.model.capabilities.vision,
+                    sandbox,
+                ));
+            }
+        }
         let computer_session_id = session_id.clone();
 
         // Project instructions belong to the session's own workspace, not the
@@ -3158,6 +3475,13 @@ impl AppView {
         };
         let checkpoint_recorder =
             Arc::new(crate::checkpoint::CheckpointRecorder::new(shared.clone()));
+        // One live mode source for the whole tree: the main harness and every
+        // child harness resolve their mode through this closure, so a Shift+Tab
+        // mid-run takes effect on the next tool call for agents too.
+        let permission_mode_provider: Arc<dyn Fn() -> PermissionMode + Send + Sync> = {
+            let shared = shared.clone();
+            Arc::new(move || lock_session(&shared).permission_mode)
+        };
         let harness_config = HarnessConfig {
             max_tokens: Some(resolved.max_output_tokens()),
             temperature: self.config.temperature,
@@ -3177,6 +3501,9 @@ impl AppView {
             // child harnesses inherit the same sink through the cloned config,
             // so subagent edits land in the parent turn.
             checkpoint_sink: Some(checkpoint_recorder.clone()),
+            // Children launched from this conversation inherit this closure, so
+            // the mode governs the whole agent tree, not just the main agent.
+            permission_mode: Some(permission_mode_provider.clone()),
             ..HarnessConfig::default()
         };
 
@@ -3204,10 +3531,6 @@ impl AppView {
         // a Shift+Tab mid-run takes effect on the next tool call. The UI keeps
         // responding to the inner broker gate; locally decided calls never
         // reach it and never show an approval card.
-        let permission_mode_provider: Arc<dyn Fn() -> PermissionMode + Send + Sync> = {
-            let shared = shared.clone();
-            Arc::new(move || lock_session(&shared).permission_mode)
-        };
         let mode_gate = Arc::new(ModeApprovalGate::new(
             approval.clone(),
             permission_mode_provider.clone(),
@@ -3215,11 +3538,21 @@ impl AppView {
         // Computer consent is layered *outside* the mode gate: FullAccess must
         // not silently grant screen control, and Plan mode must block mutating
         // computer actions even if the user would approve the card.
-        let approval_gate = Arc::new(ComputerApprovalGate::new(
+        let mode_gate = Arc::new(ComputerApprovalGate::new(
             mode_gate,
             approval.clone(),
             self.computer.clone(),
             computer_session_id,
+            permission_mode_provider.clone(),
+        ));
+        // Browser consent is layered on top for the same reason: FullAccess
+        // must not silently grant browser control, and Plan mode must block
+        // navigation, clicks, script execution and uploads.
+        let approval_gate = Arc::new(BrowserApprovalGate::new(
+            mode_gate,
+            approval.clone(),
+            self.browser.clone(),
+            session_id.clone(),
             permission_mode_provider,
         ));
         let harness = AgentHarness::new(
@@ -3285,6 +3618,8 @@ impl AppView {
             approval,
             started_at: Instant::now(),
             checkpoint: Some(checkpoint_recorder),
+            manual_compaction: false,
+            compaction_record: None,
         };
         if in_front {
             self.active_run = Some(run);
@@ -3398,10 +3733,16 @@ impl AppView {
             .map(|active| lock_session(&active.shared).id.clone())
         {
             self.computer.stop(&session_id);
+            // A stopped browser session must release its engine too; leaving
+            // an orphaned AI browser running is both confusing and costly.
+            self.browser.stop(&session_id);
             if let Some(runtime) = &self.runtime {
                 let computer = self.computer.clone();
+                let browser = self.browser.clone();
+                let browser_session = session_id.clone();
                 runtime.spawn(async move {
                     computer.finish_session(&session_id).await;
+                    let _ = browser.end_session(&browser_session).await;
                 });
             }
         }
@@ -3465,6 +3806,10 @@ impl AppView {
 
     fn handle_event(&mut self, event: HarnessEvent, cx: &mut Context<Self>) {
         let mut structural = false;
+        // A `/compact` pass must not auto-resume the queue: it owns no user
+        // turn, so waking the model afterwards would send a message the user
+        // never asked for at that moment.
+        let mut manual_finished = false;
         match &event {
             HarnessEvent::RunStarted { run_id, .. } => {
                 let turn_id = self.active_run.as_ref().and_then(|run| {
@@ -3568,6 +3913,13 @@ impl AppView {
                     .active_run
                     .as_ref()
                     .map(|run| (run.session_id.clone(), run.shared.clone()));
+                // `/compact` owns no user turn: it reports a token drop, keeps
+                // the queue untouched and never wakes the model afterwards.
+                let manual = self
+                    .active_run
+                    .as_ref()
+                    .filter(|run| run.manual_compaction)
+                    .map(|run| run.compaction_record.clone());
                 if let Some(run) = &self.active_run {
                     run.handle.take_pending_steers();
                 }
@@ -3578,9 +3930,12 @@ impl AppView {
                 self.retry_status = None;
                 // A failed or interrupted turn pauses the queue (ZCode's
                 // error-paused state): the messages stay visible and the user
-                // decides whether to send or drop them.
-                self.queue_held =
-                    !matches!(outcome, RunOutcome::Completed) && !self.pending_inputs.is_empty();
+                // decides whether to send or drop them. A `/compact` pass owns
+                // no turn, so it never changes that decision.
+                if manual.is_none() {
+                    self.queue_held = !matches!(outcome, RunOutcome::Completed)
+                        && !self.pending_inputs.is_empty();
+                }
                 self.pending_approvals
                     .retain(|pending| pending.agent_id.is_some());
                 // Hide the control bar and restore parked windows/workspace.
@@ -3599,19 +3954,35 @@ impl AppView {
                 self.persist_active(cx);
                 self.refresh_sessions(cx);
                 structural = true;
-                match outcome {
-                    RunOutcome::Failed(error) => {
-                        self.last_error = Some(error.clone());
-                    }
-                    RunOutcome::Interrupted => {
-                        self.notice = Some("已停止当前任务。".to_string());
-                    }
-                    RunOutcome::Completed => {
-                        self.notice = None;
+                manual_finished = manual.is_some();
+                if manual_finished {
+                    self.notice = Some(Self::manual_compaction_notice(outcome, manual.flatten()));
+                } else {
+                    match outcome {
+                        RunOutcome::Failed(error) => {
+                            self.last_error = Some(error.clone());
+                        }
+                        RunOutcome::Interrupted => {
+                            self.notice = Some("已停止当前任务。".to_string());
+                        }
+                        RunOutcome::Completed => {
+                            self.notice = None;
+                        }
                     }
                 }
             }
-            HarnessEvent::TodosUpdated { .. } | HarnessEvent::ContextCompacted { .. } => {
+            HarnessEvent::TodosUpdated { .. } => {
+                self.persist_active(cx);
+            }
+            HarnessEvent::ContextCompacted { record } => {
+                // A manual pass reports the drop in its completion notice, so
+                // its record rides on the run instead of the transcript alone.
+                if record.trigger == effibuddy_agent_core::CompactionTrigger::Manual
+                    && let Some(run) = self.active_run.as_mut()
+                    && run.manual_compaction
+                {
+                    run.compaction_record = Some(record.clone());
+                }
                 self.persist_active(cx);
             }
             HarnessEvent::SessionChanged => {
@@ -3625,6 +3996,7 @@ impl AppView {
         }
         if let HarnessEvent::RunFinished { outcome, .. } = &event {
             if outcome.is_success()
+                && !manual_finished
                 && let Some(session_id) = self.active_id()
             {
                 self.resume_after_run_for(&session_id, cx);
@@ -9358,6 +9730,15 @@ impl AppView {
             .unwrap_or(false);
         let computer_vision = resolved.model.capabilities.vision;
         let computer_hint = composer_hint(computer_mode, computer_granted, computer_vision);
+        let browser_mode = self.config.browser_use_mode;
+        let browser_granted = self
+            .active_shared()
+            .map(|shared| {
+                let session = lock_session(&shared);
+                self.browser.is_granted(&session.id)
+            })
+            .unwrap_or(false);
+        let browser_hint = crate::browser::composer_hint(browser_mode, browser_granted);
 
         let mut footer_left = div().flex().items_center().gap(px(8.0)).child(
             if permission_mode == PermissionMode::Plan {
@@ -9399,6 +9780,43 @@ impl AppView {
                         .child(
                             svg()
                                 .path(icons::MOUSE)
+                                .size(px(10.0))
+                                .text_color(hint_color),
+                        )
+                        .child(label),
+                );
+        }
+
+        if let Some((label, tooltip_text)) = browser_hint {
+            let (hint_color, hint_bg) = if browser_granted || browser_mode == BrowserUseMode::Always
+            {
+                (theme.success, theme.success_soft)
+            } else {
+                (theme.text_muted, theme.surface_alt)
+            };
+            footer_left = footer_left
+                .child(div().w(px(1.0)).h(px(10.0)).bg(theme.border))
+                .child(
+                    div()
+                        .id("composer-browser")
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(20.0))
+                        .px(px(6.0))
+                        .rounded(px(999.0))
+                        .bg(hint_bg)
+                        .text_size(px(10.0))
+                        .text_color(hint_color)
+                        .cursor_pointer()
+                        .tooltip(effibuddy_ui::tooltip(theme, tooltip_text))
+                        .hover(|style| style.bg(theme.active))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_settings_section(SettingsSection::General, window, cx)
+                        }))
+                        .child(
+                            svg()
+                                .path(icons::GLOBE)
                                 .size(px(10.0))
                                 .text_color(hint_color),
                         )
@@ -9836,12 +10254,24 @@ impl AppView {
                     .child(request.summary.clone()),
             )
             .when_some(
-                // Subagent harnesses run on the bare broker gate: the main
-                // session's permission mode neither auto-approves nor
-                // auto-denies their requests, so the mode hint would contradict
-                // the card's actual behavior.
+                // Subagent requests go through the same mode gate as the main
+                // session, so the card explains which mode is currently in
+                // force instead of claiming the mode does not apply.
                 if origin.is_some() {
-                    Some("子代理请求不受主会话权限模式影响：不会被自动批准或拒绝，仍需你确认。")
+                    Some(match self.permission_mode() {
+                        PermissionMode::Default => {
+                            "子代理请求跟随主会话权限模式：当前为默认询问，仍需你确认。"
+                        }
+                        PermissionMode::AcceptEdits => {
+                            "子代理请求跟随主会话权限模式：自动编辑模式下，子代理的编辑已自动批准。"
+                        }
+                        PermissionMode::Plan => {
+                            "子代理请求跟随主会话权限模式：计划模式下，子代理的编辑与命令会被拒绝。"
+                        }
+                        PermissionMode::FullAccess => {
+                            "子代理请求跟随主会话权限模式：完全访问模式下不会打断你。"
+                        }
+                    })
                 } else {
                     permission_mode_hint(self.permission_mode())
                 },
@@ -10879,9 +11309,7 @@ fn permission_mode_hint(mode: PermissionMode) -> Option<&'static str> {
         PermissionMode::Plan => {
             Some("计划模式：编辑与命令会被自动拒绝。请先让 EffiBuddy 输出计划，再切换模式执行。")
         }
-        PermissionMode::FullAccess => {
-            Some("完全访问模式只对主会话生效；来自子代理的请求仍会请求批准。")
-        }
+        PermissionMode::FullAccess => Some("完全访问模式：主会话与子代理的工具调用都不会打断你。"),
     }
 }
 

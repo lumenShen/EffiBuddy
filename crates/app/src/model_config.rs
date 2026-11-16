@@ -8,8 +8,9 @@
 use std::path::PathBuf;
 
 use effibuddy_agent_core::{
-    ApiFormat, MODEL_CONFIG_SCHEMA_VERSION, ModelCapabilities, ModelConfig, ModelConfigFile,
-    ModelSelection, ProviderConfig, ResolvedModel, SessionState,
+    ApiFormat, DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS, MODEL_CONFIG_SCHEMA_VERSION,
+    ModelCapabilities, ModelConfig, ModelConfigFile, ModelSelection, ProviderConfig, ResolvedModel,
+    SessionState,
 };
 
 use crate::config::{AppConfig, base_dir};
@@ -431,11 +432,12 @@ impl ModelConfigStore {
     }
 }
 
-/// Conservative model metadata used when a user adds a model by hand.
+/// Conservative model metadata used when a user adds a model by hand. Both
+/// budgets are configurable per model in the editor; these are only the seeds.
 pub fn default_model_metadata(id: &str, name: &str) -> ModelConfig {
     ModelConfig::new(id)
         .with_name(name)
-        .with_context(128_000, 8_192)
+        .with_context(DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT_TOKENS)
         .with_capabilities(ModelCapabilities::tool())
 }
 
@@ -470,7 +472,7 @@ mod tests {
         let resolved = file.resolve(Some("custom-test"), Some("m1"), None);
         assert_eq!(resolved.provider.id, "custom-test");
         assert_eq!(resolved.model.id, "m1");
-        assert_eq!(resolved.model.max_output_tokens, 8_192);
+        assert_eq!(resolved.model.max_output_tokens, DEFAULT_MAX_OUTPUT_TOKENS);
     }
 
     #[test]

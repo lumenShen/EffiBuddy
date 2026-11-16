@@ -112,10 +112,7 @@ pub(crate) fn collect(shared: &SharedSession, context_window: usize) -> ContextU
 
 /// 已持有会话锁时的快照构建。概览页在同一把锁里读取计划与用量，避免
 /// 两次加锁之间数据被 harness 更新。
-pub(crate) fn collect_from_session(
-    session: &SessionState,
-    context_window: usize,
-) -> ContextUsage {
+pub(crate) fn collect_from_session(session: &SessionState, context_window: usize) -> ContextUsage {
     let visible = session.visible_messages();
     let cleared: HashSet<String> = session.cleared_tool_calls.iter().cloned().collect();
     let message_tokens: usize = visible

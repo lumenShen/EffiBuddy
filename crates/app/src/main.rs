@@ -8,9 +8,11 @@
 mod agents;
 mod app;
 mod attachments;
+mod browser;
 mod chat;
 mod chat_agent;
 mod checkpoint;
+mod commands;
 mod composer_menu;
 mod computer;
 mod config;

@@ -65,10 +65,7 @@ pub enum AppEvent {
     /// Stress lab (feature `stress`): a sampled sessions-mode harness event
     /// routed through the pump so the dashboard cards can render it.
     #[cfg(feature = "stress")]
-    StressDelta {
-        index: usize,
-        event: HarnessEvent,
-    },
+    StressDelta { index: usize, event: HarnessEvent },
 }
 
 #[derive(Clone)]

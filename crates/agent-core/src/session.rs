@@ -50,13 +50,26 @@ impl RunStatus {
 
 /// Why a compaction ran. Kept in the record so the UI and transcripts can
 /// distinguish proactive threshold compaction from the rescue path used after
-/// a provider rejected an oversized request.
+/// a provider rejected an oversized request, and from a compaction the user
+/// asked for explicitly (`/compact`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionTrigger {
     #[default]
     Auto,
     Reactive,
+    /// Requested by the user regardless of the token threshold.
+    Manual,
+}
+
+impl CompactionTrigger {
+    pub fn label(self) -> &'static str {
+        match self {
+            CompactionTrigger::Auto => "自动",
+            CompactionTrigger::Reactive => "超限重试",
+            CompactionTrigger::Manual => "手动",
+        }
+    }
 }
 
 /// Where the summary text came from. Model summaries are the normal path;

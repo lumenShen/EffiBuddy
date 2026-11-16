@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use effibuddy_agent_core::tool::{ModeApprovalGate, PermissionMode};
 use effibuddy_agent_core::{
     AgentHarness, AgentMessage, AgentMessageKind, AgentSendOutcome, ApprovalDecision,
     BrokerApprovalGate, ChildRunRecord, ContentBlock, HarnessConfig, HarnessEvent, MAX_AGENT_DEPTH,
-    ModelProvider, Role, RunOutcome, SessionState, SubagentLaunch, SubagentProfile, SubagentReport,
-    SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry, extract_json_value,
-    lock_session, new_shared_session, validate_json,
+    ModelProvider, ResolvedModel, Role, RunOutcome, SessionState, SubagentLaunch, SubagentProfile,
+    SubagentReport, SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry,
+    extract_json_value, lock_session, new_shared_session, validate_json,
 };
 use effibuddy_agent_tools::builtin_tools_with_roots;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -61,6 +62,11 @@ pub struct SubagentService {
     catalog_refreshed_at: Arc<Mutex<Option<Instant>>>,
     /// Durable provider/model registry used to resolve profile `model`.
     models: Arc<effibuddy_agent_core::ModelConfigFile>,
+    /// Live permission mode of the owning conversation. Every child harness
+    /// resolves its mode through this closure, so one Shift+Tab in the composer
+    /// governs the whole agent tree instead of leaving children on a bare
+    /// broker gate that keeps asking (or keeps denying) in the old mode.
+    permission_mode: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
 }
 
 /// Minimum spacing between profile-directory scans per service.
@@ -100,6 +106,12 @@ impl SubagentService {
         let catalog_refreshed_at = Arc::new(Mutex::new(None));
         let mut base_config = base_config;
         base_config.agent_catalog = catalog.clone();
+        // Children inherit the owning conversation's live mode when the host
+        // supplied one through `HarnessConfig`; otherwise they run in `Default`
+        // mode, which is the behavior tests and the stress lab rely on.
+        let permission_mode = base_config.permission_mode.clone().unwrap_or_else(|| {
+            Arc::new(|| PermissionMode::Default) as Arc<dyn Fn() -> PermissionMode + Send + Sync>
+        });
         Self {
             provider,
             parent_session_id,
@@ -119,6 +131,7 @@ impl SubagentService {
             catalog_diagnostics,
             catalog_refreshed_at,
             models,
+            permission_mode,
         }
     }
 
@@ -126,6 +139,17 @@ impl SubagentService {
     /// stay untouched when the user stops the active one.
     pub fn parent_session_id(&self) -> &str {
         &self.parent_session_id
+    }
+
+    /// Make every child harness follow `provider`'s permission mode. Without
+    /// this the children resolve the mode from their own fresh session (always
+    /// `Default`), which is what tests and the stress lab want.
+    pub fn with_permission_mode(
+        mut self,
+        provider: Arc<dyn Fn() -> PermissionMode + Send + Sync>,
+    ) -> Self {
+        self.permission_mode = provider;
+        self
     }
 
     /// Reload Markdown profiles from both scopes and publish the merged
@@ -216,6 +240,9 @@ impl SubagentService {
         let mut provider_id = self.parent_provider_id.clone();
         let mut model = self.parent_model.clone();
         let mut reasoning = self.parent_reasoning.clone();
+        // Set when the profile pins its own model: the child then also takes
+        // that model's per-model budgets (context window, output tokens).
+        let mut model_override: Option<ResolvedModel> = None;
         if !profile.inherits_model() {
             let requested = profile.model.as_deref().unwrap_or_default().trim();
             let (provider_hint, model_id) = match requested.split_once('/') {
@@ -249,10 +276,15 @@ impl SubagentService {
             provider_id = resolved.provider.id.clone();
             model = resolved.model.id.clone();
             reasoning = resolved.reasoning_level.clone();
+            model_override = Some(resolved);
         }
 
         let mut session = SessionState::new(request.workspace.clone(), model.clone());
         session.set_model_selection(provider_id, model, reasoning);
+        // Snapshot for the transcript record; the harness itself re-reads the
+        // owning conversation's mode on every tool call through
+        // `HarnessConfig::permission_mode`.
+        session.permission_mode = (self.permission_mode)();
         session.title = format!("{} · {}", name, request.description);
         session.parent_id = Some(request.parent_session_id.clone());
         session.agent_name = Some(name.clone());
@@ -271,6 +303,12 @@ impl SubagentService {
 
         let mut config = self.base_config.clone();
         config.system_prompt_extra.clear();
+        // The output budget belongs to the model, not the conversation: a
+        // profile that overrides `model` must also adopt that model's
+        // `max_output_tokens` instead of inheriting the parent's.
+        if let Some(overridden) = model_override.as_ref() {
+            config.max_tokens = Some(overridden.max_output_tokens());
+        }
         config.additional_workspaces = request.additional_workspaces.clone();
         config.system_prompt_override = Some(child_prompt(
             &profile,
@@ -283,6 +321,10 @@ impl SubagentService {
         config.agent_id = agent_id.to_string();
         config.agent_name = Some(name.clone());
         config.agent_depth = request.depth;
+        // The child's approval decisions follow the owning conversation, not its
+        // own fresh session. The gate re-reads the closure per call, so a
+        // Shift+Tab mid-run reaches children too.
+        config.permission_mode = Some(self.permission_mode.clone());
 
         Ok(PreparedChild {
             request: request.clone(),
@@ -412,12 +454,21 @@ impl SubagentService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             gates.insert(agent_id.clone(), broker.clone());
         }
+        // The mode gate sits between the child harness and the broker: with
+        // FullAccess the child's edits and commands are approved locally (no
+        // card), Plan denies them locally, AcceptEdits approves edits. The
+        // closure is the owning conversation's, so children never drift from
+        // what the composer shows.
+        let approval_gate = Arc::new(ModeApprovalGate::new(
+            broker.clone() as Arc<dyn effibuddy_agent_core::ApprovalGate>,
+            self.permission_mode.clone(),
+        ));
 
         let harness = AgentHarness::new(
             prepared.shared.clone(),
             prepared.provider.clone(),
             prepared.tools.clone(),
-            broker.clone(),
+            approval_gate,
             prepared.config.clone(),
             child_tx.clone(),
         )

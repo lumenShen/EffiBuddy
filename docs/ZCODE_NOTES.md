@@ -145,7 +145,7 @@ ZCode 的核心决策，以及 EffiBuddy 的移植方式：
 
 刻意没做的 / 已知边界：
 
-- 权限模式只装配在主会话 harness 上：子代理用裸 `BrokerApprovalGate`，模式不传导，子代理的写/命令仍弹卡由用户决定（审批卡已单独注明「子代理请求不受主会话权限模式影响」）；
+- 权限模式贯通整棵树：主会话把模式闭包放进 `HarnessConfig.permission_mode`，子代理 harness 也装 `ModeApprovalGate`，所以完全访问下子代理不再逐次弹卡、计划模式下子代理同样被本地拒绝（审批卡文案改为说明当前档位，不再声称「不受影响」）；
 - plan 模式指令在 `start_run` 时快照，运行中切到 Plan 不更新 system prompt，由 Plan 专用拒绝文案补偿；
 - 未知 `permission_mode` 值会让整个会话文件反序列化失败（严格拒绝是设计取舍，代价是该 transcript 打不开）。
 

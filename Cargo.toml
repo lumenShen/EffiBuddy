@@ -5,13 +5,14 @@ members = [
     "crates/agent-tools",
     "crates/agent-js",
     "crates/computer-use",
+    "crates/browser-use",
     "crates/ui",
     "crates/app",
     "crates/stress",
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -23,6 +24,7 @@ effibuddy-agent-core = { path = "crates/agent-core" }
 effibuddy-agent-tools = { path = "crates/agent-tools" }
 effibuddy-agent-js = { path = "crates/agent-js" }
 effibuddy-computer = { path = "crates/computer-use" }
+effibuddy-browser = { path = "crates/browser-use" }
 effibuddy-ui = { path = "crates/ui" }
 
 gpui = "0.2.2"

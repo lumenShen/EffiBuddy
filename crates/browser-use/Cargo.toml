@@ -1,0 +1,33 @@
+[package]
+name = "effibuddy-browser"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "CDP-driven browser control for EffiBuddy: AX snapshots, console/network journals"
+
+[features]
+# Exposes FakeBrowser for downstream tests and the UI preview mode.
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+base64 = "0.22"
+futures.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tokio-tungstenite = { version = "0.30", default-features = false, features = [
+    "connect",
+    "handshake",
+] }
+reqwest.workspace = true
+dirs.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tempfile.workspace = true

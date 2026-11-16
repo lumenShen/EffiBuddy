@@ -293,45 +293,49 @@ jobs:
           # choco 的 shim 机制不覆盖 makensis，把安装目录显式加进 PATH。
           Add-Content $env:GITHUB_PATH "C:\Program Files (x86)\NSIS"
 
-      # 占位符注入版本号（NSIS 的 $ 变量不能出现在 PowerShell 可展开的
-      # 字符串里，所以这里用单引号 here-string + __VERSION__）。
+      # 安装器自带的 PowerShell 辅助脚本必须能被解析：它们是 ASCII-only 的，
+      # 一旦有人塞进非 ASCII 字符或写坏语法，装机时才炸。这里提前拦下。
+      - name: 校验安装器 PowerShell 脚本
+        shell: pwsh
+        run: |
+          $bad = 0
+          foreach ($f in Get-ChildItem installer\*.ps1) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors -and $errors.Count -gt 0) {
+              $bad = 1
+              foreach ($e in $errors) {
+                Write-Host "::error file=$($f.Name),line=$($e.Extent.StartLineNumber)::$($e.Message)"
+              }
+            }
+            $nonAscii = Select-String -Path $f.FullName -Pattern '[^\x00-\x7F]' -AllMatches
+            if ($nonAscii) {
+              $bad = 1
+              Write-Host "::error file=$($f.Name)::$($f.Name) 含非 ASCII 字符；powershell.exe 5.1 无 BOM 时会按 ANSI 解码，中文会变乱码"
+            }
+            Write-Host "checked $($f.Name)"
+          }
+          if ($bad -ne 0) { exit 1 }
+
+      # 安装包脚本在 installer/effibuddy.nsi（Modern UI 2，组件页让用户自己勾选
+      # 开始菜单/桌面快捷方式与任务栏固定）。这里只负责传真版本号。
+      # VIProductVersion 只吃四段纯数字，预发布后缀要先裁掉。
       - name: 生成 NSIS 安装包
         shell: pwsh
         run: |
-          $nsi = @'
-          !define APPNAME "EffiBuddy"
-          OutFile "EffiBuddy-__VERSION__-windows-x86_64-setup.exe"
-          InstallDir "$PROGRAMFILES64\${APPNAME}"
-          RequestExecutionLevel admin
-          Page directory
-          Page instfiles
-          Section
-            SetOutPath "$INSTDIR"
-            File "target\release\effibuddy.exe"
-            SetOutPath "$INSTDIR\runtime\msys"
-            File /r "runtime\msys\*.*"
-            SetOutPath "$INSTDIR"
-            WriteUninstaller "$INSTDIR\uninstall.exe"
-            CreateDirectory "$SMPROGRAMS\${APPNAME}"
-            CreateShortCut "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk" "$INSTDIR\effibuddy.exe"
-            CreateShortCut "$DESKTOP\${APPNAME}.lnk" "$INSTDIR\effibuddy.exe"
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "DisplayName" "${APPNAME}"
-            WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}" "UninstallString" "$INSTDIR\uninstall.exe"
-          SectionEnd
-          Section "Uninstall"
-            Delete "$INSTDIR\effibuddy.exe"
-            Delete "$INSTDIR\uninstall.exe"
-            RMDir /r "$INSTDIR\runtime"
-            RMDir "$INSTDIR"
-            Delete "$SMPROGRAMS\${APPNAME}\${APPNAME}.lnk"
-            RMDir "$SMPROGRAMS\${APPNAME}"
-            Delete "$DESKTOP\${APPNAME}.lnk"
-            DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
-          SectionEnd
-          '@
-          $nsi = $nsi -replace '__VERSION__', $env:VERSION
-          $nsi | Out-File -FilePath installer.nsi -Encoding utf8
-          makensis installer.nsi
+          # 去掉预发布/构建元数据后缀，把 0.2 / 0.2.0 / 0.2.0.1 统一补成四段。
+          $core = (($env:VERSION -replace '^v', '') -split '[-+]')[0]
+          $parts = @($core.Split('.') | Where-Object { $_ -ne '' })
+          if ($parts.Count -lt 2 -or $parts.Count -gt 4 -or ($parts -join '') -notmatch '^\d+$') {
+            Write-Host "::error::无法从版本号 '$env:VERSION' 推导 VIProductVersion（需要 2-4 段纯数字）"
+            exit 1
+          }
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $vi = $parts -join '.'
+          Write-Host "VIProductVersion = $vi"
+          makensis /V3 "/DVERSION=$env:VERSION" "/DVI_VERSION=$vi" "/DSRCDIR=$PWD" "/DOUTFILE=$PWD\EffiBuddy-$env:VERSION-windows-x86_64-setup.exe" "installer\effibuddy.nsi"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
         with:
