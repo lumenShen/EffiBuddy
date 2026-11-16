@@ -39,6 +39,9 @@ struct JournalState {
 }
 
 struct PendingRequest {
+    request_id: String,
+    /// MIME type reported with the response headers, if it arrived.
+    content_type: Option<String>,
     method: String,
     url: String,
     resource_type: String,
@@ -149,6 +152,39 @@ impl Journal {
         }
     }
 
+    /// Finished requests matching `predicate`, oldest first.
+    ///
+    /// Used by `wait_for_request`: the matcher comes from the caller (a URL
+    /// regex compiled once), and `since` keeps a repeated wait from re-matching
+    /// the entry it already returned.
+    pub fn find_network(
+        &self,
+        since: Option<u64>,
+        limit: usize,
+        predicate: impl Fn(&NetEntry) -> bool,
+    ) -> Vec<NetEntry> {
+        let state = self.lock();
+        let mut hits: Vec<NetEntry> = state
+            .network
+            .iter()
+            .filter(|entry| match since {
+                Some(since) => entry.seq > since,
+                None => true,
+            })
+            .filter(|entry| predicate(entry))
+            .cloned()
+            .collect();
+        if hits.len() > limit {
+            hits.drain(..hits.len() - limit);
+        }
+        hits
+    }
+
+    /// Highest network sequence written so far, finished or not.
+    pub fn network_cursor(&self) -> u64 {
+        self.lock().next_net_seq.saturating_sub(1)
+    }
+
     pub fn push_console(
         &self,
         level: ConsoleLevel,
@@ -198,6 +234,8 @@ impl Journal {
         state.pending.insert(
             request_id.to_string(),
             PendingRequest {
+                request_id: request_id.to_string(),
+                content_type: None,
                 method: method.to_string(),
                 url: truncate(url, MAX_URL_CHARS),
                 resource_type: resource_type.to_string(),
@@ -206,6 +244,20 @@ impl Journal {
             },
         );
         state.pending_order.push(request_id.to_string());
+    }
+
+    /// Attach the MIME type that arrived on `Network.responseReceived`.
+    ///
+    /// It is recorded with the entry so a body fetch can tell text from binary
+    /// without guessing from the URL.
+    pub fn set_network_content_type(&self, request_id: &str, content_type: &str) {
+        if content_type.is_empty() {
+            return;
+        }
+        let mut state = self.lock();
+        if let Some(pending) = state.pending.get_mut(request_id) {
+            pending.content_type = Some(content_type.to_string());
+        }
     }
 
     pub fn push_network_finish(
@@ -228,6 +280,8 @@ impl Journal {
         });
         let entry = NetEntry {
             seq: pending.seq,
+            request_id: pending.request_id,
+            content_type: pending.content_type,
             method: pending.method,
             url: pending.url,
             status,
@@ -475,6 +529,18 @@ mod tests {
             ..JournalQuery::default()
         });
         assert_eq!(net_page.entries.len(), 1);
+    }
+
+    #[test]
+    fn content_type_is_carried_from_the_response_to_the_entry() {
+        let journal = journal();
+        journal.push_network_start("r", "GET", "https://api.test/thing", "xhr");
+        journal.set_network_content_type("r", "application/json");
+        journal.push_network_finish("r", Some(200), None, Some(1));
+        let entries = journal.find_network(None, 10, |_| true);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content_type.as_deref(), Some("application/json"));
+        assert_eq!(entries[0].request_id, "r");
     }
 
     #[test]

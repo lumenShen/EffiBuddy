@@ -26,13 +26,15 @@ use tokio::sync::broadcast;
 
 use crate::backend::{BrowserBackend, KeyChord, KeyModifier, WaitCondition, WaitRequest};
 use crate::discover::{self, LaunchedBrowser};
+use crate::editor::post_save_script;
 use crate::journal::Journal;
 use crate::keys::{self, KeySpec};
 use crate::protocol::{CdpConnection, CdpEvent};
 use crate::snapshot::{self, RawAxTree};
 use crate::types::{
-    AxNode, BrowserError, BrowserInfo, ConsoleEntry, ConsoleLevel, EngineKind, JournalPage,
-    JournalQuery, MouseButton, NetEntry, PageCapture, PageFrame, PageInfo, Rect, ScreenshotOptions,
+    AxNode, BrowserError, BrowserInfo, ConsoleEntry, ConsoleLevel, EditorOp, EditorRequest,
+    ElementText, EngineKind, EvalOutcome, EvalRequest, JournalPage, JournalQuery, MouseButton,
+    NetEntry, PageCapture, PageFrame, PageInfo, Rect, RequestWait, ResponseBody, ScreenshotOptions,
     Snapshot, SnapshotMode, TabInfo, TabInfoState, WaitPolicy,
 };
 
@@ -67,6 +69,14 @@ struct Live {
     snapshot_title: String,
     event_task: tokio::task::JoinHandle<()>,
     last_console_seq: u64,
+    /// `Page.addScriptToEvaluateOnNewDocument` registrations for this session.
+    /// They die with the CDP session, so `select_tab` clears them.
+    scripts: Vec<ScriptRegistration>,
+}
+
+struct ScriptRegistration {
+    source: String,
+    identifier: String,
 }
 
 pub struct CdpBackend {
@@ -79,7 +89,26 @@ pub struct CdpBackend {
     headless: AtomicBool,
     /// Bumped on navigation so cached refs are known to be stale.
     generation: AtomicU64,
+    /// Scripts every new document should run. The runtime swaps these per
+    /// conversation whenever it re-attaches to a tab.
+    init_scripts: Mutex<Vec<String>>,
+    /// Bodies already fetched, so `network` + `wait_for_request` on the same
+    /// request do not re-fetch (and survive Chromium evicting them).
+    bodies: Mutex<HashMap<String, CachedBody>>,
 }
+
+struct CachedBody {
+    body: String,
+    truncated: bool,
+    base64: bool,
+}
+
+/// How many response bodies to keep around. Bodies are only fetched on demand,
+/// so this bounds a model that walks a long request list.
+const MAX_CACHED_BODIES: usize = 24;
+
+/// Largest body kept in the cache, regardless of the caller's budget.
+const MAX_CACHED_BODY_CHARS: usize = 256_000;
 
 impl Drop for CdpBackend {
     fn drop(&mut self) {
@@ -111,6 +140,8 @@ impl CdpBackend {
             snapshot_lock: tokio::sync::Mutex::new(()),
             headless: AtomicBool::new(true),
             generation: AtomicU64::new(0),
+            init_scripts: Mutex::new(Vec::new()),
+            bodies: Mutex::new(HashMap::new()),
         }
     }
 
@@ -323,12 +354,16 @@ impl CdpBackend {
                     }
                     "Network.responseReceived" => {
                         let request_id = event.params["requestId"].as_str().unwrap_or_default();
-                        if let Some(status) = event.params["response"]
+                        let response = &event.params["response"];
+                        if let Some(status) = response
                             .get("status")
                             .and_then(Value::as_u64)
                             .map(|status| status as u16)
                         {
                             statuses.insert(request_id.to_string(), status);
+                        }
+                        if let Some(mime) = response.get("mimeType").and_then(Value::as_str) {
+                            journal.set_network_content_type(request_id, mime);
                         }
                     }
                     "Network.loadingFinished" => {
@@ -673,16 +708,38 @@ impl CdpBackend {
 
     /// Evaluate an expression and return its by-value result.
     async fn eval_value(&self, expression: &str) -> Result<Value, BrowserError> {
-        let reply = self
-            .call(
-                "Runtime.evaluate",
-                json!({
-                    "expression": expression,
-                    "returnByValue": true,
-                    "awaitPromise": true,
-                }),
-            )
-            .await?;
+        self.eval_value_with_timeout(expression, None, true).await
+    }
+
+    /// Evaluate with an optional client-side deadline.
+    ///
+    /// `None` means "wait as long as the page takes" (the settlement helpers
+    /// rely on that); a number is the budget the model asked for and produces
+    /// [`BrowserError::Timeout`] rather than hanging the tool loop.
+    async fn eval_value_with_timeout(
+        &self,
+        expression: &str,
+        timeout_ms: Option<u64>,
+        await_promise: bool,
+    ) -> Result<Value, BrowserError> {
+        let call = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": await_promise,
+            }),
+        );
+        let reply = match timeout_ms {
+            Some(limit) => {
+                tokio::time::timeout(Duration::from_millis(limit.clamp(1, 300_000)), call)
+                    .await
+                    .map_err(|_| {
+                        BrowserError::Timeout(format!("evaluation exceeded {limit}ms"))
+                    })??
+            }
+            None => call.await?,
+        };
         if let Some(details) = reply.get("exceptionDetails") {
             let message = details
                 .get("exception")
@@ -699,6 +756,174 @@ impl CdpBackend {
             .unwrap_or(Value::Null))
     }
 
+    /// Read whatever `console` output the in-flight evaluation captured.
+    ///
+    /// Runs with a short deadline: if the page is wedged in a synchronous loop
+    /// this call blocks too, and a partial result is not worth another 15s.
+    async fn read_eval_logs(&self) -> Result<Vec<String>, BrowserError> {
+        let value = self
+            .eval_value_with_timeout(
+                "JSON.stringify(globalThis.__effi_eval_log ? globalThis.__effi_eval_log.logs : [])",
+                Some(2_000),
+                false,
+            )
+            .await?;
+        let text = value.as_str().unwrap_or_default();
+        let logs: Vec<String> = serde_json::from_str(text).unwrap_or_default();
+        Ok(logs)
+    }
+
+    /// Fetch one response body and remember it (bounded).
+    async fn fetch_response_body(
+        &self,
+        request_id: &str,
+        max_chars: usize,
+    ) -> Result<ResponseBody, BrowserError> {
+        let entry = self
+            .journal
+            .find_network(Some(0), usize::MAX, |entry| entry.request_id == request_id);
+        let Some(entry) = entry.into_iter().next_back() else {
+            return Err(BrowserError::NotFound(format!(
+                "no finished request with id `{request_id}`; call network to list requests"
+            )));
+        };
+        let cached = self
+            .bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(request_id)
+            .map(|cached| (cached.body.clone(), cached.truncated, cached.base64));
+        let (body, base64) = match cached {
+            Some((body, _, base64)) => (body, base64),
+            None => {
+                let reply = self
+                    .call(
+                        "Network.getResponseBody",
+                        json!({ "requestId": request_id }),
+                    )
+                    .await;
+                let Ok(reply) = reply else {
+                    return Ok(ResponseBody::unavailable(
+                        &entry,
+                        "the engine no longer holds this body (evicted or redirected); \
+                         re-run the request and read it right away",
+                    ));
+                };
+                let raw = reply
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let base64 = reply
+                    .get("base64Encoded")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let kept: String = raw.chars().take(MAX_CACHED_BODY_CHARS).collect();
+                let mut cache = self
+                    .bodies
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if cache.len() >= MAX_CACHED_BODIES {
+                    cache.clear();
+                }
+                cache.insert(
+                    request_id.to_string(),
+                    CachedBody {
+                        body: kept.clone(),
+                        truncated: raw.chars().count() > MAX_CACHED_BODY_CHARS,
+                        base64,
+                    },
+                );
+                (kept, base64)
+            }
+        };
+        let (text, truncated) = truncate_chars(&body, max_chars.clamp(1, MAX_CACHED_BODY_CHARS));
+        Ok(ResponseBody {
+            request_id: entry.request_id.clone(),
+            url: entry.url.clone(),
+            method: entry.method.clone(),
+            status: entry.status,
+            content_type: entry.content_type.clone(),
+            body: text,
+            truncated,
+            base64,
+            available: true,
+            note: None,
+        })
+    }
+
+    /// Make the page's script registrations match the requested list.
+    async fn apply_init_scripts(&self) -> Result<(), BrowserError> {
+        let wanted = self
+            .init_scripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let existing = {
+            let guard = self.lock();
+            match guard.as_ref() {
+                Some(live) => live
+                    .scripts
+                    .iter()
+                    .map(|script| (script.source.clone(), script.identifier.clone()))
+                    .collect::<Vec<_>>(),
+                None => return Ok(()),
+            }
+        };
+
+        // Drop registrations whose script the conversation removed.
+        for (source, identifier) in &existing {
+            if !wanted.iter().any(|wanted| wanted == source) {
+                let _ = self
+                    .call(
+                        "Page.removeScriptToEvaluateOnNewDocument",
+                        json!({ "identifier": identifier }),
+                    )
+                    .await;
+            }
+        }
+        {
+            let mut guard = self.lock();
+            if let Some(live) = guard.as_mut() {
+                live.scripts
+                    .retain(|script| wanted.iter().any(|source| source == &script.source));
+            }
+        }
+
+        // Add the missing ones.
+        for source in &wanted {
+            let already = {
+                let guard = self.lock();
+                guard
+                    .as_ref()
+                    .map(|live| live.scripts.iter().any(|script| &script.source == source))
+                    .unwrap_or(false)
+            };
+            if already {
+                continue;
+            }
+            let reply = self
+                .call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": source }),
+                )
+                .await?;
+            let identifier = reply
+                .get("identifier")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let mut guard = self.lock();
+            if let Some(live) = guard.as_mut() {
+                live.scripts.push(ScriptRegistration {
+                    source: source.clone(),
+                    identifier,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Apply the standard viewport override used for screenshots and layout.
     async fn apply_viewport(&self) -> Result<(), BrowserError> {
         self.call(
@@ -713,6 +938,62 @@ impl CdpBackend {
         .await?;
         Ok(())
     }
+}
+
+/// Wrap an expression so `console` output emitted while it runs is captured in
+/// `globalThis.__effi_eval_log.logs`.
+///
+/// The harness cannot cancel a page-side promise, so a timed-out evaluation
+/// leaves this capture installed until the promise settles; the next call
+/// resets the log and reuses the same hooks (they are idempotent), which is why
+/// a timed-out long poll still hands back everything it had logged.
+fn wrap_eval(expression: &str, await_promise: bool) -> String {
+    let runner = if await_promise {
+        format!("(async () => {{ return ({expression}); }})()")
+    } else {
+        format!("(() => {{ return ({expression}); }})()")
+    };
+    format!(
+        r#"(() => {{
+  const key = "__effi_eval_log";
+  const state = globalThis[key] || (globalThis[key] = {{ logs: [], restore: null }});
+  state.logs = [];
+  if (!state.restore) {{
+    const originals = {{}};
+    for (const level of ["log", "info", "warn", "error", "debug"]) {{
+      const original = console[level];
+      originals[level] = original;
+      console[level] = function (...args) {{
+        try {{
+          const text = args.map((value) => {{
+            if (typeof value === "string") return value;
+            try {{ return JSON.stringify(value); }} catch (_) {{ return String(value); }}
+          }}).join(" ");
+          state.logs.push(level === "warn" ? "[warn] " + text
+            : level === "error" ? "[error] " + text : text);
+          if (state.logs.length > 500) state.logs.shift();
+        }} catch (_) {{}}
+        try {{ return original.apply(console, args); }} catch (_) {{ return undefined; }}
+      }};
+    }}
+    state.restore = () => {{
+      for (const level of Object.keys(originals)) console[level] = originals[level];
+      state.restore = null;
+    }};
+  }}
+  return {runner};
+}})()"#
+    )
+}
+
+/// Cut `text` to `max` characters; reports whether anything was dropped.
+fn truncate_chars(text: &str, max: usize) -> (String, bool) {
+    if text.chars().count() <= max {
+        return (text.to_string(), false);
+    }
+    let mut out: String = text.chars().take(max).collect();
+    out.push('…');
+    (out, true)
 }
 
 /// Build the console text for a `Runtime.consoleAPICalled` event.
@@ -829,12 +1110,15 @@ impl BrowserBackend for CdpBackend {
                 snapshot_title: String::new(),
                 event_task: task,
                 last_console_seq: last_console,
+                scripts: Vec::new(),
             });
         }
 
         // Headless defaults to 800x600, which makes layout and screenshots
         // unnecessarily cramped.
         let _ = self.apply_viewport().await;
+        // Re-register whatever the conversation had installed before a restart.
+        let _ = self.apply_init_scripts().await;
         self.read_page().await
     }
 
@@ -852,6 +1136,10 @@ impl BrowserBackend for CdpBackend {
         let _ = live.connection.call("Browser.close", json!({})).await;
         live.browser.shutdown().await;
         self.journal.clear();
+        self.bodies
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
         self.refresh_generation();
         Ok(())
     }
@@ -947,9 +1235,13 @@ impl BrowserBackend for CdpBackend {
                 live.refs.clear();
                 live.stamps.clear();
                 live.last_console_seq = last_console;
+                // Script registrations belong to the CDP session we just
+                // replaced, so the new one needs them again.
+                live.scripts.clear();
             }
         }
         let _ = self.apply_viewport().await;
+        let _ = self.apply_init_scripts().await;
         let _ = self.call("Page.bringToFront", json!({})).await;
         self.refresh_generation();
         self.read_page().await
@@ -1337,9 +1629,128 @@ impl BrowserBackend for CdpBackend {
         self.settle(WaitPolicy::Load).await
     }
 
-    async fn evaluate(&self, expression: &str) -> Result<Value, BrowserError> {
+    async fn evaluate(&self, request: &EvalRequest) -> Result<EvalOutcome, BrowserError> {
         self.ensure_ready().await?;
-        self.eval_value(expression).await
+        let script = wrap_eval(&request.expression, request.await_promise);
+        let call = self.call(
+            "Runtime.evaluate",
+            json!({
+                "expression": script,
+                "returnByValue": true,
+                "awaitPromise": request.await_promise,
+                "userGesture": true,
+            }),
+        );
+        let budget = Duration::from_millis(request.timeout_ms.clamp(100, 300_000));
+        match tokio::time::timeout(budget, call).await {
+            Ok(Ok(reply)) => {
+                let logs = self.read_eval_logs().await.unwrap_or_default();
+                if reply.get("exceptionDetails").is_some() {
+                    let message = reply["exceptionDetails"]
+                        .get("exception")
+                        .and_then(|exception| exception.get("description"))
+                        .and_then(Value::as_str)
+                        .or_else(|| {
+                            reply["exceptionDetails"]
+                                .get("text")
+                                .and_then(Value::as_str)
+                        })
+                        .unwrap_or("evaluation failed")
+                        .to_string();
+                    let mut message = message;
+                    if !logs.is_empty() {
+                        message
+                            .push_str(&format!("\nconsole before the error: {}", logs.join(" | ")));
+                    }
+                    return Err(BrowserError::Page(message));
+                }
+                Ok(EvalOutcome {
+                    value: reply
+                        .get("result")
+                        .and_then(|result| result.get("value"))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    timed_out: false,
+                    logs,
+                })
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => Ok(EvalOutcome {
+                value: Value::Null,
+                timed_out: true,
+                // The expression keeps running page-side; this is what it
+                // managed to print before the deadline.
+                logs: self.read_eval_logs().await.unwrap_or_default(),
+            }),
+        }
+    }
+
+    async fn response_body(
+        &self,
+        request_id: &str,
+        max_chars: usize,
+    ) -> Result<ResponseBody, BrowserError> {
+        self.ensure_ready().await?;
+        self.fetch_response_body(request_id, max_chars).await
+    }
+
+    async fn wait_for_request(&self, request: &RequestWait) -> Result<ResponseBody, BrowserError> {
+        self.ensure_ready().await?;
+        let pattern = regex::Regex::new(&request.pattern).map_err(|error| {
+            BrowserError::Invalid(format!(
+                "invalid url pattern `{}`: {error}",
+                request.pattern
+            ))
+        })?;
+        let method = request
+            .method
+            .as_ref()
+            .map(|method| method.to_ascii_uppercase());
+        let deadline =
+            Instant::now() + Duration::from_millis(request.timeout_ms.clamp(100, 120_000));
+        let since = request.since;
+        loop {
+            let hit = self
+                .journal
+                .find_network(since, 1, |entry| {
+                    pattern.is_match(&entry.url)
+                        && method
+                            .as_ref()
+                            .map(|method| entry.method.eq_ignore_ascii_case(method))
+                            .unwrap_or(true)
+                })
+                .pop();
+            if let Some(entry) = hit {
+                let mut body = self
+                    .fetch_response_body(&entry.request_id, request.max_chars)
+                    .await?;
+                body.url = entry.url;
+                body.method = entry.method;
+                body.status = entry.status;
+                // A matched request that finishes without a body is still a
+                // useful answer: the model learns the status at least.
+                return Ok(body);
+            }
+            if Instant::now() >= deadline {
+                let seen = self
+                    .journal
+                    .find_network(since, 3, |_entry| true)
+                    .into_iter()
+                    .map(|entry| format!("{} {}", entry.method, entry.url))
+                    .collect::<Vec<_>>();
+                return Err(BrowserError::Timeout(format!(
+                    "no request matched `{}` within {}ms; recent requests: {}",
+                    request.pattern,
+                    request.timeout_ms,
+                    if seen.is_empty() {
+                        "none".to_string()
+                    } else {
+                        seen.join(", ")
+                    }
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     async fn console(
@@ -1351,6 +1762,203 @@ impl BrowserBackend for CdpBackend {
 
     async fn network(&self, query: &JournalQuery) -> Result<JournalPage<NetEntry>, BrowserError> {
         Ok(self.journal.network(query))
+    }
+
+    async fn element_text(
+        &self,
+        selector: &str,
+        all: bool,
+        max_chars: usize,
+    ) -> Result<ElementText, BrowserError> {
+        self.ensure_ready().await?;
+        let script = format!(
+            r#"(() => {{
+  let nodes = [];
+  try {{ nodes = Array.from(document.querySelectorAll({selector})); }}
+  catch (error) {{ return {{ error: String(error) }}; }}
+  if (!nodes.length) return {{ matches: 0, text: "" }};
+  const visible = nodes.filter((node) => {{
+    const box = node.getBoundingClientRect();
+    return box.width > 0 && box.height > 0;
+  }});
+  const wantedAll = {all};
+  const chosen = wantedAll ? (visible.length ? visible : nodes) : [(visible[0] || nodes[0])];
+  const texts = chosen.map((node) => (node.innerText || node.textContent || "").trim())
+    .filter((text) => text.length > 0);
+  return {{ matches: nodes.length, text: texts.join("\n\n"), shown: chosen.length }};
+}})()"#,
+            selector = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+            all = if all { "true" } else { "false" },
+        );
+        let value = self.eval_value(&script).await?;
+        if let Some(error) = value.get("error").and_then(Value::as_str) {
+            return Err(BrowserError::Invalid(format!(
+                "invalid CSS selector `{selector}`: {error}"
+            )));
+        }
+        let text = value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let (text, truncated) = truncate_chars(&text, max_chars.clamp(1, 200_000));
+        Ok(ElementText {
+            selector: selector.to_string(),
+            matches: value.get("matches").and_then(Value::as_u64).unwrap_or(0) as usize,
+            text,
+            truncated,
+        })
+    }
+
+    async fn element_box(&self, selector: &str) -> Result<Option<Rect>, BrowserError> {
+        self.ensure_ready().await?;
+        let script = format!(
+            r#"(async () => {{
+  const el = document.querySelector({selector});
+  if (!el) return null;
+  el.scrollIntoView({{ block: "center", inline: "center" }});
+  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  const box = el.getBoundingClientRect();
+  return {{ x: box.left, y: box.top, width: box.width, height: box.height }};
+}})()"#,
+            selector = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into()),
+        );
+        let value = self.eval_value(&script).await?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let number = |key: &str| value.get(key).and_then(Value::as_f64).unwrap_or(0.0);
+        Ok(Some(Rect::new(
+            number("x"),
+            number("y"),
+            number("width"),
+            number("height"),
+        )))
+    }
+
+    async fn click_point(
+        &self,
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        click_count: u32,
+        modifiers: &[KeyModifier],
+        wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError> {
+        self.ensure_ready().await?;
+        self.mouse_click_at(x, y, button, click_count, modifiers)
+            .await?;
+        self.refresh_generation();
+        self.settle(wait).await
+    }
+
+    async fn drag(
+        &self,
+        from: (f64, f64),
+        to: (f64, f64),
+        steps: u32,
+        wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError> {
+        self.ensure_ready().await?;
+        let steps = steps.clamp(1, 60);
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({"type": "mouseMoved", "x": from.0, "y": from.1, "buttons": 0}),
+        )
+        .await?;
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mousePressed", "x": from.0, "y": from.1,
+                "button": "left", "buttons": 1, "clickCount": 1,
+            }),
+        )
+        .await?;
+        // A drag that jumps straight to the target looks like a teleport to
+        // sortable lists: they need intermediate moves to start dragging.
+        for step in 1..=steps {
+            let ratio = f64::from(step) / f64::from(steps);
+            let x = from.0 + (to.0 - from.0) * ratio;
+            let y = from.1 + (to.1 - from.1) * ratio;
+            self.call(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseMoved", "x": x, "y": y,
+                    "button": "left", "buttons": 1,
+                }),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(12)).await;
+        }
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseReleased", "x": to.0, "y": to.1,
+                "button": "left", "buttons": 0, "clickCount": 1,
+            }),
+        )
+        .await?;
+        self.refresh_generation();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.settle(wait).await
+    }
+
+    async fn editor(&self, request: &EditorRequest) -> Result<Value, BrowserError> {
+        self.ensure_ready().await?;
+        let script = request.script();
+        let mut value = match self
+            .eval_value_with_timeout(&script, Some(15_000), false)
+            .await
+        {
+            Ok(value) => value,
+            Err(BrowserError::Timeout(_)) => {
+                return Err(BrowserError::Timeout(
+                    "the editor adapter did not answer within 15s".to_string(),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        if value.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Ok(value);
+        }
+        if request.op != EditorOp::Save {
+            return Ok(value);
+        }
+        // The site owns the save path (a button, a debounce, a socket), so the
+        // shortcut is the only family-agnostic trigger. Then re-read the buffer:
+        // "saved" is only true when nothing changed after the shortcut.
+        self.dispatch_key(&KeyChord {
+            modifiers: vec![KeyModifier::Ctrl],
+            key: "s".to_string(),
+        })
+        .await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let after = self
+            .eval_value_with_timeout(
+                &post_save_script(request.target.as_deref()),
+                Some(5_000),
+                false,
+            )
+            .await
+            .unwrap_or(Value::Null);
+        value["post_save"] = after.clone();
+        value["saved"] = json!(after.get("ok").and_then(Value::as_bool).unwrap_or(false));
+        value["dirty_after_save"] = after.get("dirty").cloned().unwrap_or(Value::Null);
+        Ok(value)
+    }
+
+    async fn set_init_scripts(&self, scripts: &[String]) -> Result<(), BrowserError> {
+        {
+            let mut current = self
+                .init_scripts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if current.as_slice() == scripts {
+                return Ok(());
+            }
+            *current = scripts.to_vec();
+        }
+        self.apply_init_scripts().await
     }
 
     async fn wait_for(&self, request: &WaitRequest) -> Result<PageInfo, BrowserError> {

@@ -113,7 +113,7 @@ cargo run -p effibuddy-app -- --settings                    # 设置 → 通用
 
 ## 内置工具
 
-`read_file` · `write_file` · `edit_file` · `list_dir` · `grep` · `shell` · `todo_write` · `run_js` · `agent` · `agent_send` · `agent_list` · `workflow_run` · `computer`
+`read_file` · `write_file` · `edit_file` · `list_dir` · `grep` · `shell` · `todo_write` · `state` · `run_js` · `agent` · `agent_send` · `agent_list` · `workflow_run` · `computer`
 
 文件工具被限制在工作区内；写文件、改文件、shell、`computer` 与 `browser` 都走同一套权限矩阵：默认询问、计划模式只放行只读动作、完全访问直接放行（主代理与子代理一致）。
 
@@ -157,7 +157,7 @@ cargo build --workspace
 - 写文件、改文件、shell、电脑操作与浏览器操作默认需要显式批准；审批超时按拒绝处理。
 - Wayland 仅支持全屏读图/输入；macOS 发布包未签名，且暂不支持 Computer Use。
 - 默认 DeepSeek 模型不支持视觉输入，使用 Computer Use 截图前需要切换到支持图片的模型。
-- 项目仍在早期（0.2.7），接口与数据格式可能变化。
+- 项目仍在早期（0.2.8），接口与数据格式可能变化。
 
 ## 许可证
 

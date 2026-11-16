@@ -12,6 +12,11 @@
 //! All path-based tools resolve through [`Workspace`], which rejects paths
 //! outside the workspace root. Mutating tools require approval.
 
+// The `browser` tool's JSON schema (`json!`) expands one macro level per
+// property; the default limit is no longer enough now that it documents every
+// action and parameter.
+#![recursion_limit = "512"]
+
 pub mod agent;
 pub mod args;
 pub mod browser;
@@ -21,6 +26,7 @@ mod grep;
 pub mod messaging;
 mod ptc;
 mod shell;
+pub mod state;
 mod todo;
 pub mod workflow;
 pub mod workspace;
@@ -37,6 +43,7 @@ pub use grep::GrepTool;
 pub use messaging::{AgentListTool, AgentSendTool};
 pub use ptc::RunJsTool;
 pub use shell::{SHELL_ENV, ShellSpec, ShellTool};
+pub use state::{SessionStateTool, forget_session as forget_session_state};
 pub use todo::TodoWriteTool;
 pub use workflow::WorkflowTool;
 pub use workspace::Workspace;
@@ -69,6 +76,7 @@ pub fn builtin_tools_with_roots(
     registry.register(GrepTool::new(workspace.clone()));
     registry.register(ShellTool::new(workspace));
     registry.register(TodoWriteTool::new());
+    registry.register(SessionStateTool::new());
     registry.register(RunJsTool::new());
     registry.register(AgentTool::new());
     registry.register(AgentSendTool::new());

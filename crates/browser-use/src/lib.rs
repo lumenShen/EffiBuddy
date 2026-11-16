@@ -19,6 +19,7 @@
 
 pub mod backend;
 pub mod discover;
+pub mod editor;
 pub mod journal;
 pub mod keys;
 pub mod protocol;
@@ -39,8 +40,9 @@ pub use journal::Journal;
 pub use runtime::{BrowserRuntime, ConsoleQuery, OverlayEmitter, OverlayEvent, OverlayEventKind};
 pub use snapshot::{AX_TREE_JS, PAGE_TEXT_JS, build_snapshot, render_snapshot};
 pub use types::{
-    AxNode, BrowserError, BrowserInfo, BrowserUseMode, ConsoleEntry, ConsoleLevel, EngineKind,
-    JournalPage, JournalQuery, MouseButton, NetEntry, PageCapture, PageFrame, PageInfo, Rect,
+    AxNode, BrowserError, BrowserInfo, BrowserUseMode, ConsoleEntry, ConsoleLevel, EditorOp,
+    EditorRequest, ElementText, EngineKind, EvalOutcome, EvalRequest, JournalPage, JournalQuery,
+    MouseButton, NetEntry, PageCapture, PageFrame, PageInfo, Rect, RequestWait, ResponseBody,
     ScreenshotOptions, Snapshot, SnapshotMode, TabInfo, TabInfoState, WaitPolicy,
 };
 

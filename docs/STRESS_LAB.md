@@ -94,6 +94,9 @@ cargo run --release -p effibuddy-stress -- \
 | 每次 spawn 重扫 profile 目录（真实磁盘） | `refresh_catalog` 2s TTL |
 | 侧栏摘要每次刷新全量解析全部 JSON | `(mtime, size)` 缓存，只解析变更文件 |
 | 消息重建每次重哈希全部文本（`message_signature` / 提示栏预览） | `Message::revision` 自增指纹替代全量哈希；提示栏按指纹复用已展平预览（10k 消息 rebuild 10.4ms → 4.0ms） |
+| 占用环/概览每帧重算整条 transcript 的 token（每帧两遍） | 按会话 revision 记忆化，流式期间 250ms 节流（10k 消息帧率 132 → 199 fps） |
+| 折叠的右侧栏仍然每帧构建内容树 | `side.width <= 0` 时返回零宽占位符 |
+| `prepare_frame` 每帧重建全部虚拟行计划 | `plan_cache` 按 items/展开态/流式态复用，空闲与滚动帧 O(1) |
 | 冷启动 `ListState::reset` 后行高估算为 0 → 历史滚不上去 | `set_estimated_item_height` 首帧估算 + `splice` 无邻居时借已知均值/估算；`reset` 后重新贴底 |
 | **子代理审批卡死**：children 的 write_file/edit_file 走 `BrokerApprovalGate`，审批卡片等用户点击 → 子代理挂起 600s（压测中 750/1000 卡死、UI 审批卡片堆积） | 压测子代理设为只读（`read_only: Some(true)`）— 变更类工具被过滤，剩余工具全部 `ApprovalPolicy::Auto`，零审批往返（修复后：取消 750→0、完成 419→1497） |
 
@@ -153,6 +156,61 @@ EFFIBUDDY_BENCH_10K=1 cargo test --release -p effibuddy-app --bin effibuddy \
    `Message::revision`（所有 mutator 经 `touch()` 自增）替代全量哈希，外部输入
    （工具结果、执行时长）仍然参与指纹；前端提示栏改为按指纹复用已展平的预览；
    工具结果复用比较改为形状（长度）而非逐字节。
+
+## 真实窗口滚动基准（`--bench-scroll`）
+
+`chat_bench` 只能测应用侧的结构成本：它的无窗口环境用 GPUI 的 `NoopTextSystem`，
+字形排版、光栅化与 GPU 提交在那里都是免费的。要看「用户真正感知到的帧」，得跑
+真窗口：
+
+```bash
+# 10k 消息、真实字体、真实 GPU；--bench-scroll [秒数]
+EFFIBUDDY_PERF=1 EFFIBUDDY_VSYNC=0 \
+  cargo run --release -p effibuddy-app -- --bench-scroll 8
+
+# 可选环境变量
+EFFIBUDDY_BENCH_SCROLL_MESSAGES=10000   # 种子消息数（默认 10000）
+EFFIBUDDY_BENCH_SCROLL_STEP=64          # 每帧滚动像素（默认 64，0 = 只重绘不滚动）
+```
+
+会打印一行 `[bench]`（frame / work / render 的 avg-p50-p95-p99）和一行
+`[bench-scroll]`（帧数、虚拟行数、每帧实际绘制行数、行计划缓存命中、以及
+prepare / rail / render_chat / 各面板的分段耗时）。
+
+### 实测（本机，10000 条消息 / 5004 个虚拟行 / 8.3MB 文本，vsync off）
+
+| 指标 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 帧率 | 132 fps | **199 fps** |
+| 帧间隔 p50 | 7.5ms | **4.7ms** |
+| `window.draw + present` p50 | 5.9ms | **2.5ms** |
+| 整棵元素树构建（`render`） | 3.17ms | **0.12ms** |
+| 其中右侧栏 | **3.20ms** | 0.03ms |
+| 其中主内容区（含 `prepare_frame`） | 0.06ms | 0.05ms |
+| 1k 消息对照 | 184 fps | 193 fps |
+
+修复后 **帧成本与历史长度脱钩**：1k 与 10k 消息的帧率、元素树构建时间基本一致。
+按 300Hz 的 3.3ms 预算，2.5ms 的帧成本可以顶住。
+
+### 基准揪出的三个「每帧 O(历史)」热点
+
+这三个都不在滚动路径上，靠无窗口基准和肉眼都看不出来——只有真窗口的分段计时
+才能定位：
+
+1. **输入框占用环每帧重算整条 transcript 的 token**。`context_usage()` →
+   `context_meter::collect_from_session` 逐字符估算每条消息（tool call 还要
+   `serde_json::to_string` 一次），10k 消息约 2–3ms，**而且每帧算两遍**（输入框
+   一次、右侧栏概览一次）。修复：按会话 revision 做 O(1) 键的记忆化
+   （`cached_message_usage`），流式期间用 250ms 下限节流。
+2. **右侧栏折叠到 0 宽仍然构建整棵树**，于是上面的概览页照旧每帧走一遍全量
+   估算。修复：`render_side_pane` 在 `side.width <= 0` 时直接返回零宽占位符。
+3. **行计划每帧重建**：`prepare_frame` 每次都走一遍全部 item 生成槽位与 slot key。
+   修复：`plan_cache` 记住「items 的 `Rc` 指针 + running + 四个展开集合」，未变化
+   且没有流式揭示时整帧 O(1)（空闲/滚动帧的 `prepare_frame` 从 0.38ms 降到
+   0.00ms；流式帧仍照常重建，因为揭示表每帧都在长）。
+
+> 教训：虚拟列表做得再好，只要**每帧还有一处 O(消息数) 的旁路计算**，长会话就
+> 会一直慢。真窗口分段计时（而不是只看总帧时间）是找到这类问题的唯一可靠手段。
 
 ## 呈现节奏（垂直同步）
 

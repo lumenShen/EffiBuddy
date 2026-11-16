@@ -78,11 +78,14 @@ impl Tool for RunJsTool {
          or to keep large intermediate results out of the conversation.\n\
          \n\
          Contract:\n\
-         - The script is synchronous. `await`, `import` and timers are unavailable.\n\
+         - The script is synchronous. `await`, `import` and timers are unavailable, but \
+           `sleep(ms)` blocks the script thread (bounded budget) and `retry(fn, opts)` / \
+           `poll(fn, opts)` wrap it, so waiting for something to become ready is one call.\n\
          - Every registered tool is exposed as `tools.<name>(argsObject)`. It returns the tool's \
            observation, parsed as JSON when possible, and throws on tool errors.\n\
          - Return a JSON-serializable value with `return`; it becomes the tool result.\n\
          - `console.log(...)` output is captured and returned.\n\
+         - Keep long waits inside one script: `retry(() => tools.util_check(), { attempts: 20, delay_ms: 2000 })`.\n\
          - Tool calls are still approval-checked individually.\n\
          - Prefer compact results. Do not dump entire files; select the fields you need.\n\
          \n\

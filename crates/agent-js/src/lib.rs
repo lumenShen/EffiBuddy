@@ -34,7 +34,7 @@
 //! can still consume CPU until it hits the loop limit. Run untrusted code in a
 //! child process if that matters for your threat model.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -154,7 +154,15 @@ thread_local! {
     static BRIDGE: RefCell<Option<Bridge>> = const { RefCell::new(None) };
     static LOGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static LOG_LIMITS: RefCell<(usize, usize)> = const { RefCell::new((100, 2_000)) };
+    /// Milliseconds of `sleep` this script may still spend. Polling loops are
+    /// the main use, and they are exactly what blocks the interpreter thread,
+    /// so the budget is enforced here rather than by the async timeout.
+    static SLEEP_LEFT_MS: Cell<u64> = const { Cell::new(0) };
 }
+
+/// Upper bound on the total time one script may spend sleeping, even when the
+/// script timeout is larger.
+const MAX_SCRIPT_SLEEP_MS: u64 = 120_000;
 
 struct BridgeGuard;
 
@@ -281,6 +289,13 @@ fn run_sync(
         });
     });
     let _guard = BridgeGuard;
+    SLEEP_LEFT_MS.with(|left| {
+        left.set(
+            u64::try_from(config.timeout.as_millis())
+                .unwrap_or(u64::MAX)
+                .min(MAX_SCRIPT_SLEEP_MS),
+        )
+    });
 
     let mut context = Context::default();
     let mut limits: RuntimeLimits = context.runtime_limits();
@@ -330,6 +345,13 @@ fn register_host_functions(context: &mut Context) -> JsResult<()> {
         .length(1)
         .build();
     context.register_global_property(js_str!("__effi_log"), log, Attribute::default())?;
+
+    let sleep =
+        FunctionObjectBuilder::new(context.realm(), NativeFunction::from_fn_ptr(sleep_native))
+            .name(js_str!("__effi_sleep"))
+            .length(1)
+            .build();
+    context.register_global_property(js_str!("__effi_sleep"), sleep, Attribute::default())?;
 
     Ok(())
 }
@@ -389,6 +411,43 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     Ok(JsValue::from(js_string!(content)))
 }
 
+/// Block the script thread for a bounded number of milliseconds.
+///
+/// The sandbox runs on a blocking task, so a real sleep is safe: it does not
+/// stall the async runtime, and the host's wall-clock timeout still applies to
+/// the whole script. Without this, "wait for the build and retry" had to be
+/// split across many model turns.
+fn sleep_native(_this: &JsValue, args: &[JsValue], _context: &mut Context) -> JsResult<JsValue> {
+    let requested = args
+        .first()
+        .and_then(JsValue::as_number)
+        .map(|value| value.max(0.0))
+        .unwrap_or(0.0);
+    let requested = if requested.is_finite() {
+        requested as u64
+    } else {
+        0
+    };
+    let allowed = SLEEP_LEFT_MS.with(|left| {
+        let available = left.get();
+        let granted = requested.min(available);
+        left.set(available - granted);
+        granted
+    });
+    if requested > allowed {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "sleep({requested}ms) exceeds the script's remaining sleep budget ({allowed}ms); \
+                 return what you have and continue in the next call"
+            ))
+            .into());
+    }
+    if allowed > 0 {
+        std::thread::sleep(Duration::from_millis(allowed));
+    }
+    Ok(JsValue::undefined())
+}
+
 fn log_native(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let message = args
         .first()
@@ -439,7 +498,39 @@ const __effi_parse = (text) => {
             "tools[{json_name}] = (args = {{}}) => __effi_parse(__effi_call_tool({json_name}, JSON.stringify(args)));\n"
         ));
     }
-    source.push_str("const callTool = (name, args = {}) => __effi_parse(__effi_call_tool(String(name), JSON.stringify(args)));\n");
+    source.push_str(
+        "const callTool = (name, args = {}) => __effi_parse(__effi_call_tool(String(name), JSON.stringify(args)));\n",
+    );
+    // Helpers that make "poll until ready" a single call instead of a chain of
+    // model turns. `sleep` blocks the script thread (bounded by the sandbox
+    // budget); `retry`/`poll` are plain JS built on top of it.
+    source.push_str(
+        r#"const sleep = (ms) => { __effi_sleep(Number(ms) || 0); return undefined; };
+const retry = (fn, options = {}) => {
+  const attempts = Math.max(1, Number(options.attempts) || 5);
+  const baseDelay = Math.max(0, Number(options.delay_ms) || 500);
+  const factor = Math.max(1, Number(options.factor) || 1.5);
+  const maxDelay = Math.max(0, Number(options.max_delay_ms) || 10000);
+  let delay = baseDelay;
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try { return fn(attempt); }
+    catch (error) {
+      lastError = error;
+      if (attempt === attempts) break;
+      if (delay > 0) sleep(delay);
+      delay = Math.min(maxDelay, Math.max(delay, delay * factor));
+    }
+  }
+  throw lastError;
+};
+const poll = (fn, options = {}) => retry((attempt) => {
+  const value = fn(attempt);
+  if (value) return value;
+  throw new Error("poll returned no result on attempt " + attempt);
+}, options);
+"#,
+    );
     if !prelude.trim().is_empty() {
         source.push_str(prelude);
         source.push('\n');
@@ -519,6 +610,55 @@ mod tests {
 
     fn sandbox() -> JsSandbox {
         JsSandbox::new(SandboxConfig::default())
+    }
+
+    #[tokio::test]
+    async fn sleep_and_retry_make_polling_one_call() {
+        let invoker = Arc::new(RecordingInvoker::new(|_, _| Ok("{}".to_string())));
+        let started = Instant::now();
+        let result = sandbox()
+            .run(
+                r#"
+                let attempts = 0;
+                const value = retry((attempt) => {
+                  attempts = attempt;
+                  if (attempt < 3) throw new Error("not ready");
+                  return { ready: true, attempt };
+                }, { attempts: 4, delay_ms: 5 });
+                sleep(5);
+                return { value, attempts };
+                "#,
+                vec![],
+                invoker,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value,
+            serde_json::json!({"value": {"ready": true, "attempt": 3}, "attempts": 3})
+        );
+        // Two sleeps happened for real: the helper blocks the script thread.
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[tokio::test]
+    async fn sleep_beyond_the_budget_is_an_error_not_a_hang() {
+        let invoker = Arc::new(RecordingInvoker::new(|_, _| Ok("{}".to_string())));
+        let config = SandboxConfig {
+            timeout: Duration::from_millis(50),
+            ..SandboxConfig::default()
+        };
+        let error = JsSandbox::new(config)
+            .run(
+                "sleep(10_000); return 1;",
+                vec![],
+                invoker,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("must fail");
+        assert!(error.to_string().contains("sleep budget"), "{error}");
     }
 
     #[tokio::test]

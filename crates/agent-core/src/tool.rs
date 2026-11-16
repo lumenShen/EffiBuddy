@@ -457,6 +457,19 @@ pub trait Tool: Send + Sync + 'static {
         ToolRisk::Mutating
     }
 
+    /// Group key for "allow for the rest of this session".
+    ///
+    /// Approving a tool for the session is cached by `name` unless the tool
+    /// asks for finer granularity. Tools that mix capabilities under one name
+    /// (device tools) return the concrete action instead, so:
+    ///
+    /// - approving `browser eval` once does not blanket-approve navigation or
+    ///   uploads, and
+    /// - forty consecutive `eval` calls ask exactly once.
+    fn approval_key(&self, _arguments: &Value) -> Option<String> {
+        None
+    }
+
     /// Human-readable one-liner shown in the approval card.
     fn summarize(&self, arguments: &Value) -> String {
         let compact = serde_json::to_string(arguments).unwrap_or_default();
@@ -639,11 +652,8 @@ mod tests {
     }
 
     fn device_request(tool: &str, risk: ToolRisk) -> ApprovalRequest {
-        ApprovalRequest::new(
-            &ToolCall::new(tool, json!({"action": "any"})),
-            "summary",
-        )
-        .with_risk(risk)
+        ApprovalRequest::new(&ToolCall::new(tool, json!({"action": "any"})), "summary")
+            .with_risk(risk)
     }
 
     #[tokio::test]

@@ -29,5 +29,5 @@ dirs.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "net", "io-util"] }
 tempfile.workspace = true

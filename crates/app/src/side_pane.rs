@@ -1222,6 +1222,18 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // A collapsed pane is still part of the element tree; building its tab
+        // content walks the transcript (the overview's token estimate), which
+        // cost ~3ms per frame of a 10k-message session for something nobody can
+        // see. Keep a zero-width placeholder until it is actually open.
+        if self.side.width <= 0.0 {
+            return div()
+                .id("side-pane")
+                .w(px(0.0))
+                .h_full()
+                .flex_none()
+                .into_any_element();
+        }
         let theme = self.theme.clone();
         let tab_bar = self.render_side_tab_bar(&theme, cx);
         let body: AnyElement = match self.side.active().cloned() {
@@ -1511,7 +1523,7 @@ impl AppView {
                     .as_ref()
                     .map(|record| record.compacted_messages)
                     .unwrap_or(0),
-                crate::context_meter::collect_from_session(&session, context_window),
+                self.cached_message_usage(&session, context_window),
             )
         } else {
             (

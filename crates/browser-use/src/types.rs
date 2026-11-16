@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// User preference for letting the model drive a browser.
 ///
@@ -366,10 +367,17 @@ pub struct ConsoleEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NetEntry {
     pub seq: u64,
+    /// CDP `requestId`; the handle for fetching the body later. Older entries
+    /// (or a fake backend) leave it empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub request_id: String,
     pub method: String,
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
+    /// Response MIME type, when the engine reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
     /// `document`, `xhr`, `fetch`, `script`, `image`, …
     pub resource_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,6 +391,140 @@ impl NetEntry {
     pub fn is_failed(&self) -> bool {
         self.failure.is_some() || self.status.map(|status| status >= 400).unwrap_or(false)
     }
+}
+
+/// A finished response, with its body when the engine still has it.
+///
+/// The model asks for a body by request id (or by waiting on a URL pattern):
+/// fetching every body up front would copy megabytes into the journal for
+/// requests nobody reads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseBody {
+    /// CDP `requestId`, unique per navigation in the current tab.
+    pub request_id: String,
+    pub url: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// Body text, already truncated to the caller's budget.
+    pub body: String,
+    /// True when the body was cut to fit the budget.
+    pub truncated: bool,
+    /// True when the engine returned base64 (binary payload); `body` is the
+    /// encoded text and must not be treated as document text.
+    pub base64: bool,
+    /// False when the engine no longer holds the body (evicted, redirect, or a
+    /// preflight with no payload).
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl ResponseBody {
+    /// Placeholder for a request whose body the engine cannot produce.
+    pub fn unavailable(entry: &NetEntry, note: impl Into<String>) -> Self {
+        Self {
+            request_id: entry.request_id.clone(),
+            url: entry.url.clone(),
+            method: entry.method.clone(),
+            status: entry.status,
+            content_type: None,
+            body: String::new(),
+            truncated: false,
+            base64: false,
+            available: false,
+            note: Some(note.into()),
+        }
+    }
+}
+
+/// What to wait for on the network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestWait {
+    /// Regular expression matched against the response URL.
+    pub pattern: String,
+    /// Optional HTTP method filter (`GET`, `POST`, …), case-insensitive.
+    pub method: Option<String>,
+    /// Only consider entries newer than this journal cursor.
+    pub since: Option<u64>,
+    pub timeout_ms: u64,
+    /// Budget for the returned body.
+    pub max_chars: usize,
+}
+
+/// One `eval` call: an expression plus the client-side budget for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvalRequest {
+    pub expression: String,
+    /// How long the harness waits before giving up on the promise.
+    pub timeout_ms: u64,
+    /// Await the returned promise (long polls, `fetch`, `sleep`).
+    pub await_promise: bool,
+}
+
+/// Result of [`EvalRequest`]: the value, or what the page logged before the
+/// deadline passed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EvalOutcome {
+    pub value: Value,
+    /// True when the harness stopped waiting; `value` is then `Null` and
+    /// `logs` holds everything the expression printed so far.
+    pub timed_out: bool,
+    /// Console output the expression produced during this call.
+    pub logs: Vec<String>,
+}
+
+/// Text extracted from one CSS selector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementText {
+    pub selector: String,
+    /// How many elements the selector matched.
+    pub matches: usize,
+    pub text: String,
+    pub truncated: bool,
+}
+
+/// What an in-page code editor should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorOp {
+    /// Report the editor family and the files it holds.
+    Detect,
+    /// Same as detect, but the result is used as the file listing.
+    List,
+    /// Read one file (or the active editor) into the result.
+    Read,
+    /// Replace the editor's buffer without saving.
+    Write,
+    /// Write (when content was given), press the app's save shortcut, and
+    /// report whether the buffer is still dirty.
+    Save,
+}
+
+impl EditorOp {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Detect => "detect",
+            Self::List => "list",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Save => "save",
+        }
+    }
+}
+
+/// One `browser` `editor` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorRequest {
+    pub op: EditorOp,
+    /// File path/label or numeric index from a previous listing; `None` means
+    /// the editor that currently has focus.
+    pub target: Option<String>,
+    /// Buffer content for `write`/`save`.
+    pub content: Option<String>,
+    /// Budget for `read`.
+    pub max_chars: usize,
 }
 
 /// Cursor-based query over a journal.
@@ -517,7 +659,9 @@ mod tests {
     fn net_entry_treats_4xx_as_failure() {
         let mut entry = NetEntry {
             seq: 1,
+            request_id: "r1".into(),
             method: "GET".into(),
+            content_type: None,
             url: "https://example.com".into(),
             status: Some(200),
             resource_type: "document".into(),

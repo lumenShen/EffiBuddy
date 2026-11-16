@@ -15,6 +15,8 @@ mod chat_agent;
 mod chat_bench;
 #[cfg(test)]
 mod chat_scroll_tests;
+#[cfg(test)]
+mod sidebar_layout_tests;
 mod checkpoint;
 mod commands;
 mod composer_menu;

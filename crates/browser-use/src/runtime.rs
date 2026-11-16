@@ -17,8 +17,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::backend::{BrowserBackend, KeyChord};
 use crate::types::{
-    BrowserError, BrowserInfo, BrowserUseMode, ConsoleEntry, JournalPage, JournalQuery,
-    MouseButton, NetEntry, PageCapture, PageFrame, PageInfo, Rect, ScreenshotOptions, Snapshot,
+    AxNode, BrowserError, BrowserInfo, BrowserUseMode, ConsoleEntry, EditorOp, EditorRequest,
+    ElementText, EvalOutcome, JournalPage, JournalQuery, MouseButton, NetEntry, PageCapture,
+    PageFrame, PageInfo, Rect, RequestWait, ResponseBody, ScreenshotOptions, Snapshot,
     SnapshotMode, TabInfo, WaitPolicy,
 };
 
@@ -54,6 +55,10 @@ pub enum OverlayEventKind {
 pub type ConsoleQuery = JournalQuery;
 
 struct SessionRuntime {
+    /// Browser tab this conversation drives. One browser process is shared by
+    /// the whole agent tree, so every conversation owns a tab and the runtime
+    /// switches back to it before acting.
+    tab_id: Option<String>,
     paused: bool,
     stopped: bool,
     notify: Arc<Notify>,
@@ -64,11 +69,14 @@ struct SessionRuntime {
     overlay_visible: bool,
     last_message: String,
     console_cursor: u64,
+    /// Scripts injected into every new document of this conversation's tab.
+    init_scripts: Vec<String>,
 }
 
 impl SessionRuntime {
     fn new() -> Self {
         Self {
+            tab_id: None,
             paused: false,
             stopped: false,
             notify: Arc::new(Notify::new()),
@@ -79,6 +87,7 @@ impl SessionRuntime {
             overlay_visible: false,
             last_message: "正在连接浏览器…".to_string(),
             console_cursor: 0,
+            init_scripts: Vec::new(),
         }
     }
 
@@ -150,6 +159,10 @@ impl SessionRuntime {
 }
 
 pub struct BrowserRuntime {
+    /// Tab the backend is currently attached to. Only this runtime switches
+    /// tabs, and every action result carries the real `tab_id`, so this stays
+    /// authoritative without an extra CDP round trip per call.
+    active_tab: Mutex<Option<String>>,
     mode: RwLock<BrowserUseMode>,
     backend: Arc<dyn BrowserBackend>,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
@@ -171,6 +184,7 @@ impl BrowserRuntime {
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         Self {
+            active_tab: Mutex::new(None),
             mode: RwLock::new(BrowserUseMode::default()),
             backend,
             sessions: Mutex::new(HashMap::new()),
@@ -305,6 +319,7 @@ impl BrowserRuntime {
                 BrowserUseMode::Off => "off",
                 BrowserUseMode::On => "on",
             },
+            "tab": self.session_tab(session_id),
             "stopped": stopped,
             "paused": paused,
             "backend": info,
@@ -315,15 +330,22 @@ impl BrowserRuntime {
                 "nodes": snapshot.nodes.len(),
                 "truncated": snapshot.truncated,
             })),
+            "init_scripts": self.init_scripts(session_id).len(),
             "capabilities": {
                 "snapshot": true,
                 "accessibility_tree": true,
                 "console": true,
                 "network": true,
+                "network_bodies": true,
+                "request_wait": true,
                 "screenshot": true,
                 "evaluate": true,
+                "evaluate_timeout": true,
                 "tabs": true,
                 "upload": true,
+                "editor": true,
+                "drag": true,
+                "init_scripts": true,
             },
         });
         if !previous_url.is_empty() {
@@ -366,13 +388,159 @@ impl BrowserRuntime {
                 return Err(BrowserError::Stopped);
             }
             if !paused {
-                return Ok(());
+                break;
             }
             tokio::select! {
                 _ = notify.notified() => {}
                 _ = cancel.cancelled() => return Err(BrowserError::Cancelled),
             }
         }
+        self.bind_tab(session_id, cancel).await?;
+        self.sync_init_scripts(session_id, cancel).await;
+        Ok(())
+    }
+
+    /// Scripts this conversation injects into every new document.
+    pub fn init_scripts(&self, session_id: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .map(|session| session.init_scripts.clone())
+            .unwrap_or_default()
+    }
+
+    /// Replace the conversation's init scripts and push them to the backend.
+    pub async fn set_init_scripts(
+        &self,
+        session_id: &str,
+        scripts: &[String],
+        cancel: &CancellationToken,
+    ) -> Result<(), BrowserError> {
+        self.gate(session_id, cancel).await?;
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(session) = sessions.get_mut(session_id) {
+                session.init_scripts = scripts.to_vec();
+            }
+        }
+        with_cancel(cancel, self.backend.set_init_scripts(scripts)).await
+    }
+
+    /// Re-assert the conversation's helpers on the tab it is attached to.
+    ///
+    /// Best effort: a page that cannot take a script must not fail the action
+    /// the model actually asked for.
+    async fn sync_init_scripts(&self, session_id: &str, cancel: &CancellationToken) {
+        let scripts = self.init_scripts(session_id);
+        let _ = with_cancel(cancel, self.backend.set_init_scripts(&scripts)).await;
+    }
+
+    fn any_session_bound(&self) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .any(|session| session.tab_id.is_some())
+    }
+
+    /// Tab the backend is attached to, as far as this runtime knows.
+    pub fn active_tab(&self) -> Option<String> {
+        self.active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn remember_active_tab(&self, tab_id: impl Into<String>) {
+        *self
+            .active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tab_id.into());
+    }
+
+    fn forget_active_tab(&self) {
+        *self
+            .active_tab
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+
+    /// Tab bound to one conversation, if any.
+    pub fn session_tab(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(session_id)
+            .and_then(|session| session.tab_id.clone())
+    }
+
+    fn set_tab(&self, session_id: &str, tab_id: Option<String>) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.tab_id = tab_id;
+        }
+    }
+
+    /// Drop per-page state that belongs to the tab we are leaving.
+    fn clear_page_state(&self, session_id: &str) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(session) = sessions.get_mut(session_id) {
+            session.snapshots.clear();
+            session.frames.clear();
+        }
+    }
+
+    /// Bind the conversation to its own tab and make it the attached page.
+    ///
+    /// The first call from a conversation opens a dedicated tab; later calls
+    /// switch the backend back to it when another agent acted in between, so
+    /// snapshots and `[ref]` handles never leak across conversations.
+    async fn bind_tab(
+        &self,
+        session_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(), BrowserError> {
+        if let Some(tab_id) = self.session_tab(session_id) {
+            if self.active_tab() == Some(tab_id.clone()) {
+                return Ok(());
+            }
+            // The tab may have been closed by the user; fall through and open a
+            // fresh one instead of failing every later action.
+            if let Ok(info) = with_cancel(cancel, self.backend.select_tab(&tab_id)).await {
+                self.note_page(session_id, &info);
+                return Ok(());
+            }
+            self.set_tab(session_id, None);
+        }
+        // The first conversation takes over the page the browser opened with,
+        // so a single user never sees a stray idle tab. Every later conversation
+        // gets its own.
+        if !self.any_session_bound()
+            && let Ok(info) = with_cancel(cancel, self.backend.ensure_ready()).await
+            && !info.tab_id.is_empty()
+        {
+            self.set_tab(session_id, Some(info.tab_id.clone()));
+            self.note_page(session_id, &info);
+            return Ok(());
+        }
+        with_cancel(cancel, self.backend.ensure_ready()).await?;
+        let tab = with_cancel(cancel, self.backend.new_tab(None)).await?;
+        let info = with_cancel(cancel, self.backend.select_tab(&tab.id)).await?;
+        self.remember_active_tab(tab.id.clone());
+        self.clear_page_state(session_id);
+        self.set_tab(session_id, Some(tab.id));
+        self.note_page(session_id, &info);
+        Ok(())
     }
 
     fn emit(&self, session_id: &str, kind: OverlayEventKind) {
@@ -423,6 +591,9 @@ impl BrowserRuntime {
     }
 
     fn note_page(&self, session_id: &str, info: &PageInfo) {
+        if !info.tab_id.is_empty() {
+            self.remember_active_tab(info.tab_id.clone());
+        }
         let mut sessions = self
             .sessions
             .lock()
@@ -512,7 +683,16 @@ impl BrowserRuntime {
         if let Some(url) = url {
             self.check_url(url)?;
         }
-        with_cancel(cancel, self.backend.new_tab(url)).await
+        let tab = with_cancel(cancel, self.backend.new_tab(url)).await?;
+        // A new tab becomes this conversation's tab: the next action would
+        // otherwise switch back to the old one and confuse the model.
+        let info = with_cancel(cancel, self.backend.select_tab(&tab.id)).await?;
+        self.remember_active_tab(tab.id.clone());
+        self.clear_page_state(session_id);
+        self.set_tab(session_id, Some(tab.id.clone()));
+        self.note_page(session_id, &info);
+        self.note(session_id, describe_page(&info));
+        Ok(tab)
     }
 
     pub async fn select_tab(
@@ -523,6 +703,9 @@ impl BrowserRuntime {
     ) -> Result<PageInfo, BrowserError> {
         self.gate(session_id, cancel).await?;
         let info = with_cancel(cancel, self.backend.select_tab(tab_id)).await?;
+        self.remember_active_tab(tab_id.to_string());
+        self.clear_page_state(session_id);
+        self.set_tab(session_id, Some(tab_id.to_string()));
         self.note_page(session_id, &info);
         self.note(session_id, describe_page(&info));
         Ok(info)
@@ -535,7 +718,23 @@ impl BrowserRuntime {
         cancel: &CancellationToken,
     ) -> Result<(), BrowserError> {
         self.gate(session_id, cancel).await?;
-        with_cancel(cancel, self.backend.close_tab(tab_id)).await
+        with_cancel(cancel, self.backend.close_tab(tab_id)).await?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for session in sessions.values_mut() {
+            if session.tab_id.as_deref() == Some(tab_id) {
+                session.tab_id = None;
+                session.snapshots.clear();
+                session.frames.clear();
+            }
+        }
+        drop(sessions);
+        if self.active_tab() == Some(tab_id.to_string()) {
+            self.forget_active_tab();
+        }
+        Ok(())
     }
 
     /// Produce and record a snapshot; returns it with its `[ref]` handles.
@@ -554,7 +753,7 @@ impl BrowserRuntime {
             snapshot.id = format!("n{}", self.snapshot_counter.load(Ordering::Relaxed));
         }
         let info = PageInfo {
-            tab_id: String::new(),
+            tab_id: self.session_tab(session_id).unwrap_or_default(),
             url: snapshot.url.clone(),
             title: snapshot.title.clone(),
             ready_state: "complete".to_string(),
@@ -816,15 +1015,240 @@ impl BrowserRuntime {
     }
 
     /// High-risk: evaluate JS in the page origin.
+    ///
+    /// `timeout_ms` is the harness budget, not a page-side kill: when it runs
+    /// out the outcome is `timed_out` plus whatever the expression logged,
+    /// which is far more useful than dropping the evidence.
     pub async fn evaluate(
         &self,
         session_id: &str,
         expression: &str,
+        timeout_ms: u64,
+        await_promise: bool,
+        cancel: &CancellationToken,
+    ) -> Result<EvalOutcome, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        self.note(session_id, "正在执行页面脚本…");
+        let request = crate::types::EvalRequest {
+            expression: expression.to_string(),
+            timeout_ms,
+            await_promise,
+        };
+        with_cancel(cancel, self.backend.evaluate(&request)).await
+    }
+
+    /// Body of a finished request.
+    pub async fn response_body(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        max_chars: usize,
+        cancel: &CancellationToken,
+    ) -> Result<ResponseBody, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        with_cancel(cancel, self.backend.response_body(request_id, max_chars)).await
+    }
+
+    /// Wait for a response whose URL matches `pattern`.
+    pub async fn wait_for_request(
+        &self,
+        session_id: &str,
+        request: &RequestWait,
+        cancel: &CancellationToken,
+    ) -> Result<ResponseBody, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        self.note(session_id, format!("正在等待请求 {}…", request.pattern));
+        let body = with_cancel(cancel, self.backend.wait_for_request(request)).await?;
+        self.note(session_id, format!("已拿到 {}", short_url(&body.url)));
+        Ok(body)
+    }
+
+    /// Text of the page element(s) matching a CSS selector.
+    pub async fn element_text(
+        &self,
+        session_id: &str,
+        selector: &str,
+        all: bool,
+        max_chars: usize,
+        cancel: &CancellationToken,
+    ) -> Result<ElementText, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        with_cancel(cancel, self.backend.element_text(selector, all, max_chars)).await
+    }
+
+    /// Click the element whose accessible name matches `text`.
+    ///
+    /// Matching is resolved against the latest snapshot, so the click uses the
+    /// same box the model saw. Exact matches win over substring matches, and
+    /// interactive roles win over decorative ones; the error lists the
+    /// candidates so the model can correct itself in one turn.
+    pub async fn click_text(
+        &self,
+        session_id: &str,
+        snapshot_id: Option<&str>,
+        text: &str,
+        exact: bool,
+        wait: WaitPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<(String, PageInfo), BrowserError> {
+        self.gate(session_id, cancel).await?;
+        let node = {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let session = sessions
+                .get(session_id)
+                .ok_or_else(|| BrowserError::Invalid("browser session is gone".to_string()))?;
+            let snapshot = session.snapshot(snapshot_id)?;
+            match_text_node(snapshot, text, exact)?
+        };
+        let label = format!("{}「{}」", node.role, node.name);
+        self.note(session_id, format!("正在点击 {label}"));
+        let info = with_cancel(
+            cancel,
+            self.backend
+                .click_ref(&node.id, MouseButton::Left, 1, &[], wait),
+        )
+        .await?;
+        self.after_action(session_id, &info);
+        Ok((node.id, info))
+    }
+
+    /// Click the center of the first element matching a CSS selector.
+    pub async fn click_selector(
+        &self,
+        session_id: &str,
+        selector: &str,
+        button: MouseButton,
+        click_count: u32,
+        wait: WaitPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<PageInfo, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        let bounds = with_cancel(cancel, self.backend.element_box(selector))
+            .await?
+            .ok_or_else(|| {
+                BrowserError::NotFound(format!(
+                    "no element matches `{selector}`; check the selector or take a snapshot"
+                ))
+            })?;
+        if !bounds.is_visible() {
+            return Err(BrowserError::NotInteractable(format!(
+                "`{selector}` has no visible layout box"
+            )));
+        }
+        let (x, y) = bounds.center();
+        self.note(session_id, format!("正在点击 {selector}"));
+        let info = with_cancel(
+            cancel,
+            self.backend
+                .click_point(x, y, button, click_count, &[], wait),
+        )
+        .await?;
+        self.after_action(session_id, &info);
+        Ok(info)
+    }
+
+    /// Drag from one element/point to another.
+    ///
+    /// Refs are re-resolved through the backend so the gesture lands on the
+    /// element's *current* box, not the box it had when the snapshot was taken.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn drag(
+        &self,
+        session_id: &str,
+        snapshot_id: Option<&str>,
+        from_ref: Option<&str>,
+        to_ref: Option<&str>,
+        from_point: Option<(f64, f64)>,
+        to_point: Option<(f64, f64)>,
+        steps: u32,
+        wait: WaitPolicy,
+        cancel: &CancellationToken,
+    ) -> Result<PageInfo, BrowserError> {
+        self.gate(session_id, cancel).await?;
+        for r#ref in [from_ref, to_ref].into_iter().flatten() {
+            self.resolve_ref(session_id, snapshot_id, r#ref)?;
+        }
+        let start = match (from_ref, from_point) {
+            (Some(r#ref), _) => self.ref_center(session_id, r#ref, cancel).await?,
+            (None, Some(point)) => point,
+            (None, None) => {
+                return Err(BrowserError::Invalid(
+                    "drag needs from_ref or x/y for the start point".to_string(),
+                ));
+            }
+        };
+        let end = match (to_ref, to_point) {
+            (Some(r#ref), _) => self.ref_center(session_id, r#ref, cancel).await?,
+            (None, Some(point)) => point,
+            (None, None) => {
+                return Err(BrowserError::Invalid(
+                    "drag needs to_ref or to_x/to_y for the end point".to_string(),
+                ));
+            }
+        };
+        self.note(
+            session_id,
+            format!(
+                "正在拖动 ({:.0}, {:.0}) → ({:.0}, {:.0})",
+                start.0, start.1, end.0, end.1
+            ),
+        );
+        let info = with_cancel(
+            cancel,
+            self.backend.drag(start, end, steps.clamp(1, 60), wait),
+        )
+        .await?;
+        self.after_action(session_id, &info);
+        Ok(info)
+    }
+
+    /// Center of a ref's current box.
+    async fn ref_center(
+        &self,
+        session_id: &str,
+        r#ref: &str,
+        cancel: &CancellationToken,
+    ) -> Result<(f64, f64), BrowserError> {
+        let bounds = with_cancel(cancel, self.backend.ref_bounds(r#ref))
+            .await?
+            .ok_or_else(|| {
+                BrowserError::NotInteractable(format!(
+                    "ref `{}` has no layout box; take a new browser_snapshot",
+                    r#ref
+                ))
+            })?;
+        if !bounds.is_visible() {
+            return Err(BrowserError::NotInteractable(format!(
+                "ref `{}` has no visible layout box",
+                r#ref
+            )));
+        }
+        let (x, y) = bounds.center();
+        let _ = session_id;
+        Ok((x, y))
+    }
+
+    /// Drive an in-page code editor.
+    pub async fn editor(
+        &self,
+        session_id: &str,
+        request: &EditorRequest,
         cancel: &CancellationToken,
     ) -> Result<Value, BrowserError> {
         self.gate(session_id, cancel).await?;
-        self.note(session_id, "正在执行页面脚本…");
-        with_cancel(cancel, self.backend.evaluate(expression)).await
+        self.note(
+            session_id,
+            match request.op {
+                EditorOp::Save => "正在保存编辑器内容…",
+                EditorOp::Write => "正在写入编辑器…",
+                EditorOp::Read => "正在读取编辑器…",
+                EditorOp::List | EditorOp::Detect => "正在查找页面里的编辑器…",
+            },
+        );
+        with_cancel(cancel, self.backend.editor(request)).await
     }
 
     pub async fn screenshot(
@@ -928,20 +1352,45 @@ impl BrowserRuntime {
     }
 
     /// End the browser session for one conversation.
+    ///
+    /// Other agents may still be driving their own tabs, so this only closes
+    /// this conversation's tab; the last one closes the browser process.
     pub async fn end_session(&self, session_id: &str) -> Result<(), BrowserError> {
-        {
+        let (tab_id, others) = {
             let mut sessions = self
                 .sessions
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(session) = sessions.get_mut(session_id) {
-                session.snapshots.clear();
-                session.frames.clear();
-                session.overlay_visible = false;
-            }
-        }
+            let tab_id = sessions
+                .get(session_id)
+                .and_then(|session| session.tab_id.clone());
+            let others: Vec<String> = sessions
+                .iter()
+                .filter(|(id, session)| id.as_str() != session_id && session.tab_id.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            sessions.remove(session_id);
+            (tab_id, others)
+        };
         self.emit(session_id, OverlayEventKind::Hide);
-        self.backend.end_session().await
+        if others.is_empty() {
+            self.forget_active_tab();
+            return self.backend.end_session().await;
+        }
+        // Detach from our tab before closing it, then hand the browser back to
+        // one of the remaining conversations.
+        if let Some(tab_id) = tab_id {
+            let witness = others
+                .iter()
+                .find_map(|other| self.session_tab(other))
+                .unwrap_or_default();
+            if !witness.is_empty() {
+                let _ =
+                    with_cancel(&CancellationToken::new(), self.backend.select_tab(&witness)).await;
+            }
+            let _ = self.backend.close_tab(&tab_id).await;
+        }
+        Ok(())
     }
 
     fn after_action(&self, session_id: &str, info: &PageInfo) {
@@ -1028,6 +1477,72 @@ impl BrowserRuntime {
         }
         Ok(())
     }
+}
+
+/// Pick the node a `click --text` should hit.
+///
+/// Exact matches beat substring matches, and interactive roles beat everything
+/// else; among equals, the first match in tree order wins (that is the one a
+/// user would see first). Failing with the candidate names in the message lets
+/// the model fix its call instead of guessing.
+fn match_text_node(snapshot: &Snapshot, text: &str, exact: bool) -> Result<AxNode, BrowserError> {
+    const INTERACTIVE: [&str; 10] = [
+        "button", "link", "menuitem", "tab", "option", "checkbox", "radio", "switch", "textbox",
+        "combobox",
+    ];
+    let needle = text.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err(BrowserError::Invalid("click text cannot be empty".into()));
+    }
+    let rank = |node: &AxNode| -> Option<(u8, u8)> {
+        let name = node.name.trim().to_lowercase();
+        if name.is_empty() {
+            return None;
+        }
+        let positional = match node.bounds {
+            Some(bounds) if bounds.is_visible() => 0u8,
+            _ => 1u8,
+        };
+        let hit = if name == needle {
+            0u8
+        } else if !exact && name.contains(&needle) {
+            1u8
+        } else {
+            return None;
+        };
+        let role = if INTERACTIVE.contains(&node.role.as_str()) {
+            0u8
+        } else {
+            1u8
+        };
+        Some((hit, role.saturating_add(positional)))
+    };
+    let best = snapshot
+        .nodes
+        .iter()
+        .filter_map(|node| rank(node).map(|rank| (rank, node)))
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, node)| node.clone());
+    if let Some(node) = best {
+        return Ok(node);
+    }
+    let candidates: Vec<String> = snapshot
+        .nodes
+        .iter()
+        .filter(|node| INTERACTIVE.contains(&node.role.as_str()) && !node.name.trim().is_empty())
+        .take(12)
+        .map(|node| format!("{}「{}」", node.role, truncate(&node.name, 30)))
+        .collect();
+    Err(BrowserError::NotFound(format!(
+        "no element matching text `{}` in snapshot `{}`; visible controls: {}",
+        text,
+        snapshot.id,
+        if candidates.is_empty() {
+            "none — take a new snapshot".to_string()
+        } else {
+            candidates.join(", ")
+        }
+    )))
 }
 
 fn describe_page(info: &PageInfo) -> String {
@@ -1193,6 +1708,169 @@ mod tests {
             Err(BrowserError::StaleSnapshot(_))
         ));
         assert!(session.snapshot(None).is_ok());
+    }
+
+    fn fake_runtime() -> (Arc<BrowserRuntime>, Arc<crate::testing::FakeBrowser>) {
+        let backend = Arc::new(crate::testing::FakeBrowser::new());
+        let runtime = Arc::new(BrowserRuntime::with_data_dir(
+            backend.clone(),
+            std::env::temp_dir(),
+        ));
+        (runtime, backend)
+    }
+
+    #[tokio::test]
+    async fn every_conversation_drives_its_own_tab() {
+        let (runtime, backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+
+        // Two conversations touching the browser get two tabs.
+        runtime.gate("a", &cancel).await.unwrap();
+        runtime.gate("b", &cancel).await.unwrap();
+        let tab_a = runtime.session_tab("a").expect("a is bound to a tab");
+        let tab_b = runtime.session_tab("b").expect("b is bound to a tab");
+        assert_ne!(tab_a, tab_b, "conversations must not share a tab");
+        assert_eq!(backend.active_tab().as_deref(), Some(tab_b.as_str()));
+
+        // `a` acting again re-attaches to its own tab instead of driving `b`'s.
+        runtime.gate("a", &cancel).await.unwrap();
+        assert_eq!(backend.active_tab().as_deref(), Some(tab_a.as_str()));
+        assert_eq!(runtime.session_tab("a").as_deref(), Some(tab_a.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_new_tab_becomes_the_conversations_tab() {
+        let (runtime, backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime.gate("a", &cancel).await.unwrap();
+        let first = runtime.session_tab("a").unwrap();
+
+        let tab = runtime
+            .new_tab("a", Some("https://new.test/"), &cancel)
+            .await
+            .unwrap();
+        assert_ne!(tab.id, first);
+        assert_eq!(runtime.session_tab("a").as_deref(), Some(tab.id.as_str()));
+        assert_eq!(backend.active_tab().as_deref(), Some(tab.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn ending_one_conversation_keeps_the_browser_for_the_others() {
+        let (runtime, backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime.gate("a", &cancel).await.unwrap();
+        runtime.gate("b", &cancel).await.unwrap();
+        let tab_a = runtime.session_tab("a").unwrap();
+        let tab_b = runtime.session_tab("b").unwrap();
+
+        runtime.end_session("a").await.unwrap();
+        assert!(runtime.session_tab("a").is_none());
+        // `b` still owns its tab and the backend stays attached to it.
+        assert_eq!(runtime.session_tab("b").as_deref(), Some(tab_b.as_str()));
+        assert_eq!(backend.active_tab().as_deref(), Some(tab_b.as_str()));
+        assert!(!backend.tab_ids().contains(&tab_a), "a's tab is closed");
+    }
+
+    #[tokio::test]
+    async fn init_scripts_follow_the_conversation_and_its_tab() {
+        let (runtime, backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime
+            .set_init_scripts("a", &["globalThis.__set = 1;".to_string()], &cancel)
+            .await
+            .unwrap();
+        assert_eq!(backend.init_scripts(), vec!["globalThis.__set = 1;"]);
+
+        // Another conversation acting must not inherit `a`'s helpers.
+        runtime.gate("b", &cancel).await.unwrap();
+        assert!(backend.init_scripts().is_empty());
+
+        // Coming back to `a` re-installs them.
+        runtime.gate("a", &cancel).await.unwrap();
+        assert_eq!(backend.init_scripts(), vec!["globalThis.__set = 1;"]);
+    }
+
+    #[tokio::test]
+    async fn click_text_prefers_exact_labels_and_reports_candidates() {
+        let (runtime, _backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime
+            .snapshot("a", SnapshotMode::Interesting, 50, &cancel)
+            .await
+            .unwrap();
+
+        let (r#ref, _info) = runtime
+            .click_text("a", None, "save", false, WaitPolicy::None, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(r#ref, "e1");
+
+        let error = runtime
+            .click_text("a", None, "Publish", false, WaitPolicy::None, &cancel)
+            .await
+            .expect_err("unknown label must fail");
+        assert!(matches!(error, BrowserError::NotFound(_)), "{error}");
+        assert!(error.to_string().contains("button"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn drag_requires_two_ends_and_resolves_refs() {
+        let (runtime, _backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime
+            .snapshot("a", SnapshotMode::Interesting, 50, &cancel)
+            .await
+            .unwrap();
+
+        // ref → point works.
+        runtime
+            .drag(
+                "a",
+                None,
+                Some("e1"),
+                None,
+                None,
+                Some((300.0, 300.0)),
+                4,
+                WaitPolicy::None,
+                &cancel,
+            )
+            .await
+            .unwrap();
+
+        // A missing end fails with an actionable message.
+        let error = runtime
+            .drag(
+                "a",
+                None,
+                Some("e1"),
+                None,
+                None,
+                None,
+                4,
+                WaitPolicy::None,
+                &cancel,
+            )
+            .await
+            .expect_err("missing end must fail");
+        assert!(matches!(error, BrowserError::Invalid(_)), "{error}");
+
+        // A ref from a stale snapshot fails closed.
+        let error = runtime
+            .drag(
+                "a",
+                None,
+                Some("e99"),
+                None,
+                None,
+                Some((1.0, 1.0)),
+                4,
+                WaitPolicy::None,
+                &cancel,
+            )
+            .await
+            .expect_err("stale ref must fail");
+        assert!(matches!(error, BrowserError::NotFound(_)), "{error}");
     }
 
     #[test]

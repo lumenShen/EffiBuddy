@@ -626,7 +626,13 @@ impl SubagentService {
                 .restore_isolation(&child_session_id)
                 .await;
             devices.computer.forget_session(&child_session_id);
-            devices.browser.forget(&child_session_id);
+            // The browser is shared: a child that never used it must not close
+            // it, and one that did only gives up its own tab.
+            if devices.browser.session_tab(&child_session_id).is_some() {
+                let _ = devices.browser.end_session(&child_session_id).await;
+            } else {
+                devices.browser.forget(&child_session_id);
+            }
         }
         {
             let mut gates = self

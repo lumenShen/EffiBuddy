@@ -61,6 +61,18 @@ const ITEM_GAP: f32 = 40.0;
 /// chunks), matching the inter-block spacing inside a single document.
 const CHUNK_GAP: f32 = 9.0;
 const LIST_OVERDRAW: f32 = 560.0;
+/// Per-frame row-plan cache counters, reported by `--bench-scroll`.
+static PLAN_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PLAN_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How often `prepare_frame` reused the previous row plan, and how often it
+/// had to rebuild it. A frame that reuses the plan is O(1) in transcript size.
+pub(crate) fn plan_cache_stats() -> (u64, u64) {
+    (
+        PLAN_HITS.load(std::sync::atomic::Ordering::Relaxed),
+        PLAN_MISSES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
 /// First-frame height estimate for a virtual row (message block / markdown
 /// chunk) that has never been painted. Only affects scroll geometry before
 /// the first paint of each row; rows are re-measured as they render.
@@ -431,6 +443,18 @@ pub(crate) struct RunStatusItem {
 
 // --- the list --------------------------------------------------------------
 
+/// Inputs that determine the virtual-row plan (see
+/// [`ChatList::plan_cache`]). Comparing them is O(expanded items), which is
+/// what a user has expanded — never the transcript length.
+struct PlanCache {
+    items: Rc<Vec<Rc<ChatItem>>>,
+    running: bool,
+    expanded_reasoning: HashSet<String>,
+    expanded_tools: HashSet<String>,
+    expanded_turns: HashSet<String>,
+    collapsed_turns: HashSet<String>,
+}
+
 pub(crate) struct ChatList {
     pub list_state: ListState,
     items: Rc<Vec<Rc<ChatItem>>>,
@@ -467,6 +491,10 @@ pub(crate) struct ChatList {
     /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
     /// an O(1) lookup here instead of a scan through the transcript.
     first_slots: Vec<usize>,
+    /// Inputs of the last virtual-row plan. When the items, the run state and
+    /// the expansion sets are unchanged (and no answer is being revealed), the
+    /// plan is reused verbatim and a frame costs O(1) instead of O(messages).
+    plan_cache: Option<PlanCache>,
     /// Guards against scheduling more than one reveal frame at a time.
     pub reveal_frame_scheduled: bool,
     /// Smooth-scroll glide state (wheel capture + animated scroll-to-bottom).
@@ -522,6 +550,7 @@ impl ChatList {
             tool_images: Rc::new(RefCell::new(HashMap::new())),
             prompt_marks: Rc::new(Vec::new()),
             first_slots: Vec::new(),
+            plan_cache: None,
             reveal_frame_scheduled: false,
             glide: ScrollGlide::new(),
             glide_frame_scheduled: false,
@@ -578,6 +607,7 @@ impl ChatList {
         self.tool_images = Rc::new(RefCell::new(HashMap::new()));
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
+        self.plan_cache = None;
         self.glide = ScrollGlide::new();
         self.turn_expand_at.clear();
         self.revealed_turns.clear();
@@ -928,6 +958,50 @@ impl ChatList {
             });
         }
 
+        // Fast path: while nothing structural changed and no answer is being
+        // revealed, this frame's row plan is byte-identical to the last one's.
+        // Reusing it makes an idle or scrolling frame O(1) instead of
+        // O(messages) — the difference between "0.4ms of bookkeeping every
+        // frame" and "nothing", which is what a 300 Hz refresh actually needs.
+        //
+        // A live stream bypasses the cache on purpose: the reveal table grows
+        // per frame, so both the row count and the tail row's key change.
+        let plan_unchanged = streaming_id.is_none()
+            && self.plan_cache.as_ref().is_some_and(|cache| {
+                Rc::ptr_eq(&cache.items, &self.items)
+                    && cache.running == running
+                    && cache.expanded_reasoning == *expanded_reasoning
+                    && cache.expanded_tools == *expanded_tools
+                    && cache.expanded_turns == *expanded_turns
+                    && cache.collapsed_turns == *collapsed_turns
+            });
+        if plan_unchanged {
+            PLAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let markdown = markdown_interaction(&self.workspace, entity);
+            return ChatViewState {
+                items: self.items.clone(),
+                slots: Rc::clone(&self.slots),
+                results: Rc::clone(&self.results),
+                agents: Rc::new(agents.clone()),
+                expanded_reasoning: expanded_reasoning.clone(),
+                expanded_tools: expanded_tools.clone(),
+                expanded_turns: expanded_turns.clone(),
+                collapsed_turns: collapsed_turns.clone(),
+                running,
+                actions_enabled,
+                stream_chunks: streaming_chunks,
+                stream,
+                reasoning_scrolls: Rc::clone(&self.reasoning_scrolls),
+                code_scrolls: Rc::clone(&self.code_scrolls),
+                markdown,
+                tool_images: Rc::clone(&self.tool_images),
+                jump_flash: None,
+                turn_expand_at: Rc::new(self.turn_expand_at.clone()),
+                turn_block_heights: Rc::clone(&self.turn_block_heights),
+            };
+        }
+
+        PLAN_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Build the virtual-row plan. Assistant items with a chunk table
         // expand into lead/chunk/tail rows; the streaming message expands
         // into the per-frame table of its revealed text.
@@ -1056,6 +1130,16 @@ impl ChatList {
         self.slots = new_slots;
         self.slot_keys = new_keys;
         self.first_sync = false;
+        // Remember what the plan was derived from, so the next frame can skip
+        // the whole walk when nothing changed (see the plan_cache field).
+        self.plan_cache = Some(PlanCache {
+            items: self.items.clone(),
+            running,
+            expanded_reasoning: expanded_reasoning.clone(),
+            expanded_tools: expanded_tools.clone(),
+            expanded_turns: expanded_turns.clone(),
+            collapsed_turns: collapsed_turns.clone(),
+        });
 
         let markdown = markdown_interaction(&self.workspace, entity);
         ChatViewState {

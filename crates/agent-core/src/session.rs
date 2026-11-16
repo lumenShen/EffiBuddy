@@ -218,6 +218,16 @@ pub struct SessionState {
     pub reasoning_level: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Monotonic counter bumped by every mutation that funnels through
+    /// [`SessionState::touch`] (message pushes, model switches, tool-result
+    /// clearing, …). The UI memoizes derived data that walks the whole
+    /// transcript — the composer's context ring, for instance — against it, so
+    /// a frame over a long session costs O(1) instead of O(bytes).
+    ///
+    /// Not persisted; a reloaded session restarts at 0, which only means the
+    /// first consumer misses its cache once.
+    #[serde(skip)]
+    pub revision: u64,
     #[serde(default)]
     pub messages: Vec<Message>,
     #[serde(default)]
@@ -323,6 +333,7 @@ impl SessionState {
             reasoning_level: None,
             created_at: now,
             updated_at: now,
+            revision: 0,
             messages: Vec::new(),
             todos: Vec::new(),
             usage: Usage::default(),
@@ -351,6 +362,7 @@ impl SessionState {
 
     pub fn touch(&mut self) {
         self.updated_at = Utc::now();
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Switch the model for this conversation. The harness is rebuilt from the

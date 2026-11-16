@@ -298,22 +298,37 @@ fn clear_stale_profile_lock(profile_dir: &Path, notes: &mut Vec<String>) {
     notes.push("清理了上次遗留的 profile 锁".to_string());
 }
 
-fn unique_profile(engine: EngineKind) -> PathBuf {
+/// Where this engine keeps its user data.
+///
+/// The profile is deliberately **stable** across launches: cookies, sessions
+/// and local storage are exactly what makes a long task possible after the
+/// browser crashes, and Chrome only rewrites them when it shuts down cleanly.
+/// `EFFIBUDDY_BROWSER_PROFILE` points at a specific directory;
+/// `EFFIBUDDY_BROWSER_PROFILE_FRESH=1` restores the old throwaway behaviour,
+/// which is what tests and "log out everything" runs want.
+fn profile_for(engine: EngineKind) -> PathBuf {
     if let Some(custom) = std::env::var_os("EFFIBUDDY_BROWSER_PROFILE")
         .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
     {
         return custom;
     }
-    let stamp = format!(
-        "{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.subsec_nanos())
-            .unwrap_or(0)
-    );
-    profiles_dir().join(format!("{}-{stamp}", engine.label().to_lowercase()))
+    let label = engine.label().to_lowercase();
+    let fresh = std::env::var("EFFIBUDDY_BROWSER_PROFILE_FRESH")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if fresh {
+        let stamp = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.subsec_nanos())
+                .unwrap_or(0)
+        );
+        return profiles_dir().join(format!("{label}-{stamp}"));
+    }
+    profiles_dir().join(format!("{label}-default"))
 }
 
 /// Launch (or attach to) a browser and return its DevTools WebSocket URL.
@@ -384,7 +399,7 @@ async fn launch_candidate(
     headless: bool,
     notes: &mut Vec<String>,
 ) -> Result<LaunchedBrowser, BrowserError> {
-    let profile_dir = unique_profile(candidate.kind);
+    let profile_dir = profile_for(candidate.kind);
     std::fs::create_dir_all(&profile_dir)?;
     clear_stale_profile_lock(&profile_dir, notes);
 
@@ -596,6 +611,13 @@ mod tests {
         let dir = data_dir();
         assert!(dir.ends_with("effibuddy/browser") || dir.ends_with("effibuddy\\browser"));
         assert!(profiles_dir().ends_with("profiles"));
+
+        // The default profile is stable: that is what keeps logins alive
+        // across browser restarts.
+        let first = profile_for(EngineKind::Chrome);
+        let second = profile_for(EngineKind::Chrome);
+        assert_eq!(first, second);
+        assert!(first.ends_with("chrome-default"));
     }
 
     #[test]

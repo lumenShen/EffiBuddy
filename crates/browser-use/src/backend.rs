@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::types::{
-    AxNode, BrowserError, BrowserInfo, ConsoleEntry, JournalPage, JournalQuery, MouseButton,
-    NetEntry, PageCapture, PageInfo, ScreenshotOptions, Snapshot, SnapshotMode, TabInfo,
-    WaitPolicy,
+    AxNode, BrowserError, BrowserInfo, ConsoleEntry, EditorRequest, ElementText, EvalOutcome,
+    EvalRequest, JournalPage, JournalQuery, MouseButton, NetEntry, PageCapture, PageInfo,
+    RequestWait, ResponseBody, ScreenshotOptions, Snapshot, SnapshotMode, TabInfo, WaitPolicy,
 };
 
 /// One keyboard chord, e.g. `ctrl+shift+t`, `Return`, `Escape`, `F5`.
@@ -186,7 +186,21 @@ pub trait BrowserBackend: Send + Sync {
 
     /// Evaluate an expression in the page. The runtime treats this as a
     /// high-risk action and gates it behind an explicit approval.
-    async fn evaluate(&self, expression: &str) -> Result<Value, BrowserError>;
+    ///
+    /// The backend owns the deadline: it must return [`EvalOutcome::timed_out`]
+    /// with whatever the expression logged before the budget ran out instead
+    /// of discarding the partial evidence.
+    async fn evaluate(&self, request: &EvalRequest) -> Result<EvalOutcome, BrowserError>;
+
+    /// Fetch the body of a finished request.
+    async fn response_body(
+        &self,
+        request_id: &str,
+        max_chars: usize,
+    ) -> Result<ResponseBody, BrowserError>;
+
+    /// Block until a response whose URL matches `pattern` finishes.
+    async fn wait_for_request(&self, request: &RequestWait) -> Result<ResponseBody, BrowserError>;
 
     async fn console(
         &self,
@@ -196,6 +210,51 @@ pub trait BrowserBackend: Send + Sync {
     async fn network(&self, query: &JournalQuery) -> Result<JournalPage<NetEntry>, BrowserError>;
 
     async fn wait_for(&self, request: &WaitRequest) -> Result<PageInfo, BrowserError>;
+
+    /// Text of the first (or all) elements matching a CSS selector.
+    async fn element_text(
+        &self,
+        selector: &str,
+        all: bool,
+        max_chars: usize,
+    ) -> Result<ElementText, BrowserError>;
+
+    /// Viewport box of the first element matching a CSS selector.
+    async fn element_box(&self, selector: &str)
+    -> Result<Option<crate::types::Rect>, BrowserError>;
+
+    /// Click a CSS-pixel point in the main frame.
+    async fn click_point(
+        &self,
+        x: f64,
+        y: f64,
+        button: MouseButton,
+        click_count: u32,
+        modifiers: &[KeyModifier],
+        wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError>;
+
+    /// Press at `from`, move in `steps` increments, release at `to`.
+    async fn drag(
+        &self,
+        from: (f64, f64),
+        to: (f64, f64),
+        steps: u32,
+        wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError>;
+
+    /// Drive an in-page code editor (Monaco, CodeMirror, Ace, plain textarea).
+    ///
+    /// Returns the page-side JSON envelope described in `crate::editor`; the
+    /// runtime does not interpret it, only forwards it to the model.
+    async fn editor(&self, request: &EditorRequest) -> Result<Value, BrowserError>;
+
+    /// Replace the scripts injected into every new document of the active tab.
+    ///
+    /// Implementations must make this idempotent and re-apply after they attach
+    /// to a different target, so a conversation can rely on its helpers being
+    /// present on every page.
+    async fn set_init_scripts(&self, scripts: &[String]) -> Result<(), BrowserError>;
 
     /// Current tab state without round-tripping the page.
     async fn page_info(&self) -> Result<PageInfo, BrowserError>;
@@ -354,7 +413,19 @@ impl BrowserBackend for UnsupportedBackend {
         self.error()
     }
 
-    async fn evaluate(&self, _expression: &str) -> Result<Value, BrowserError> {
+    async fn evaluate(&self, _request: &EvalRequest) -> Result<EvalOutcome, BrowserError> {
+        self.error()
+    }
+
+    async fn response_body(
+        &self,
+        _request_id: &str,
+        _max_chars: usize,
+    ) -> Result<ResponseBody, BrowserError> {
+        self.error()
+    }
+
+    async fn wait_for_request(&self, _request: &RequestWait) -> Result<ResponseBody, BrowserError> {
         self.error()
     }
 
@@ -371,6 +442,52 @@ impl BrowserBackend for UnsupportedBackend {
 
     async fn wait_for(&self, _request: &WaitRequest) -> Result<PageInfo, BrowserError> {
         self.error()
+    }
+
+    async fn element_text(
+        &self,
+        _selector: &str,
+        _all: bool,
+        _max_chars: usize,
+    ) -> Result<ElementText, BrowserError> {
+        self.error()
+    }
+
+    async fn element_box(
+        &self,
+        _selector: &str,
+    ) -> Result<Option<crate::types::Rect>, BrowserError> {
+        self.error()
+    }
+
+    async fn click_point(
+        &self,
+        _x: f64,
+        _y: f64,
+        _button: MouseButton,
+        _click_count: u32,
+        _modifiers: &[KeyModifier],
+        _wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError> {
+        self.error()
+    }
+
+    async fn drag(
+        &self,
+        _from: (f64, f64),
+        _to: (f64, f64),
+        _steps: u32,
+        _wait: WaitPolicy,
+    ) -> Result<PageInfo, BrowserError> {
+        self.error()
+    }
+
+    async fn editor(&self, _request: &EditorRequest) -> Result<Value, BrowserError> {
+        self.error()
+    }
+
+    async fn set_init_scripts(&self, _scripts: &[String]) -> Result<(), BrowserError> {
+        Ok(())
     }
 
     async fn page_info(&self) -> Result<PageInfo, BrowserError> {

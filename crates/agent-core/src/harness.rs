@@ -1705,11 +1705,17 @@ impl ToolExecutor {
         // `permission_mode` is resolved through the config so a child harness
         // follows the owning conversation's mode (see `HarnessConfig`).
         let permission_mode = self.config.effective_permission_mode(&self.session);
+        // Tools that declare a finer key (device tools group by action) cache
+        // "allow for session" per action; everything else caches per tool.
+        let approval_key = match tool.approval_key(&call.arguments) {
+            Some(suffix) => format!("{}:{suffix}", call.name),
+            None => call.name.clone(),
+        };
         let already_approved = self
             .approved
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(&call.name);
+            .contains(&approval_key);
         // Plan mode consults the gate for every tool regardless of its declared
         // policy: Auto tools such as `run_js` and `agent` must not bypass the
         // read-only research contract, and the session approval cache ("allow
@@ -1761,7 +1767,7 @@ impl ToolExecutor {
                     self.approved
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(call.name.clone());
+                        .insert(approval_key.clone());
                 }
                 ApprovalDecision::Deny => {
                     let denial = if permission_mode == PermissionMode::Plan {
@@ -2871,6 +2877,106 @@ mod tests {
             result.content.contains("Plan"),
             "denial should explain plan mode: {}",
             result.content
+        );
+    }
+
+    /// A device-style tool: one name, many capabilities, approval grouped by
+    /// the concrete action.
+    struct ActionTool {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ActionTool {
+        fn name(&self) -> &str {
+            "browser"
+        }
+        fn description(&self) -> &str {
+            "Drive a browser"
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object"})
+        }
+        fn approval(&self) -> ApprovalPolicy {
+            ApprovalPolicy::Ask
+        }
+        fn approval_key(&self, arguments: &Value) -> Option<String> {
+            arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        async fn execute(
+            &self,
+            _ctx: ToolContext,
+            arguments: Value,
+        ) -> Result<ToolOutput, ToolError> {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            self.calls.lock().unwrap().push(action.clone());
+            Ok(ToolOutput::text(action))
+        }
+    }
+
+    /// Gate that remembers every approval for the session and records what it
+    /// was asked about.
+    struct RecordingSessionGate {
+        asks: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ApprovalGate for RecordingSessionGate {
+        async fn request_approval(&self, request: ApprovalRequest) -> ApprovalDecision {
+            let action = request
+                .arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            self.asks.lock().unwrap().push(action);
+            ApprovalDecision::ApproveForSession
+        }
+    }
+
+    /// Regression: a loop of identical device actions must ask once, and a
+    /// different action must ask on its own — the browser tool's `eval` loop
+    /// used to re-prompt 40 times (or, with a tool-level cache, to approve
+    /// everything at once).
+    #[tokio::test]
+    async fn session_approvals_are_grouped_by_action() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut tools = ToolRegistry::new();
+        tools.register(ActionTool {
+            calls: calls.clone(),
+        });
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            Completion::default()
+                .with_tool_call(ToolCall::new("browser", json!({"action": "eval"})))
+                .with_tool_call(ToolCall::new("browser", json!({"action": "eval"})))
+                .with_tool_call(ToolCall::new("browser", json!({"action": "navigate"}))),
+            Completion::text("done"),
+        ]));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider,
+            Arc::new(tools),
+            Arc::new(RecordingSessionGate { asks: asks.clone() }),
+            HarnessConfig::default(),
+            tx,
+        );
+        let outcome = harness.run_turn("drive the browser").await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(&*calls.lock().unwrap(), &["eval", "eval", "navigate"]);
+        assert_eq!(
+            &*asks.lock().unwrap(),
+            &["eval", "navigate"],
+            "the second eval must reuse the session approval for that action"
         );
     }
 

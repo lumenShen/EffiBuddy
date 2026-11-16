@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, Timelike, Utc};
@@ -543,6 +544,19 @@ pub struct AppView {
     bench_until: Option<Instant>,
     /// The stress streaming message, so the bench loop can refill its backlog.
     bench_stream: Option<Message>,
+    /// Rows the list painted on the first scroll-bench frame, so the summary
+    /// can report how much of the transcript actually reached the screen.
+    scroll_bench_rows_start: u64,
+    /// Memo for `context_usage`: the ring costs O(bytes) to compute and is
+    /// read on every paint.
+    context_usage_cache: std::cell::RefCell<Option<UsageCache>>,
+    /// `--bench-scroll` deadline; the per-frame hook scrolls until it passes.
+    scroll_bench_until: Option<Instant>,
+    /// Frames and bottom-to-top passes the scroll bench has driven so far.
+    scroll_bench_frames: u64,
+    scroll_bench_wraps: u64,
+    /// Pixels scrolled per frame.
+    scroll_bench_step: f32,
     /// Guards background session scans: a stale listing never overwrites a
     /// newer one.
     refresh_generation: u64,
@@ -693,6 +707,7 @@ impl AppView {
             argument == "--preview"
                 || argument == "--preview-stress"
                 || argument == "--bench"
+                || argument == "--bench-scroll"
                 || argument == "--preview-empty"
                 || argument == "--preview-agents"
                 || argument == "--preview-subagent"
@@ -1140,6 +1155,12 @@ impl AppView {
             draft_save_scheduled: false,
             bench_until: None,
             bench_stream: None,
+            context_usage_cache: std::cell::RefCell::new(None),
+            scroll_bench_until: None,
+            scroll_bench_rows_start: 0,
+            scroll_bench_frames: 0,
+            scroll_bench_wraps: 0,
+            scroll_bench_step: bench_scroll_step(),
             run_tick_stamp: 0,
             agent_tick_stamp: 0,
             refresh_generation: 0,
@@ -1242,6 +1263,17 @@ impl AppView {
             view.seed_preview(cx);
             view.seed_stress_transcript(cx);
             view.start_bench(seconds, cx);
+        }
+        if std::env::args().any(|argument| argument == "--bench-scroll") {
+            let seconds = std::env::args()
+                .skip_while(|argument| argument != "--bench-scroll")
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(8);
+            // The bench needs an active session; the preview fixture builds one.
+            view.seed_preview(cx);
+            view.seed_scroll_bench_transcript(bench_scroll_messages(), cx);
+            view.start_scroll_bench(seconds, cx);
         }
         if std::env::args().any(|argument| argument == "--preview-stress") {
             view.seed_preview(cx);
@@ -2060,6 +2092,9 @@ impl AppView {
     fn forget_session_runtime(&mut self, id: &str) {
         self.background_sessions.remove(id);
         self.session_shares.remove(id);
+        // The `state` scratchpad lives in process memory; a deleted
+        // conversation must not leave its entries behind.
+        effibuddy_agent_tools::forget_session_state(id);
         if let Some(run) = self.background_runs.remove(id) {
             run.handle.interrupt();
             run.approval.deny_all();
@@ -5441,12 +5476,76 @@ impl AppView {
 
     /// 输入框占用环与概览页共用的一次快照：主会话的上下文占用 +
     /// 整棵子代理树的累计消耗。
+    /// Context-window usage for the composer's progress ring.
+    ///
+    /// The estimate walks every message and counts every character, so doing it
+    /// per frame made a long transcript cost O(bytes) on *every* paint: the
+    /// composer ring alone accounted for ~2ms of a 10k-message frame. Memoized
+    /// against the session revision; during streaming the key changes every
+    /// delta, so a short time floor keeps it at a few recomputes per second.
     pub(crate) fn context_usage(&self, context_window: usize) -> ContextUsage {
-        let mut usage = self
-            .active_shared()
-            .map(|shared| crate::context_meter::collect(&shared, context_window))
-            .unwrap_or_else(|| ContextUsage::empty(context_window));
-        usage.subagents = self.subagent_usage();
+        let Some(shared) = self.active_shared() else {
+            return ContextUsage::empty(context_window);
+        };
+        let usage = {
+            let session = lock_session(&shared);
+            self.cached_message_usage(&session, context_window)
+        };
+        ContextUsage {
+            subagents: self.subagent_usage(),
+            ..usage
+        }
+    }
+
+    /// Memoized sibling of [`crate::context_meter::collect_from_session`].
+    ///
+    /// That estimate walks every message and counts every character (plus a
+    /// `serde_json` round-trip per tool call), which made a 10k-message frame
+    /// pay ~2-3ms — twice per frame, because both the composer ring and the
+    /// overview pane read it. Callers already hold the session lock, so this
+    /// only does the O(1) key check and the (rare) recompute.
+    pub(crate) fn cached_message_usage(
+        &self,
+        session: &effibuddy_agent_core::SessionState,
+        context_window: usize,
+    ) -> ContextUsage {
+        let key = UsageKey {
+            session: {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                session.id.hash(&mut hasher);
+                hasher.finish()
+            },
+            revision: session.revision,
+            messages: session.messages.len(),
+            tail: session
+                .messages
+                .last()
+                .map_or(0, |message| message.revision),
+            cleared: session.cleared_tool_calls.len(),
+            compaction: session
+                .compaction
+                .as_ref()
+                .map_or(0, |record| record.summary.len()),
+            prompt: session.usage.prompt_tokens,
+            completion: session.usage.completion_tokens,
+            last_prompt: session.usage.last_prompt_tokens,
+        };
+        let now = Instant::now();
+        if let Some(cached) = self.context_usage_cache.borrow().as_ref() {
+            let fresh = cached.key == key && cached.window == context_window;
+            let recent = now.duration_since(cached.stamp) < USAGE_CACHE_MIN_INTERVAL;
+            if fresh || recent {
+                return cached.usage.clone();
+            }
+        }
+        let usage = crate::context_meter::collect_from_session(session, context_window);
+        *self.context_usage_cache.borrow_mut() = Some(UsageCache {
+            key,
+            window: context_window,
+            stamp: now,
+            usage: usage.clone(),
+        });
         usage
     }
 
@@ -5500,6 +5599,148 @@ impl AppView {
             // 手动展开也打点：展开内容按 50ms stagger 渐显。
             self.chat.note_turn_expanded(id);
         }
+    }
+
+    /// `--bench-scroll`: seed a long transcript and drive it one scroll step
+    /// per rendered frame, then print the same `[bench]` summary.
+    ///
+    /// `chat_bench` (the headless benchmark) can only measure app-side costs:
+    /// its window-less test environment uses GPUI's `NoopTextSystem`, so text
+    /// shaping, rasterization and GPU presentation are all free there. This
+    /// mode runs the real window against real fonts so the `[bench]` frame /
+    /// work / render numbers are the ones a user would feel — the only way to
+    /// answer "is scrolling fast enough at 300 Hz" honestly.
+    fn start_scroll_bench(&mut self, seconds: u64, cx: &mut Context<Self>) {
+        self.scroll_bench_until = Some(Instant::now() + Duration::from_secs(seconds));
+        self.scroll_bench_rows_start = ROWS_RENDERED.load(Ordering::Relaxed);
+        // Drive the scroll from a timer rather than from `render_chat`: a
+        // window the compositor throttles (occluded, unfocused) stops receiving
+        // frame callbacks, and a deadline checked during render would then
+        // never fire. This also keeps the step/notify cadence independent of
+        // how fast the frames themselves come out.
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(4))
+                    .await;
+                let done = weak
+                    .update(cx, |this, cx| {
+                        let Some(until) = this.scroll_bench_until else {
+                            return true;
+                        };
+                        if Instant::now() >= until {
+                            this.scroll_bench_until = None;
+                            this.print_scroll_bench_summary();
+                            cx.quit();
+                            return true;
+                        }
+                        this.scroll_bench_step();
+                        cx.notify();
+                        false
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// One bench scroll step: a wheel-sized nudge toward the history, wrapping
+    /// to the tail once the top is reached.
+    fn scroll_bench_step(&mut self) {
+        let offset = -f32::from(self.chat.list_state.scroll_px_offset_for_scrollbar().y);
+        if offset <= 0.5 {
+            self.chat.pin_to_bottom();
+            self.scroll_bench_wraps += 1;
+        } else if self.scroll_bench_step > 0.0 {
+            let step = self.scroll_bench_step.min(offset);
+            self.chat.list_state.scroll_by(px(-step));
+            // `sync_scroll` recomputes `pinned` from the new geometry; without
+            // the dirty flag it would re-pin and undo the scroll.
+            self.chat.mark_scrolled();
+        }
+        self.scroll_bench_frames += 1;
+    }
+
+    fn print_scroll_bench_summary(&self) {
+        eprintln!("{}", perf::bench_summary());
+        let painted = ROWS_RENDERED.load(Ordering::Relaxed);
+        let (plan_hits, plan_misses) = crate::chat::plan_cache_stats();
+        let frames = self.scroll_bench_frames.max(1) as f64;
+        let per_frame =
+            |counter: &AtomicU64| counter.load(Ordering::Relaxed) as f64 / frames / 1000.0;
+        eprintln!(
+            "[bench-scroll] {} 帧 / {} 行 / {} 次回绕 / 步长 {:.0}px / 每帧绘制 {:.1} 行 / 计划缓存 命中 {} 未命中 {} / prepare {:.2}ms rail {:.2}ms render_chat {:.2}ms (header {:.2} / body {:.2})",
+            self.scroll_bench_frames,
+            self.chat.list_state.item_count(),
+            self.scroll_bench_wraps,
+            self.scroll_bench_step,
+            (painted.saturating_sub(self.scroll_bench_rows_start)) as f64 / frames,
+            plan_hits,
+            plan_misses,
+            per_frame(&T_PREPARE_US),
+            per_frame(&T_RAIL_US),
+            per_frame(&T_RENDER_US),
+            per_frame(&T_HEAD_US),
+            per_frame(&T_BODY_US),
+        );
+        eprintln!(
+            "[bench-scroll] 每帧：主内容区 {:.2}ms / 标题栏 {:.2}ms / 侧栏 {:.2}ms / 右侧栏 {:.2}ms / 输入框 {:.2}ms",
+            per_frame(&T_CONTENT_US),
+            per_frame(&T_TITLE_US),
+            per_frame(&T_SIDEBAR_US),
+            per_frame(&T_SIDEPANE_US),
+            per_frame(&T_COMPOSER_US),
+        );
+    }
+
+    /// Seed a synthetic transcript for [`Self::start_scroll_bench`]: every turn
+    /// is user input → thinking + tool call → tool result → thinking + body,
+    /// the four kinds of content the transcript actually renders.
+    fn seed_scroll_bench_transcript(&mut self, messages: usize, cx: &mut Context<Self>) {
+        let Some(active) = &self.active else {
+            return;
+        };
+        let mut session = lock_session(&active.shared);
+        let turns = (messages / 4).max(1);
+        for turn in 0..turns {
+            session.push_message(Message::user(format!(
+                "第 {turn} 个问题：滚动的成本应该与历史长度无关，对吧？"
+            )));
+
+            let mut plan = Message::assistant();
+            plan.push_reasoning(format!(
+                "先确认第 {turn} 处的前缀对齐是否断在流式尾巴上，再决定要不要重排；虚拟列表只排版视口附近的行。"
+            ));
+            let call = ToolCall::new("read_file", json!({"path": "crates/app/src/chat.rs"}))
+                .with_id(format!("bench_call_{turn}"));
+            plan.push_tool_call(call.clone());
+            session.push_message(plan);
+
+            let mut result = ToolResult::success(
+                &call,
+                format!("第 {turn} 行匹配：虚拟化槽位在流式过程中保持前缀稳定。"),
+            );
+            result.duration_ms = Some(8);
+            session.push_message(Message::from_tool_result(result));
+
+            let mut answer = Message::assistant();
+            answer.push_reasoning(format!("第 {turn} 段结论已经清楚，写给用户。"));
+            answer.push_text(bench_markdown_body(turn));
+            session.push_message(answer);
+        }
+        // A live tail so the transcript exercises the same shapes a real run
+        // has (the answer that is still streaming).
+        session.usage.total_tokens = 420_000;
+        session.touch();
+        drop(session);
+
+        self.chat_dirty = true;
+        self.chat.pin_to_bottom();
+        cx.notify();
     }
 
     /// `--bench`: keep the stress storm saturated for `seconds`, then print
@@ -8488,8 +8729,9 @@ impl AppView {
                 .into_any_element(),
             );
             if !pinned_collapsed {
+                let mut items = Vec::with_capacity(pinned.len());
                 for (stagger_ix, summary) in pinned.iter().enumerate() {
-                    rows.push(motion_session_row(
+                    items.push(motion_session_row(
                         &motion,
                         theme,
                         summary,
@@ -8507,6 +8749,10 @@ impl AppView {
                         cx,
                     ));
                 }
+                rows.push(sidebar_items_container(
+                    SharedString::from("sidebar-items-pinned"),
+                    items,
+                ));
             }
         }
         rows.push(
@@ -8532,6 +8778,7 @@ impl AppView {
                         &motion,
                         SharedString::from("sidebar-empty-projects"),
                         div()
+                            .flex_none()
                             .px(px(9.0))
                             .py(px(5.0))
                             .text_size(px(10.5))
@@ -8555,12 +8802,14 @@ impl AppView {
                     .into_any_element(),
                 );
                 if !collapsed {
+                    let mut items: Vec<AnyElement> = Vec::with_capacity(group.len() + 1);
                     if group.is_empty() {
-                        rows.push(
+                        items.push(
                             motion_item(
                                 &motion,
                                 SharedString::from(format!("sidebar-empty-{project_key}")),
                                 div()
+                                    .flex_none()
                                     .px(px(9.0))
                                     .py(px(5.0))
                                     .text_size(px(10.5))
@@ -8575,7 +8824,7 @@ impl AppView {
                         if row_hover {
                             preview_row_pending = false;
                         }
-                        rows.push(motion_session_row(
+                        items.push(motion_session_row(
                             &motion,
                             theme,
                             summary,
@@ -8593,6 +8842,10 @@ impl AppView {
                             cx,
                         ));
                     }
+                    rows.push(sidebar_items_container(
+                        SharedString::from(format!("sidebar-items-{project_key}")),
+                        items,
+                    ));
                 }
             }
         }
@@ -8619,6 +8872,7 @@ impl AppView {
                         &motion,
                         SharedString::from("sidebar-empty-tasks"),
                         div()
+                            .flex_none()
                             .px(px(9.0))
                             .py(px(5.0))
                             .text_size(px(10.5))
@@ -8629,10 +8883,11 @@ impl AppView {
                 );
             } else {
                 let mut preview_task_pending = self.preview_sidebar_hover && projects.is_empty();
+                let mut items = Vec::with_capacity(tasks.len());
                 for (stagger_ix, summary) in tasks.iter().enumerate() {
                     let row_hover = preview_task_pending;
                     preview_task_pending = false;
-                    rows.push(motion_session_row(
+                    items.push(motion_session_row(
                         &motion,
                         theme,
                         summary,
@@ -8650,6 +8905,10 @@ impl AppView {
                         cx,
                     ));
                 }
+                rows.push(sidebar_items_container(
+                    SharedString::from("sidebar-items-tasks"),
+                    items,
+                ));
             }
         }
 
@@ -8873,6 +9132,14 @@ impl AppView {
     }
 
     fn render_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let render_bench_started = Instant::now();
+        struct RenderTimer(Instant);
+        impl Drop for RenderTimer {
+            fn drop(&mut self) {
+                T_RENDER_US.fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+        }
+        let _render_timer = RenderTimer(render_bench_started);
         let theme = self.theme.clone();
         let shared = match self.active_shared() {
             Some(shared) => shared,
@@ -9104,6 +9371,11 @@ impl AppView {
                     ),
             );
 
+        T_HEAD_US.fetch_add(
+            render_bench_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
+        let body_started = Instant::now();
         let body = if show_empty {
             div()
                 .id("chat-empty-scroll")
@@ -9115,6 +9387,7 @@ impl AppView {
         } else {
             let agent_cards = self.agent_cards();
             let chat_entity = cx.entity().downgrade();
+            let prepare_started = Instant::now();
             let mut view = self.chat.prepare_frame(
                 self.active_run.is_some(),
                 true,
@@ -9125,12 +9398,17 @@ impl AppView {
                 &agent_cards,
                 &chat_entity,
             );
+            T_PREPARE_US.fetch_add(
+                prepare_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
             view.jump_flash = self.jump_flash.clone();
             let view = Rc::new(view);
             let state = self.chat.list_state.clone();
             let entity = chat_entity;
             let item_theme = theme.clone();
             let rows = list(state, move |index, _window, _cx| {
+                ROWS_RENDERED.fetch_add(1, Ordering::Relaxed);
                 render_chat_item(index, &view, &item_theme, &entity)
             });
 
@@ -9190,7 +9468,15 @@ impl AppView {
             .child(header)
             .children(update_banner)
             .child(body)
-            .child(self.render_composer(window, cx))
+            .child({
+                T_BODY_US.fetch_add(body_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                {
+                    let t = Instant::now();
+                    let e = self.render_composer(window, cx);
+                    T_COMPOSER_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    e
+                }
+            })
             .into_any_element()
     }
 
@@ -9201,6 +9487,7 @@ impl AppView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        let rail_started = Instant::now();
         let marks = self.chat.prompt_marks();
         let Some(metrics) = self.chat.prompt_rail_metrics() else {
             // The list viewport is measured during layout, so the first frame
@@ -9230,14 +9517,16 @@ impl AppView {
             self.prompt_rail.hover_seq = self.prompt_rail.hover_seq.wrapping_add(1);
         }
         let entity = cx.entity().downgrade();
-        Some(render_prompt_rail_element(
+        let element = render_prompt_rail_element(
             &self.theme,
             &marks,
             &self.prompt_rail,
             &metrics,
             active,
             &entity,
-        ))
+        );
+        T_RAIL_US.fetch_add(rail_started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        Some(element)
     }
 
     /// Hovering a rail row widens its bar immediately; the preview card waits
@@ -11028,6 +11317,7 @@ impl Render for AppView {
             });
         }
 
+        let content_started = Instant::now();
         let content = if self.settings_open {
             self.render_settings(window, cx)
         } else if self.view_mode == ViewMode::Graph {
@@ -11131,8 +11421,17 @@ impl Render for AppView {
                 };
                 this.set_view_mode(next, cx);
             }))
-            .child(self.render_titlebar(window, cx))
             .child({
+                let t = Instant::now();
+                let e = self.render_titlebar(window, cx);
+                T_TITLE_US.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                e
+            })
+            .child({
+                T_CONTENT_US.fetch_add(
+                    content_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 div()
                     .flex()
                     .flex_1()
@@ -11144,7 +11443,13 @@ impl Render for AppView {
                     // it goes in bare so nothing can clip its edges.
                     .when(self.sidebar_p > 0.001, |element| {
                         if self.sidebar_p >= 1.0 {
-                            element.child(self.render_sidebar(window, cx))
+                            element.child({
+                                let t = Instant::now();
+                                let e = self.render_sidebar(window, cx);
+                                T_SIDEBAR_US
+                                    .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                e
+                            })
                         } else {
                             element.child(
                                 div()
@@ -11161,7 +11466,13 @@ impl Render for AppView {
                     .child(div().flex_1().min_w(px(0.0)).h_full().child(content))
                     .when(self.side_p > 0.001, |element| {
                         if self.side_p >= 1.0 {
-                            element.child(self.render_side_pane(window, cx))
+                            element.child({
+                                let t = Instant::now();
+                                let e = self.render_side_pane(window, cx);
+                                T_SIDEPANE_US
+                                    .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                                e
+                            })
                         } else {
                             element.child(
                                 div()
@@ -11323,9 +11634,9 @@ fn permission_mode_hint(mode: PermissionMode) -> Option<&'static str> {
         PermissionMode::AcceptEdits => {
             Some("自动编辑模式：文件编辑已自动批准，shell 等命令仍需确认。")
         }
-        PermissionMode::Plan => {
-            Some("计划模式：编辑、命令与电脑/浏览器的改写类动作会被自动拒绝；只读动作照常放行。请先让 EffiBuddy 输出计划，再切换模式执行。")
-        }
+        PermissionMode::Plan => Some(
+            "计划模式：编辑、命令与电脑/浏览器的改写类动作会被自动拒绝；只读动作照常放行。请先让 EffiBuddy 输出计划，再切换模式执行。",
+        ),
         PermissionMode::FullAccess => {
             Some("完全访问模式：主会话与子代理的工具调用（含电脑操作、浏览器）都不会打断你。")
         }
@@ -11884,6 +12195,27 @@ fn section_chevron_hover_gated(group: &str, collapsed: bool) -> bool {
     group != "pinned" && !collapsed
 }
 
+/// 一段子项（某个项目的会话、置顶会话、任务）的容器。
+///
+/// 这些行以前直接挂在外层滚动列的 flex 布局里。外层列高度固定，一旦内容超过
+/// 一屏，taffy 就按 `flex-shrink: 1` 把每一行压扁（30px 的会话行被挤到 19.5px），
+/// 可滚范围跟着一起塌，旁边的区块也被拖变形。现在把一段子项收进一个
+/// `flex_none` 容器：容器高度恒等于内容高度，是外层 `#session-list` 计算滚动
+/// 范围的最小单位，子项之间仍然保持 `gap_1` 的行距。
+///
+/// 子项自己也要 `flex_none`（[`sidebar_session_row`] 里已加）：万一以后给容器
+/// 补上 `max_h` + `overflow_y_scroll` 让它内部滚动，子项同样不会被反向压扁。
+pub(crate) fn sidebar_items_container(id: SharedString, items: Vec<AnyElement>) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .flex_none()
+        .children(items)
+        .into_any_element()
+}
+
 /// Collapsible section header (`置顶` / `全部项目` / `任务`). `trailing` holds
 /// an optional action such as the projects section's "添加工作区" button.
 ///
@@ -11904,6 +12236,7 @@ fn sidebar_section_header(
         .id(row_group.clone())
         .group(row_group.clone())
         .flex()
+        .flex_none()
         .items_center()
         .gap(px(4.0))
         .h(px(26.0))
@@ -11990,6 +12323,7 @@ fn sidebar_project_header(
         .id(SharedString::from(format!("project-row-{key}")))
         .group(row_group.clone())
         .flex()
+        .flex_none()
         .items_center()
         .gap(px(6.0))
         .h(px(30.0))
@@ -12356,6 +12690,7 @@ fn sidebar_session_row(
         .id(SharedString::from(format!("session-{}", id)))
         .group(row_group.clone())
         .flex()
+        .flex_none()
         .items_center()
         .gap(px(5.0))
         .h(px(30.0))
@@ -13174,6 +13509,27 @@ mod tests {
 /// of the live streaming backlog message.
 const STRESS_TURNS: usize = 8;
 
+/// Rows the transcript list has painted, so `--bench-scroll` can report how
+/// many rows a frame actually builds (the virtualization's answer to "is a
+/// long history costing anything?").
+static ROWS_RENDERED: AtomicU64 = AtomicU64::new(0);
+/// Per-frame microseconds spent inside `prepare_frame` and inside the prompt
+/// rail builder, reported by `--bench-scroll` next to the paint counters.
+static T_PREPARE_US: AtomicU64 = AtomicU64::new(0);
+/// Whole-`render_chat` wall time (element construction only; layout/paint of
+/// the returned tree happens later inside `Window::draw`).
+static T_RENDER_US: AtomicU64 = AtomicU64::new(0);
+/// Split of `render_chat`: header (before the transcript body), body, composer.
+static T_HEAD_US: AtomicU64 = AtomicU64::new(0);
+static T_BODY_US: AtomicU64 = AtomicU64::new(0);
+/// Time spent building the main content area (chat / graph / settings).
+static T_CONTENT_US: AtomicU64 = AtomicU64::new(0);
+static T_TITLE_US: AtomicU64 = AtomicU64::new(0);
+static T_SIDEBAR_US: AtomicU64 = AtomicU64::new(0);
+static T_SIDEPANE_US: AtomicU64 = AtomicU64::new(0);
+static T_COMPOSER_US: AtomicU64 = AtomicU64::new(0);
+static T_RAIL_US: AtomicU64 = AtomicU64::new(0);
+
 /// Deterministic ~6KB markdown body (CJK paragraphs, lists, table, fences) so
 /// stress runs are reproducible and chunk boundaries stay interesting.
 fn stress_markdown_turn(turn: usize) -> String {
@@ -13195,3 +13551,71 @@ fn stress_markdown_turn(turn: usize) -> String {
     out.push_str("| 项目 | 数值 |\n|---|---|\n| 帧预算 | 8.3ms |\n| 缓动时间常数 | 85ms |\n\n");
     out
 }
+
+/// Pixels per frame for `--bench-scroll`. Env override:
+/// `EFFIBUDDY_BENCH_SCROLL_STEP` (default 64, i.e. roughly one wheel notch at
+/// 120 Hz).
+fn bench_scroll_step() -> f32 {
+    std::env::var("EFFIBUDDY_BENCH_SCROLL_STEP")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64.0)
+}
+
+/// How many messages `--bench-scroll` seeds; `EFFIBUDDY_BENCH_SCROLL_MESSAGES`
+/// overrides it (default 10000).
+fn bench_scroll_messages() -> usize {
+    std::env::var("EFFIBUDDY_BENCH_SCROLL_MESSAGES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10_000)
+}
+
+/// Deterministic markdown body for the scroll bench: headings, a list, a code
+/// fence and a table, plus enough paragraphs that a share of them crosses the
+/// chunk-splitting threshold.
+fn bench_markdown_body(turn: usize) -> String {
+    let sections = if turn % 4 == 0 { 4 } else { 1 };
+    let mut out = String::with_capacity(sections * 400);
+    out.push_str(&format!("## 回合 {turn} 的结论\n\n"));
+    for section in 0..sections {
+        out.push_str(
+            "虚拟列表只排版视口附近的行，已定稿的块在帧间复用高度，因此滚动的成本与历史长度基本无关。\n\n",
+        );
+        out.push_str(
+            "- 要点一：打字机每帧调度一次\n- 要点二：平滑滚动按指数缓动追赶目标\n- 要点三：工具卡片仅在展开时序列化 JSON\n\n",
+        );
+        out.push_str(&format!(
+            "```rust\nfn step_{turn}_{section}(state: &mut State) {{\n    state.advance(160);\n    state.glide();\n}}\n```\n\n"
+        ));
+    }
+    out.push_str("| 指标 | 数值 |\n|---|---|\n| 帧预算 | 3.3ms |\n| 缓动常数 | 85ms |\n");
+    out
+}
+
+/// Inputs of `context_usage`'s O(bytes) scan, all O(1) to read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UsageKey {
+    /// Hash of the session id, so switching conversations cannot reuse the
+    /// previous one's numbers.
+    session: u64,
+    revision: u64,
+    messages: usize,
+    tail: u64,
+    cleared: usize,
+    compaction: usize,
+    prompt: u64,
+    completion: u64,
+    last_prompt: u64,
+}
+
+struct UsageCache {
+    key: UsageKey,
+    window: usize,
+    stamp: Instant,
+    usage: ContextUsage,
+}
+
+/// Floor between two ring recomputes while the transcript keeps changing (a
+/// streaming answer would otherwise re-walk it on every delta).
+const USAGE_CACHE_MIN_INTERVAL: Duration = Duration::from_millis(250);

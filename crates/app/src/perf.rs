@@ -159,6 +159,11 @@ fn enabled() -> bool {
 }
 
 fn percentile(sorted: &[f64], fraction: f64) -> f64 {
+    // Empty samples are normal (a run that never rendered, or profiling off):
+    // return 0 rather than underflowing `len - 1`.
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let index = ((sorted.len() as f64 * fraction).ceil() as usize)
         .saturating_sub(1)
         .min(sorted.len() - 1);
@@ -284,6 +289,13 @@ pub fn hud_snapshot() -> Option<HudSnapshot> {
 
 /// One-line benchmark summary for `--bench`; the invokable perf entry point.
 pub fn bench_summary() -> String {
+    // `frame_start`/`frame_end` are no-ops unless `EFFIBUDDY_PERF=1`, so a
+    // bench run started without it has no samples at all. Say so instead of
+    // indexing an empty percentile table (which used to panic the app right
+    // when the run finished).
+    if !enabled() {
+        return "[bench] no samples: rerun with EFFIBUDDY_PERF=1".to_string();
+    }
     let Ok(state) = STATE.lock() else {
         return "[bench] stats unavailable".to_string();
     };
