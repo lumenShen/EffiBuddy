@@ -185,8 +185,9 @@ impl ListItem {
 
     fn focus_handle(&self) -> Option<FocusHandle> {
         match self {
-            ListItem::Unmeasured { focus_handle, .. }
-            | ListItem::Measured { focus_handle, .. } => focus_handle.clone(),
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
+                focus_handle.clone()
+            }
         }
     }
 
@@ -194,17 +195,20 @@ impl ListItem {
     /// measured size when available, otherwise the preserved estimate.
     fn estimated_height(&self) -> Pixels {
         match self {
-            ListItem::Unmeasured { estimated_height, .. } => *estimated_height,
+            ListItem::Unmeasured {
+                estimated_height, ..
+            } => *estimated_height,
             ListItem::Measured { size, .. } => size.height,
         }
     }
 
     fn contains_focused(&self, window: &Window, cx: &App) -> bool {
         match self {
-            ListItem::Unmeasured { focus_handle, .. }
-            | ListItem::Measured { focus_handle, .. } => focus_handle
-                .as_ref()
-                .is_some_and(|handle| handle.contains_focused(window, cx)),
+            ListItem::Unmeasured { focus_handle, .. } | ListItem::Measured { focus_handle, .. } => {
+                focus_handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.contains_focused(window, cx))
+            }
         }
     }
 }
@@ -574,9 +578,58 @@ impl ListState {
         let mut cursor = state.items.cursor::<Count>(());
         let mut rows = Vec::new();
         for (index, item) in cursor.by_ref().enumerate() {
-            rows.push((index, f32::from(item.estimated_height()), item.size().is_some()));
+            rows.push((
+                index,
+                f32::from(item.estimated_height()),
+                item.size().is_some(),
+            ));
         }
         rows
+    }
+
+    /// Mean height of the rows that have actually been measured.
+    ///
+    /// Used by owners that track row heights across rebuilds: a never-measured
+    /// row that is guessed too short or too tall shifts the pixel coordinate
+    /// system every time the user scrolls past it, which moves the scrollbar and
+    /// any pixel-based follow logic even though the row anchor is preserved.
+    pub fn measured_mean_height(&self) -> Option<Pixels> {
+        let state = self.0.borrow();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut total = px(0.);
+        let mut count = 0usize;
+        for item in cursor.by_ref() {
+            if let ListItem::Measured { size, .. } = item {
+                total += size.height;
+                count += 1;
+            }
+        }
+        (count > 0).then(|| total / count as f32)
+    }
+
+    /// Re-seed the estimate of every row that has never been measured, keeping
+    /// the measured heights intact.
+    ///
+    /// One pass over the height tree; call it when the owner learns the real
+    /// mean (a few hundred milliseconds into a session), not per frame.
+    pub fn reseed_unmeasured(&self, height: Pixels) {
+        let state = &mut *self.0.borrow_mut();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut items: Vec<ListItem> = Vec::new();
+        for item in cursor.by_ref() {
+            items.push(match item {
+                ListItem::Measured { size, focus_handle } => ListItem::Measured {
+                    size: *size,
+                    focus_handle: focus_handle.clone(),
+                },
+                ListItem::Unmeasured { focus_handle, .. } => ListItem::Unmeasured {
+                    focus_handle: focus_handle.clone(),
+                    estimated_height: height,
+                },
+            });
+        }
+        drop(cursor);
+        state.items = SumTree::from_iter(items, ());
     }
 
     /// Declare the height to assume for rows that have never been measured.

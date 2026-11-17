@@ -24,9 +24,14 @@ use std::time::Instant;
 use gpui::{App, Canvas, DispatchPhase, ScrollHandle, ScrollWheelEvent, Window, canvas, point, px};
 
 /// Time constant of the smooth-scroll exponential glide. Smaller = snappier.
-pub const SCROLL_GLIDE_TAU: f64 = 0.085;
+pub const SCROLL_GLIDE_TAU: f64 = 0.045;
 /// Glide stops once the remaining distance is under this many pixels.
-pub const SCROLL_GLIDE_CUTOFF: f32 = 0.5;
+pub const SCROLL_GLIDE_CUTOFF: f32 = 1.5;
+/// Below this per-frame speed the remaining distance is snapped instead of
+/// eased. The tail of an exponential is imperceptible as motion but keeps the
+/// transcript crawling for hundreds of milliseconds after the hand stops, which
+/// on a high-refresh display reads as a view that drifts on its own.
+pub const SCROLL_GLIDE_SNAP_VELOCITY: f32 = 0.35;
 /// Pixels per wheel notch/line (same distance the built-in handler used).
 pub const WHEEL_LINE_HEIGHT: f32 = 20.0;
 
@@ -162,11 +167,22 @@ impl ScrollGlide {
         }
 
         let k = 1.0 - (-(dt / SCROLL_GLIDE_TAU)).exp();
-        let next = self.current + (self.target - self.current) * (k as f32);
-        let delta = next - self.current;
+        let mut next = self.current + (self.target - self.current) * (k as f32);
+        let mut delta = next - self.current;
+
+        // Land as soon as the step itself stops being readable, not only when
+        // the remaining distance hits zero: that is what bounds the settle
+        // time (measured at 635ms after the last wheel event at 300Hz).
+        let remaining = self.target - next;
+        let landing =
+            remaining.abs() <= SCROLL_GLIDE_CUTOFF || delta.abs() <= SCROLL_GLIDE_SNAP_VELOCITY;
+        if landing {
+            delta += remaining;
+            next = self.target;
+        }
         self.current = next;
 
-        if (self.target - next).abs() <= SCROLL_GLIDE_CUTOFF {
+        if landing {
             let at_bottom = self.goal_bottom;
             self.active = false;
             self.goal_bottom = false;

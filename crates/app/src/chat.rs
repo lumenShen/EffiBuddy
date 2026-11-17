@@ -525,6 +525,15 @@ pub(crate) struct ChatList {
     /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
     /// an O(1) lookup here instead of a scan through the transcript.
     first_slots: Vec<usize>,
+    /// Height the list currently assumes for rows it has never measured, and
+    /// when it last re-derived that from real measurements (see
+    /// [`Self::calibrate_row_height`]).
+    seeded_row_height: f32,
+    estimate_refreshed_at: Option<Instant>,
+    /// Test hook: the mouse-replay harness runs its own virtual clock, so a
+    /// calibration throttled by real time would fire at an arbitrary point in
+    /// the replay. Calibration has its own test.
+    row_calibration_off: bool,
     /// Inputs of the last virtual-row plan. When the items, the run state and
     /// the expansion sets are unchanged (and no answer is being revealed), the
     /// plan is reused verbatim and a frame costs O(1) instead of O(messages).
@@ -585,6 +594,9 @@ impl ChatList {
             prompt_marks: Rc::new(Vec::new()),
             first_slots: Vec::new(),
             plan_cache: None,
+            seeded_row_height: ESTIMATED_ROW_HEIGHT,
+            estimate_refreshed_at: None,
+            row_calibration_off: false,
             reveal_frame_scheduled: false,
             glide: ScrollGlide::new(),
             glide_frame_scheduled: false,
@@ -1006,6 +1018,8 @@ impl ChatList {
         //
         // A live stream bypasses the cache on purpose: the reveal table grows
         // per frame, so both the row count and the tail row's key change.
+        self.calibrate_row_height();
+
         let plan_unchanged = streaming_id.is_none()
             && self.plan_cache.as_ref().is_some_and(|cache| {
                 Rc::ptr_eq(&cache.items, &self.items)
@@ -1534,6 +1548,58 @@ impl ChatList {
     /// Whether a wheel/target glide is still moving the viewport.
     pub fn glide_is_active(&self) -> bool {
         self.glide.active()
+    }
+
+    /// Re-derive the never-measured row height from the rows that *have* been
+    /// measured.
+    ///
+    /// The first guess ([`ESTIMATED_ROW_HEIGHT`]) is only ever right for the
+    /// kind of row it was tuned on. Every row the user scrolls past that is
+    /// still holding a bad guess shifts the pixel coordinate system by the
+    /// error — measured at up to 422px per frame on a 10k-message session,
+    /// which moves the scrollbar and the pinned/follow logic even though the
+    /// visible anchor is preserved. One pass over the height tree fixes the
+    /// remaining rows; it is throttled because the walk is O(rows).
+    fn calibrate_row_height(&mut self) {
+        const REFRESH: Duration = Duration::from_millis(400);
+        const TOLERANCE: f32 = 12.0;
+        // Only while the viewport is standing still: re-seeding rewrites every
+        // unmeasured height, which moves the pixel coordinate system by tens of
+        // thousands of pixels. The row anchor is preserved, so an idle
+        // transcript does not visibly move — but a glide in flight would keep
+        // chasing a target expressed in the old coordinates.
+        if self.glide.active() || self.row_calibration_off {
+            return;
+        }
+        let now = Instant::now();
+        if let Some(last) = self.estimate_refreshed_at
+            && now.duration_since(last) < REFRESH
+        {
+            return;
+        }
+        self.estimate_refreshed_at = Some(now);
+        let Some(mean) = self.list_state.measured_mean_height() else {
+            return;
+        };
+        let mean = f32::from(mean);
+        if (mean - self.seeded_row_height).abs() < TOLERANCE {
+            return;
+        }
+        if std::env::var_os("EFFIBUDDY_ROW_CALIBRATE_TRACE").is_some() {
+            println!(
+                "[calibrate] 行高估算 {:.1} → {:.1}px（已测量均值）",
+                self.seeded_row_height, mean
+            );
+        }
+        self.seeded_row_height = mean;
+        self.list_state.set_estimated_item_height(px(mean));
+        self.list_state.reseed_unmeasured(px(mean));
+    }
+
+    /// Turn off the real-time row-height calibration (tests that drive their
+    /// own clock).
+    pub fn set_row_calibration_enabled(&mut self, enabled: bool) {
+        self.row_calibration_off = !enabled;
     }
 
     pub fn tick_scroll(&mut self) -> bool {

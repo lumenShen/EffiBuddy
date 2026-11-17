@@ -762,6 +762,9 @@ fn jittered_wheel_input_matches_the_expected_trajectory(cx: &mut gpui::TestAppCo
     sim.rebuild();
     sim.frame(cx);
     sim.frame(cx);
+    // The replay below runs on a virtual clock; a calibration throttled by real
+    // time would land at an arbitrary point of some gesture.
+    sim.chat.set_row_calibration_enabled(false);
 
     let total = sim.chat.list_state.item_count();
     sim.chat.list_state.scroll_to(ListOffset {
