@@ -641,7 +641,10 @@ impl ChatList {
         self.reveal = StreamReveal::default();
         self.reasoning_scrolls = Rc::new(RefCell::new(HashMap::new()));
         self.code_scrolls = Rc::new(RefCell::new(HashMap::new()));
-        self.tool_images = Rc::new(RefCell::new(ImageCacheInner::default()));
+        // Keep the shared handle (the outgoing view snapshot still holds it)
+        // and release its contents, so the decoded pixels can be handed back
+        // to GPUI's asset cache by the next frame.
+        self.tool_images.borrow_mut().release_all();
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
         self.plan_cache = None;
@@ -1208,6 +1211,12 @@ impl ChatList {
         (self.items.len(), self.slots.len())
     }
 
+    /// Rasters the cache dropped since the last call, for the host to unload
+    /// from GPUI's asset cache (see [`ImageCacheInner::dropped`]).
+    pub fn take_dropped_images(&mut self) -> Vec<Arc<Image>> {
+        std::mem::take(&mut self.tool_images.borrow_mut().dropped)
+    }
+
     /// Approximate footprint of this snapshot for the memory diagnostics
     /// panel. O(items + results), only called while the panel is open.
     pub fn memory_stats(&self) -> ChatMemory {
@@ -1522,13 +1531,25 @@ impl ChatList {
 
     /// Advance one glide step. Returns true while the glide still needs
     /// frames; `render_chat` schedules the next frame and notifies.
+    /// Whether a wheel/target glide is still moving the viewport.
+    pub fn glide_is_active(&self) -> bool {
+        self.glide.active()
+    }
+
     pub fn tick_scroll(&mut self) -> bool {
+        self.tick_scroll_at(Instant::now())
+    }
+
+    /// [`Self::tick_scroll`] with an injected clock. The mouse simulation uses
+    /// it to replay a gesture at a fixed frame rate instead of real time (where
+    /// a tight loop has `dt == 0` and the glide never moves).
+    pub fn tick_scroll_at(&mut self, now: Instant) -> bool {
         if !self.glide.active() {
             return false;
         }
         let max = f32::from(self.list_state.max_offset_for_scrollbar().height);
         let real = -f32::from(self.list_state.scroll_px_offset_for_scrollbar().y);
-        match self.glide.tick(real, max) {
+        match self.glide.tick_at(now, real, max) {
             GlideTick::Continue => true,
             GlideTick::Step(delta) => {
                 if delta.abs() > 0.01 {
@@ -5251,6 +5272,11 @@ struct ImageCacheInner {
     clock: u64,
     /// Sum of `pixel_bytes` currently resident.
     bytes: u64,
+    /// Rasters this cache let go of since the last drain. GPUI's asset system
+    /// keeps the decoded copy of every image it has painted and never evicts
+    /// it, so the app hands these back to `ImageSource::remove_asset`, or a
+    /// session with screenshots pays for its pixels until the process exits.
+    dropped: Vec<Arc<Image>>,
 }
 
 /// Decoded raster cache, shared by every frame and released on session switch.
@@ -5268,6 +5294,7 @@ impl ImageCacheInner {
     fn insert(&mut self, key: String, image: Option<Arc<Image>>, pixel_bytes: u64) {
         if let Some(previous) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(previous.pixel_bytes);
+            self.dropped.extend(previous.image);
         }
         self.clock += 1;
         let used = self.clock;
@@ -5297,8 +5324,17 @@ impl ImageCacheInner {
             };
             if let Some(entry) = self.entries.remove(&victim) {
                 self.bytes = self.bytes.saturating_sub(entry.pixel_bytes);
+                self.dropped.extend(entry.image);
             }
         }
+    }
+
+    /// Let go of every decoded raster, queueing them for the asset drain.
+    fn release_all(&mut self) {
+        for (_, entry) in self.entries.drain() {
+            self.dropped.extend(entry.image);
+        }
+        self.bytes = 0;
     }
 }
 
@@ -5615,6 +5651,42 @@ mod tests {
         assert!(
             !cache.entries.contains_key("img1"),
             "LRU victim was not the least recently used entry"
+        );
+    }
+
+    /// Rasters the cache lets go of must reach the host, which is the only
+    /// place that can unload GPUI's decoded copy. Dropping them silently is
+    /// what pinned a pasted screenshot's pixels in the process for good.
+    #[test]
+    fn releasing_the_cache_queues_rasters_for_the_asset_drain() {
+        let mut cache = ImageCacheInner::default();
+        let raster = || {
+            Arc::new(Image::from_bytes(
+                ImageFormat::Png,
+                b"not-a-real-png".to_vec(),
+            ))
+        };
+        cache.insert("a".to_string(), Some(raster()), 4 * 1024 * 1024);
+        cache.insert("b".to_string(), Some(raster()), 4 * 1024 * 1024);
+        assert!(cache.dropped.is_empty(), "nothing dropped yet");
+
+        cache.release_all();
+        assert!(cache.entries.is_empty());
+        assert_eq!(cache.bytes, 0);
+        assert_eq!(cache.dropped.len(), 2, "both rasters queued for the drain");
+
+        // A second release is a no-op and must not re-queue anything.
+        cache.release_all();
+        assert_eq!(cache.dropped.len(), 2);
+
+        // Eviction queues the victim too, so an over-budget cache drains too.
+        let mut cache = ImageCacheInner::default();
+        for index in 0..3 {
+            cache.insert(format!("img{index}"), Some(raster()), 48 * 1024 * 1024);
+        }
+        assert!(
+            !cache.dropped.is_empty(),
+            "an evicted raster was dropped without telling the host"
         );
     }
 

@@ -61,6 +61,11 @@ pub struct PendingSave {
 }
 
 impl PendingSave {
+    /// Conversation this staged write belongs to.
+    pub fn session_id(&self) -> String {
+        self.id.clone()
+    }
+
     /// Write the staged JSON to disk (atomic rename, same as [`SessionStore::save`]).
     ///
     /// Takes `&self` so the caller can write synchronously and then enqueue the

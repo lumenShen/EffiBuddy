@@ -79,6 +79,8 @@ enum ContentBlock {
 
 `SharedSession = Arc<Mutex<SessionState>>`，UI 与 harness 共享同一份内存状态；UI 每次渲染时短暂加锁读取。
 
+内存里有几份 `SharedSession` 是有上限的：正在运行/有子代理在跑的会话必须常驻（后台事件直接写这份状态，不能回读可能落后的磁盘文件），此外只为最近打开的 4 个会话保留 transcript 以便秒切；其余在切走时由 `trim_session_shares` 释放、再次打开时从磁盘重载。释放的前提是该会话的落盘写入已被后台写线程确认（`persist_in_flight`），否则会读到旧文件。粘贴的截图还会在 GPUI 的资源缓存里留一份解码后的位图（它自己不回收），聊天侧释放解码缓存时会一并交给 `ImageSource::remove_asset`。`--bench-pages` 用真实窗口把这套导航（逐个切会话 → 全部设置页 → 图谱 → 回访）跑一遍，每步打印 RSS、堆、常驻 transcript 与图片缓存。
+
 ## 4. Harness 状态机
 
 ```mermaid

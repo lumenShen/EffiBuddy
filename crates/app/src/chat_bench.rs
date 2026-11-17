@@ -27,7 +27,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use effibuddy_agent_core::{ContentBlock, Message, SessionState, ToolCall, ToolResult};
 use effibuddy_ui::Theme;
@@ -211,6 +211,12 @@ struct Sim {
     expanded_turns: HashSet<String>,
     collapsed_turns: HashSet<String>,
     agents: HashMap<String, AgentCard>,
+    /// Offset the glide moved *this* frame (test diagnostics).
+    last_tick_delta: f32,
+    /// How much the total content height changed during the frame, and whether
+    /// the row count changed (test diagnostics).
+    last_max_delta: f32,
+    last_count_delta: i64,
 }
 
 struct FrameCost {
@@ -232,11 +238,28 @@ impl Sim {
             expanded_turns: HashSet::new(),
             collapsed_turns: HashSet::new(),
             agents: HashMap::new(),
+            last_tick_delta: 0.0,
+            last_max_delta: 0.0,
+            last_count_delta: 0,
         }
     }
 
     fn frame(&mut self, cx: &mut gpui::VisualTestContext) -> FrameCost {
-        self.chat.tick_scroll();
+        self.frame_at(cx, Instant::now())
+    }
+
+    /// One frame with an injected clock, so the mouse replay below can advance
+    /// time at a display rate instead of racing real time (where a tight loop
+    /// has `dt == 0` and the glide would never move).
+    fn frame_at(&mut self, cx: &mut gpui::VisualTestContext, now: Instant) -> FrameCost {
+        let before_tick = -f32::from(self.chat.list_state.scroll_px_offset_for_scrollbar().y);
+        let before_max = f32::from(self.chat.list_state.max_offset_for_scrollbar().height);
+        let before_count = self.chat.list_state.item_count();
+        self.chat.tick_scroll_at(now);
+        self.last_tick_delta =
+            -f32::from(self.chat.list_state.scroll_px_offset_for_scrollbar().y) - before_tick;
+        self.last_max_delta =
+            f32::from(self.chat.list_state.max_offset_for_scrollbar().height) - before_max;
         self.chat.tick();
         self.chat.sync_scroll();
 
@@ -603,5 +626,290 @@ fn wheel_notches_accumulate_instead_of_restarting(cx: &mut gpui::TestAppContext)
     assert!(
         travelled > expected * 0.8,
         "滚了 {NOTCHES} 格只移动了 {travelled:.1}px（期望 ≈{expected:.0}px）：滚轮增量被丢掉了"
+    );
+}
+
+// --- 鼠标滚动行为模拟 ------------------------------------------------------
+
+/// Deterministic xorshift, so a failing seed can be replayed exactly.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u32(&mut self) -> u32 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        ((x >> 32) as u32) ^ (x as u32)
+    }
+
+    fn range(&mut self, low: u32, high: u32) -> u32 {
+        low + self.next_u32() % (high - low + 1)
+    }
+
+    fn chance(&mut self, percent: u32) -> bool {
+        self.next_u32() % 100 < percent
+    }
+}
+
+/// One wheel event as the platform would deliver it.
+struct WheelEvent {
+    at_ms: f64,
+    /// GPUI convention: positive scrolls toward the start.
+    pixel_y: f32,
+}
+
+/// A gesture: a burst of notches followed by a pause, the way a hand on a wheel
+/// actually produces them — irregular gaps, occasional double-size Delts.
+fn wheel_gesture(rng: &mut Rng, start_ms: f64, toward_start: bool) -> Vec<WheelEvent> {
+    let notches = rng.range(1, 12);
+    // Fast flicks arrive every few ms, slow drags every ~60ms.
+    let (gap_low, gap_high) = if rng.chance(60) { (2, 18) } else { (30, 90) };
+    let mut at = start_ms;
+    let mut events = Vec::with_capacity(notches as usize);
+    for _ in 0..notches {
+        // Magnitude jitter too: some platforms send two lines per detent.
+        let magnitude = 20.0 * if rng.chance(20) { 2.0 } else { 1.0 };
+        events.push(WheelEvent {
+            at_ms: at,
+            pixel_y: if toward_start { magnitude } else { -magnitude },
+        });
+        at += rng.range(gap_low, gap_high) as f64;
+    }
+    events
+}
+
+/// What a gesture is supposed to do, and how the transcript actually behaved.
+#[derive(Debug, Default)]
+struct GestureReport {
+    expected_px: f32,
+    travelled_px: f32,
+    /// Frames where the offset moved *against* the gesture.
+    backward_jumps: usize,
+    worst_backward_px: f32,
+    /// Largest single-frame move; a teleport shows up here.
+    peak_frame_px: f32,
+    /// Frames between the first wheel event and the first pixel of motion.
+    latency_frames: usize,
+    /// Milliseconds from the last wheel event until the offset stops moving.
+    settle_ms: f64,
+    /// How much of the requested distance had been delivered when the hand
+    /// stopped. Low values read as "laggy/blocked".
+    delivered_at_gesture_end: f32,
+}
+
+impl GestureReport {
+    fn capture_ratio(&self) -> f32 {
+        if self.expected_px.abs() < 1.0 {
+            1.0
+        } else {
+            self.travelled_px / self.expected_px
+        }
+    }
+}
+
+/// Replay a jittered mouse-wheel gesture against the real `ChatList` and
+/// compare the resulting trajectory with the behaviour the user expects:
+/// every notch counts, motion follows the hand, nothing moves backwards, and
+/// the view settles promptly.
+///
+/// This is the regression that keeps coming back: the glide used to reset its
+/// target whenever the read-back offset disagreed with its internal belief, so
+/// a fast flick delivered one notch's distance and felt "stuck". Timing jitter
+/// matters because back-to-back events land inside a single frame at 300 Hz —
+/// exactly the case where an accumulator that re-bases from the current frame
+/// offset loses everything.
+/// 可见滚动进度：行锚点 (行号 × 平均行高 + 行内偏移)。
+///
+/// 不能用像素偏移衡量「用户看到的位移」—— 列表锚定的是行，行以上被测量后像素
+/// 坐标系会整体平移，而可见内容并没有动。
+fn anchor_progress(chat: &ChatList, mean: f32) -> f32 {
+    let top = chat.list_state.logical_scroll_top();
+    top.item_ix as f32 * mean + f32::from(top.offset_in_item)
+}
+
+/// Average height of the rows the list has measured so far. Captured once and
+/// reused as a fixed scale factor: recomputing it per frame would make the
+/// anchor metric itself wobble.
+fn measured_mean_row_height(chat: &ChatList) -> f32 {
+    let mut measured = 0.0f32;
+    let mut count = 0.0f32;
+    for (_, height, is_measured) in chat.list_state.debug_rows() {
+        if is_measured {
+            measured += height;
+            count += 1.0;
+        }
+    }
+    if count > 0.0 { measured / count } else { 96.0 }
+}
+
+/// Replay jittered mouse-wheel gestures against the real `ChatList` and compare
+/// the resulting *visible* trajectory with what a user expects: every notch
+/// counts, motion starts immediately, follows the hand, never reverses, and
+/// settles promptly.
+///
+/// Jitter matters: back-to-back notches land inside a single frame at 300 Hz,
+/// which is exactly the case where a glide that re-bases its target from the
+/// current frame offset silently drops the accumulated intent ("使劲滚却滚不动").
+#[gpui::test]
+fn jittered_wheel_input_matches_the_expected_trajectory(cx: &mut gpui::TestAppContext) {
+    const FRAME_MS: f64 = 1000.0 / 300.0;
+    const SETTLE_LIMIT_MS: f64 = 1500.0;
+    let cx = cx.add_empty_window();
+
+    let mut sim = Sim::new(4000);
+    sim.rebuild();
+    sim.frame(cx);
+    sim.frame(cx);
+
+    let total = sim.chat.list_state.item_count();
+    sim.chat.list_state.scroll_to(ListOffset {
+        item_ix: total / 2,
+        offset_in_item: px(0.0),
+    });
+    sim.chat.mark_scrolled();
+    sim.frame(cx);
+
+    let mut worst_capture: f32 = 1.0;
+    let mut worst_backward_px: f32 = 0.0;
+    let mut worst_latency = 0usize;
+    let mut worst_settle: f64 = 0.0;
+    let mut worst_delivered: f32 = 1.0;
+    let mut worst_offset_shift: f32 = 0.0;
+    let mut seeds = 0usize;
+
+    for seed in 1..=24u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let toward_start = seed % 2 == 0;
+        let events = wheel_gesture(&mut rng, 0.0, toward_start);
+        let gesture_end_ms = events.last().expect("non-empty gesture").at_ms;
+
+        let max = f32::from(sim.chat.list_state.max_offset_for_scrollbar().height);
+        let input: f32 = events.iter().map(|event| event.pixel_y).sum();
+        // 期望：手势总距离，按方向取正。
+        let expected_px = input.abs().min(max);
+
+        let mean_row = measured_mean_row_height(&sim.chat);
+        let start_anchor = anchor_progress(&sim.chat, mean_row);
+        let mut previous_anchor = start_anchor;
+        let mut next_event = 0usize;
+        let mut now_ms = 0.0f64;
+        let mut first_motion_ms: Option<f64> = None;
+        let mut last_motion_ms = 0.0f64;
+        let mut delivered_at_end: Option<f32> = None;
+        let mut worst_backward_here = 0.0f32;
+        let mut offset_shift_px = 0.0f32;
+        let mut applied_total = 0.0f32;
+        let mut frames = 0usize;
+
+        loop {
+            while next_event < events.len() && events[next_event].at_ms <= now_ms {
+                sim.chat.wheel(events[next_event].pixel_y);
+                next_event += 1;
+            }
+            let base = Instant::now();
+            sim.frame_at(cx, base + Duration::from_micros((now_ms * 1000.0) as u64));
+
+            let anchor = anchor_progress(&sim.chat, mean_row);
+            // 手势方向为正的「内容位移」由 glide 自己施加的像素决定；像素偏移
+            // 还会因为上方行被测量而整体平移，那个平移不是用户看到的移动。
+            let applied = if toward_start {
+                -sim.last_tick_delta
+            } else {
+                sim.last_tick_delta
+            };
+            applied_total += sim.last_tick_delta;
+            if applied.abs() > 0.01 {
+                if first_motion_ms.is_none() {
+                    first_motion_ms = Some(now_ms);
+                }
+                last_motion_ms = now_ms;
+                if applied < -1.0 {
+                    worst_backward_here = worst_backward_here.max(-applied);
+                }
+            }
+            // 诊断：像素坐标系里的反向平移（行被测量导致，不代表可见位移）。
+            let raw = previous_anchor - anchor;
+            let signed = if toward_start { raw } else { -raw };
+            if signed < -1.0 {
+                offset_shift_px = offset_shift_px.max(-signed);
+            }
+            previous_anchor = anchor;
+            frames += 1;
+
+            if delivered_at_end.is_none()
+                && next_event == events.len()
+                && now_ms >= gesture_end_ms + 100.0
+            {
+                delivered_at_end = Some(if expected_px < 1.0 {
+                    1.0
+                } else {
+                    applied_total.abs() / expected_px
+                });
+            }
+
+            let settled = !sim.chat.glide_is_active() && next_event == events.len();
+            if settled {
+                break;
+            }
+            now_ms += FRAME_MS;
+            assert!(
+                now_ms < SETTLE_LIMIT_MS + gesture_end_ms,
+                "seed {seed}: 缓动一直没停（{frames} 帧）"
+            );
+        }
+
+        let travelled = applied_total.abs();
+        let capture = if expected_px < 1.0 {
+            1.0
+        } else {
+            travelled / expected_px
+        };
+        let latency_frames = match first_motion_ms {
+            Some(first) => ((first - events[0].at_ms).max(0.0) / FRAME_MS).round() as usize,
+            None => frames,
+        };
+        let settle_ms = (last_motion_ms - gesture_end_ms).max(0.0);
+        let delivered = delivered_at_end.unwrap_or(1.0);
+
+        assert!(
+            capture > 0.90,
+            "seed {seed}: 意图丢失 —— 期望 {expected_px:.0}px，可见位移 {travelled:.0}px（{:.0}%）",
+            capture * 100.0
+        );
+        assert!(
+            worst_backward_here < 4.0,
+            "seed {seed}: 可见内容反向跳动 {:.1}px",
+            worst_backward_here
+        );
+        assert!(
+            latency_frames <= 3,
+            "seed {seed}: 首个事件后 {latency_frames} 帧才有位移"
+        );
+        assert!(
+            delivered > 0.60,
+            "seed {seed}: 手势结束时只交付 {:.0}%",
+            delivered * 100.0
+        );
+
+        worst_capture = worst_capture.min(capture);
+        worst_backward_px = worst_backward_px.max(worst_backward_here);
+        worst_offset_shift = worst_offset_shift.max(offset_shift_px);
+        worst_latency = worst_latency.max(latency_frames);
+        worst_settle = worst_settle.max(settle_ms);
+        worst_delivered = worst_delivered.min(delivered);
+        seeds += 1;
+    }
+
+    println!(
+        "[mouse] {seeds} 组带 jitter 的手势（300Hz，1–12 格，2–90ms 间隔）最坏情况：\
+         意图捕获 {:.1}% / glide 反向 {:.1}px / 首帧延迟 {worst_latency} 帧 / \
+         手势末已交付 {:.0}% / 停稳 {:.0}ms / 像素坐标平移(行测量) {:.0}px",
+        worst_capture * 100.0,
+        worst_backward_px,
+        worst_delivered * 100.0,
+        worst_settle,
+        worst_offset_shift,
     );
 }

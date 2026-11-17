@@ -33,7 +33,7 @@ use gpui::{
     list, point, prelude::*, px, size, svg, transparent_black,
 };
 use serde_json::json;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::chat::{
     AgentCard, ChatList, JumpFlash, PromptRailState, RunSnapshot, agent_color, render_chat_item,
@@ -470,8 +470,10 @@ pub struct AppView {
     pub(crate) background_runs: HashMap<String, ActiveRun>,
     /// Per-conversation queue/approval/subagent UI parked by switching.
     pub(crate) background_sessions: HashMap<String, SessionUiState>,
-    /// Live shared sessions of conversations with a run or running children.
-    /// Background events write through these instead of reloading the disk
+    /// Live shared sessions of conversations with a run or running children,
+    /// plus a few recently opened ones so switching back is instant. Anything
+    /// else is evicted by [`Self::trim_session_shares`] and reloaded from disk;
+    /// background events write through these instead of reloading the disk
     /// transcript (a throttled save may still be behind).
     pub(crate) session_shares: HashMap<String, SharedSession>,
     pub(crate) pending_approvals: Vec<PendingApproval>,
@@ -528,6 +530,8 @@ pub struct AppView {
     agent_ticker_active: bool,
     /// Staged session saves, drained one at a time off the UI thread.
     persist_tx: UnboundedSender<PendingSave>,
+    /// The persist worker reports every finished write back through this.
+    persist_done_tx: UnboundedSender<String>,
     /// Wall clock of the last completed persist staging per session; enforces
     /// the minimum interval between background serializations of a
     /// (potentially huge) transcript.
@@ -535,6 +539,17 @@ pub struct AppView {
     /// Throttled sessions waiting for the trailing flush. Keyed by session id
     /// so a switch during the wait cannot persist the wrong conversation.
     pending_persists: HashMap<String, SharedSession>,
+    /// Staged saves the writer has not finished yet, counted per session. A
+    /// share with a write in flight is still the newest copy of that
+    /// transcript, so eviction waits for the acknowledgement — otherwise a
+    /// later open would load the stale file.
+    persist_in_flight: HashMap<String, usize>,
+    /// Acknowledgements from the persist worker, drained on the persist path.
+    persist_done_rx: UnboundedReceiver<String>,
+    /// Open order of the retained transcripts; eviction takes the smallest
+    /// stamp first, so the conversations the user just left stay instant.
+    share_stamp: HashMap<String, u64>,
+    share_stamp_seq: u64,
     /// Set while a trailing persist flush is scheduled after a throttled one.
     persist_flush_scheduled: bool,
     /// Set while a debounced `drafts.json` write is pending. Draft writes are
@@ -703,6 +718,7 @@ impl AppView {
         let summaries = store.summaries();
         let drafts = DraftStore::new();
         let (persist_tx, mut persist_rx) = unbounded_channel::<PendingSave>();
+        let (persist_done_tx, persist_done_rx) = unbounded_channel::<String>();
         let preview_launch = std::env::args().any(|argument| {
             argument == "--preview"
                 || argument == "--preview-stress"
@@ -1149,8 +1165,13 @@ impl AppView {
             queue_held: false,
             agent_ticker_active: false,
             persist_tx,
+            persist_done_tx: persist_done_tx.clone(),
             last_persist: HashMap::new(),
             pending_persists: HashMap::new(),
+            persist_in_flight: HashMap::new(),
+            persist_done_rx,
+            share_stamp: HashMap::new(),
+            share_stamp_seq: 0,
             persist_flush_scheduled: false,
             draft_save_scheduled: false,
             bench_until: None,
@@ -1238,10 +1259,12 @@ impl AppView {
         // worker writes staged saves one at a time in send order.
         cx.spawn(async move |_weak, cx| {
             while let Some(save) = persist_rx.recv().await {
+                let id = save.session_id();
                 let _ = cx
                     .background_executor()
                     .spawn(async move { save.write() })
                     .await;
+                let _ = persist_done_tx.send(id);
             }
         })
         .detach();
@@ -1274,6 +1297,9 @@ impl AppView {
             view.seed_preview(cx);
             view.seed_scroll_bench_transcript(bench_scroll_messages(), cx);
             view.start_scroll_bench(seconds, cx);
+        }
+        if std::env::args().any(|argument| argument == "--bench-pages") {
+            view.start_nav_bench(cx);
         }
         if std::env::args().any(|argument| argument == "--preview-stress") {
             view.seed_preview(cx);
@@ -2065,6 +2091,7 @@ impl AppView {
         if let Some(id) = self.active_id() {
             self.background_sessions.remove(&id);
             self.session_shares.remove(&id);
+            self.share_stamp.remove(&id);
             if let Some(run) = self.background_runs.remove(&id) {
                 run.handle.interrupt();
                 run.approval.deny_all();
@@ -2092,6 +2119,7 @@ impl AppView {
     fn forget_session_runtime(&mut self, id: &str) {
         self.background_sessions.remove(id);
         self.session_shares.remove(id);
+        self.share_stamp.remove(id);
         // The `state` scratchpad lives in process memory; a deleted
         // conversation must not leave its entries behind.
         effibuddy_agent_tools::forget_session_state(id);
@@ -2409,6 +2437,9 @@ impl AppView {
         if self.stress.is_some() {
             return;
         }
+        // Persisting is the app's steady heartbeat, so the worker's
+        // acknowledgements are drained here instead of on a timer.
+        self.drain_persist_done();
         let now = Instant::now();
         if let Some(last) = self.last_persist.get(session_id)
             && now.duration_since(*last) < Self::PERSIST_MIN_INTERVAL
@@ -2430,16 +2461,90 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         self.last_persist.insert(session_id.to_string(), now);
+        // Count the write as in flight until the worker acknowledges it: the
+        // in-memory transcript must not be evicted while the file is behind.
+        *self
+            .persist_in_flight
+            .entry(session_id.to_string())
+            .or_default() += 1;
         let store = self.store.clone();
         let persist_tx = self.persist_tx.clone();
+        let persist_done_tx = self.persist_done_tx.clone();
+        let id = session_id.to_string();
         cx.background_executor()
             .spawn(async move {
                 let snapshot = lock_session(&shared).clone();
-                if let Ok(save) = store.stage(&snapshot) {
-                    let _ = persist_tx.send(save);
+                match store.stage(&snapshot) {
+                    Ok(save) => {
+                        let _ = persist_tx.send(save);
+                    }
+                    // Nothing queued, so the write is already "done".
+                    Err(_) => {
+                        let _ = persist_done_tx.send(id);
+                    }
                 }
             })
             .detach();
+    }
+
+    /// Apply the persist worker's acknowledgements. A session leaves
+    /// `persist_in_flight` once its last staged write has hit the disk, which
+    /// is the moment its in-memory share becomes droppable.
+    fn drain_persist_done(&mut self) {
+        while let Ok(id) = self.persist_done_rx.try_recv() {
+            let Some(count) = self.persist_in_flight.get_mut(&id) else {
+                continue;
+            };
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.persist_in_flight.remove(&id);
+            }
+        }
+    }
+
+    /// Mark a conversation as just opened, for [`Self::trim_session_shares`].
+    fn touch_share_stamp(&mut self, id: &str) {
+        self.share_stamp_seq += 1;
+        self.share_stamp.insert(id.to_string(), self.share_stamp_seq);
+    }
+
+    /// Drop the oldest idle transcripts so browsing many conversations cannot
+    /// pin all of them in memory.
+    ///
+    /// Every switch used to park the outgoing transcript in `session_shares`
+    /// and nothing ever removed it, so opening N conversations held N full
+    /// transcripts (the sidebar's 13 live conversations here cost ~270MB of
+    /// RSS). Anything with a live run, running children, a queued or in-flight
+    /// save — i.e. anything whose file is not current yet — is kept.
+    fn trim_session_shares(&mut self) {
+        /// Idle transcripts kept for instant switch-back.
+        const IDLE_SHARE_LIMIT: usize = 4;
+        self.drain_persist_done();
+        let active = self.active_id();
+        let mut idle: Vec<(u64, String)> = Vec::new();
+        for id in self.session_shares.keys() {
+            if Some(id.as_str()) == active.as_deref()
+                || self.background_runs.contains_key(id)
+                || self.pending_persists.contains_key(id)
+                || self.persist_in_flight.contains_key(id)
+                || self
+                    .subagent_services
+                    .iter()
+                    .any(|service| service.parent_session_id() == id)
+            {
+                continue;
+            }
+            idle.push((self.share_stamp.get(id).copied().unwrap_or(0), id.clone()));
+        }
+        if idle.len() <= IDLE_SHARE_LIMIT {
+            return;
+        }
+        idle.sort();
+        let excess = idle.len() - IDLE_SHARE_LIMIT;
+        for (_, id) in idle.into_iter().take(excess) {
+            self.session_shares.remove(&id);
+            self.share_stamp.remove(&id);
+        }
     }
 
     /// One trailing flush covers every parked session; a session that is still
@@ -6046,6 +6151,8 @@ impl AppView {
             .update(cx, |state, _| state.set_content_silent(String::new()));
         self.refresh_sessions(cx);
         self.composer_focus_handle(cx).focus(window);
+        self.touch_share_stamp(&id);
+        self.trim_session_shares();
         cx.notify();
     }
 
@@ -6245,7 +6352,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn select_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn select_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_id().as_deref() == Some(id) {
             // Clicking the active row still counts as reading it.
             self.mark_session_read(id, cx);
@@ -6327,6 +6434,8 @@ impl AppView {
         self.remember_active_draft(cx);
         self.mark_session_read(id, cx);
         self.composer_focus_handle(cx).focus(window);
+        self.touch_share_stamp(id);
+        self.trim_session_shares();
         cx.notify();
     }
 
@@ -6372,6 +6481,14 @@ impl AppView {
         // whole session twice on the UI thread.
         let save = self.store.stage(&snapshot)?;
         save.write()?;
+        // The file is current now, but the queued copy still has to be
+        // acknowledged before the in-memory share may be evicted (acks and
+        // increments must stay paired, or an unrelated ack could retire a
+        // write that has not landed).
+        *self
+            .persist_in_flight
+            .entry(snapshot.id.clone())
+            .or_default() += 1;
         let _ = self.persist_tx.send(save);
         Ok(())
     }
@@ -11286,6 +11403,13 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // EFFIBUDDY_PERF=1 measures the element-tree build cost per frame.
         let perf_frame = perf::frame_start();
+
+        crate::nav_bench::note_frame();
+        // Rasters the chat let go of (session switch, cache eviction) still
+        // sit decoded in GPUI's asset cache; unload them there too.
+        for image in self.chat.take_dropped_images() {
+            gpui::ImageSource::Image(image).remove_asset(cx);
+        }
 
         let theme = self.theme.clone();
 

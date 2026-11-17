@@ -126,7 +126,9 @@ impl ScrollGlide {
         self.tick_at(Instant::now(), offset, max)
     }
 
-    fn tick_at(&mut self, now: Instant, offset: f32, max: f32) -> GlideTick {
+    /// Same as `tick` but with an injected clock, so tests can replay a mouse
+    /// gesture deterministically instead of racing real time.
+    pub fn tick_at(&mut self, now: Instant, offset: f32, max: f32) -> GlideTick {
         if !self.active {
             return GlideTick::Cancelled;
         }

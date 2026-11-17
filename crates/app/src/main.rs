@@ -31,6 +31,7 @@ mod graph;
 mod memory;
 mod model_config;
 mod model_picker;
+mod nav_bench;
 mod perf;
 mod project_store;
 mod session_export;
