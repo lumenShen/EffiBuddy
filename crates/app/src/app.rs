@@ -5687,6 +5687,18 @@ impl AppView {
             per_frame(&T_HEAD_US),
             per_frame(&T_BODY_US),
         );
+        let memory = self.chat.memory_stats();
+        let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+        eprintln!(
+            "[bench-scroll] 内存：RSS {:.0}MB / items {} / 保留文本 {:.1}MB / 工具结果 {} 项 {:.1}MB / 图片缓存 {} 项 {:.1}MB",
+            process_rss_mib(),
+            memory.items,
+            mib(memory.text_bytes),
+            memory.tool_results,
+            mib(memory.tool_result_bytes),
+            memory.image_cache_entries,
+            mib(memory.image_cache_bytes),
+        );
         eprintln!(
             "[bench-scroll] 每帧：主内容区 {:.2}ms / 标题栏 {:.2}ms / 侧栏 {:.2}ms / 右侧栏 {:.2}ms / 输入框 {:.2}ms",
             per_frame(&T_CONTENT_US),
@@ -13619,3 +13631,27 @@ struct UsageCache {
 /// Floor between two ring recomputes while the transcript keeps changing (a
 /// streaming answer would otherwise re-walk it on every delta).
 const USAGE_CACHE_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Resident set size of this process in MiB, read straight from `/proc`.
+///
+/// The chat list keeps several derived copies of the transcript (the item's
+/// own `Message` clone plus the flattened text/reasoning), so "how much does a
+/// long session cost" is only answerable with a real number next to the
+/// composed one.
+fn process_rss_mib() -> f64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            let kb: f64 = rest
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse()
+                .unwrap_or(0.0);
+            return kb / 1024.0;
+        }
+    }
+    0.0
+}
