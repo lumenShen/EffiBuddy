@@ -9,8 +9,8 @@
 
 use std::collections::HashSet;
 
+use effibuddy_agent_core::SessionState;
 use effibuddy_agent_core::context::{estimate_message_tokens_with_cleared, estimate_tokens};
-use effibuddy_agent_core::{SessionState, SharedSession, lock_session};
 use effibuddy_ui::Theme;
 use gpui::{AnyElement, AnyView, App, Context, IntoElement, Render, Window, div, prelude::*, px};
 
@@ -102,12 +102,6 @@ impl ContextUsage {
     pub(crate) fn total_all(&self) -> u64 {
         self.total + self.subagents.total_tokens
     }
-}
-
-/// 锁定会话收集一次用量快照。
-pub(crate) fn collect(shared: &SharedSession, context_window: usize) -> ContextUsage {
-    let session = lock_session(shared);
-    collect_from_session(&session, context_window)
 }
 
 /// 已持有会话锁时的快照构建。概览页在同一把锁里读取计划与用量，避免

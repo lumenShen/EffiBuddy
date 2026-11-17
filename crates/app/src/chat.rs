@@ -160,7 +160,7 @@ pub(crate) struct ChatViewState {
     pub markdown: MarkdownInteraction,
     /// Lazily decoded tool-result rasters, keyed `call_id:index` (shared with
     /// the chat list so session switches drop the memory).
-    pub tool_images: Rc<RefCell<HashMap<String, Option<Arc<Image>>>>>,
+    pub tool_images: ImageCache,
     /// Set by the rail after a jump: the target user bubble paints a one-shot
     /// accent border so the destination is obvious in a long transcript.
     pub jump_flash: Option<JumpFlash>,
@@ -392,8 +392,42 @@ pub(crate) struct ChatMemory {
     pub image_cache_bytes: u64,
 }
 
+/// Bytes retained by a [`MessageSource`]: the id, the timestamp and the tool
+/// calls. Kept next to the type so the memory report stays honest when the
+/// representation changes.
+fn source_bytes(source: &MessageSource) -> u64 {
+    let calls: usize = source
+        .tool_calls
+        .iter()
+        .map(|call| call.name.len() + call.arguments.to_string().len())
+        .sum();
+    source.id.len() as u64 + calls as u64
+}
+
+/// The parts of the source [`Message`] the render path still reads.
+///
+/// The item used to hold a full `Message` clone *and* the flattened
+/// `text`/`reasoning`, so every assistant body was resident twice (measured at
+/// ~3 MB for a 10k-message session, on top of the session's own copy). The
+/// blocks are never read again once `text`, `chunks` and `text_key` are
+/// derived; only identity, the two flags, the timestamp and the tool calls
+/// survive, and tool calls are small compared to a body.
+pub(crate) struct MessageSource {
+    /// Kept as `String` (not `SharedString`) so the many `contains(&id)` /
+    /// `== id` sites keep working unchanged.
+    pub id: String,
+    /// See [`Message::revision`]: the fingerprint a rebuild compares instead of
+    /// re-hashing the body.
+    pub revision: u64,
+    pub interrupted: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Tool calls in source order; the row renders one card (or one group) per
+    /// run of them.
+    pub tool_calls: Rc<[ToolCall]>,
+}
+
 pub(crate) struct AssistantItem {
-    pub message: Message,
+    pub message: MessageSource,
     pub reasoning_duration: Option<Duration>,
     /// Pre-computed at rebuild time so the per-frame render path neither
     /// joins the text blocks nor hashes/counts them again. `text_key` feeds
@@ -485,7 +519,7 @@ pub(crate) struct ChatList {
     /// image sources resolve against it.
     workspace: PathBuf,
     /// Decoded tool-result images, created lazily at render time.
-    tool_images: Rc<RefCell<HashMap<String, Option<Arc<Image>>>>>,
+    tool_images: ImageCache,
     /// One mark per user query for the left-edge rail, in transcript order.
     prompt_marks: Rc<Vec<PromptMark>>,
     /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
@@ -547,7 +581,7 @@ impl ChatList {
             reasoning_scrolls: Rc::new(RefCell::new(HashMap::new())),
             code_scrolls: Rc::new(RefCell::new(HashMap::new())),
             workspace: PathBuf::new(),
-            tool_images: Rc::new(RefCell::new(HashMap::new())),
+            tool_images: Rc::new(RefCell::new(ImageCacheInner::default())),
             prompt_marks: Rc::new(Vec::new()),
             first_slots: Vec::new(),
             plan_cache: None,
@@ -607,7 +641,7 @@ impl ChatList {
         self.reveal = StreamReveal::default();
         self.reasoning_scrolls = Rc::new(RefCell::new(HashMap::new()));
         self.code_scrolls = Rc::new(RefCell::new(HashMap::new()));
-        self.tool_images = Rc::new(RefCell::new(HashMap::new()));
+        self.tool_images = Rc::new(RefCell::new(ImageCacheInner::default()));
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
         self.plan_cache = None;
@@ -1197,17 +1231,17 @@ impl ChatList {
                     }
                 }
                 ChatItemKind::Assistant(assistant) => {
-                    // The item owns a cloned `Message` plus flattened
-                    // text/reasoning SharedStrings derived from it.
-                    stats.text_bytes += crate::memory::message_bytes(&assistant.message);
+                    // Only the flattened text/reasoning are retained now; the
+                    // source message stays in the session and is not cloned.
                     stats.text_bytes +=
                         assistant.text.len() as u64 + assistant.reasoning.len() as u64;
+                    stats.text_bytes += source_bytes(&assistant.message);
                 }
                 ChatItemKind::Turn(turn) => {
                     for member in &turn.members {
-                        stats.text_bytes += crate::memory::message_bytes(&member.message);
                         stats.text_bytes +=
                             member.text.len() as u64 + member.reasoning.len() as u64;
+                        stats.text_bytes += source_bytes(&member.message);
                     }
                 }
                 ChatItemKind::System { text }
@@ -1231,10 +1265,12 @@ impl ChatList {
                     .map(|image| image.data.len() as u64)
                     .sum::<u64>();
         }
-        for image in self.tool_images.borrow().values().flatten() {
-            stats.image_cache_entries += 1;
-            stats.image_cache_bytes += image.bytes.len() as u64;
-        }
+        // Report the decompressed footprint, not the compressed payload: the
+        // compressed size is off by an order of magnitude for screenshots and
+        // made this field useless for judging the cache.
+        let images = self.tool_images.borrow();
+        stats.image_cache_entries = images.entries.len();
+        stats.image_cache_bytes = images.bytes;
         stats
     }
 
@@ -1863,8 +1899,23 @@ fn build_assistant_item(message: &Message, reasoning_duration: Option<Duration>)
     let text = message.text();
     let reasoning = message.reasoning();
     let chunks = ChatList::split_chunks(&text);
+    let tool_calls: Rc<[ToolCall]> = message
+        .blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::ToolCall { call } => Some(call.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .into();
     AssistantItem {
-        message: message.clone(),
+        message: MessageSource {
+            id: message.id.clone(),
+            revision: message.revision,
+            interrupted: message.interrupted,
+            created_at: message.created_at,
+            tool_calls,
+        },
         reasoning_duration,
         text_key: markdown_source_key(&text),
         text: text.into(),
@@ -3076,7 +3127,7 @@ fn item_presentation(
             flags.extend(
                 assistant
                     .message
-                    .tool_calls()
+                    .tool_calls
                     .iter()
                     .map(|call| expanded_tools.contains(&call.id)),
             );
@@ -3212,10 +3263,11 @@ fn render_turn_header(
 ) -> AnyElement {
     let live = view.running && turn_is_live(turn, view);
     let unresolved = turn.members.iter().any(|member| {
-        member.message.blocks.iter().any(|block| match block {
-            ContentBlock::ToolCall { call } => !view.results.contains_key(&call.id),
-            _ => false,
-        })
+        member
+            .message
+            .tool_calls
+            .iter()
+            .any(|call| !view.results.contains_key(&call.id))
     });
 
     let mut label = if live {
@@ -3634,14 +3686,7 @@ fn append_tool_rows(
     reveal: Option<(TurnReveal, usize)>,
 ) -> Div {
     let message = &assistant.message;
-    let calls: Vec<&ToolCall> = message
-        .blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::ToolCall { call } => Some(call),
-            _ => None,
-        })
-        .collect();
+    let calls: Vec<&ToolCall> = message.tool_calls.iter().collect();
     let mut rows: Vec<AnyElement> = Vec::new();
     let mut cursor = 0;
     while cursor < calls.len() {
@@ -5174,18 +5219,175 @@ fn tool_detail(call: &ToolCall) -> String {
     truncate_text(&detail, 140)
 }
 
-/// Decoded rasters are big (RGBA, not the compressed payload); keep only a
-/// short window of recent ones. Revisiting an evicted image decodes it again.
-const MAX_DECODED_IMAGES: usize = 16;
+/// A decoded raster the transcript may still paint.
+///
+/// `Image` only carries the *compressed* payload, so the number that matters
+/// (the RGBA sprite the renderer uploads) has to come from the header. A 1080p
+/// screenshot is ~8 MB decoded, and the cache used to be capped at 16
+/// *entries* — i.e. it could pin ~128 MB of anonymous heap for pictures nobody
+/// was looking at, with a FIFO eviction that had no idea how big anything was.
+struct DecodedImage {
+    image: Option<Arc<Image>>,
+    /// Estimated decompressed footprint: width × height × 4.
+    pixel_bytes: u64,
+    /// Last use, for LRU eviction.
+    used: u64,
+}
 
-fn cache_decoded_image(view: &ChatViewState, key: String, image: Option<Arc<Image>>) {
-    let mut cache = view.tool_images.borrow_mut();
-    if cache.len() >= MAX_DECODED_IMAGES && !cache.contains_key(&key) {
-        if let Some(victim) = cache.keys().next().cloned() {
-            cache.remove(&victim);
+/// Budget for decoded rasters. Chosen so a couple of full-screen screenshots
+/// plus a few thumbnails stay resident, but a long computer-use run cannot
+/// accumulate dozens of them.
+const MAX_DECODED_IMAGE_BYTES: u64 = 48 * 1024 * 1024;
+/// Entry cap for the degenerate case of many tiny images.
+const MAX_DECODED_IMAGES: usize = 24;
+/// Assumed footprint when the header is unrecognized, so an unknown format
+/// still competes for the budget instead of being free.
+const UNKNOWN_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+#[derive(Default)]
+struct ImageCacheInner {
+    entries: HashMap<String, DecodedImage>,
+    /// Monotonic tick, so `used` gives a total order.
+    clock: u64,
+    /// Sum of `pixel_bytes` currently resident.
+    bytes: u64,
+}
+
+/// Decoded raster cache, shared by every frame and released on session switch.
+pub(crate) type ImageCache = Rc<RefCell<ImageCacheInner>>;
+
+impl ImageCacheInner {
+    fn get(&mut self, key: &str) -> Option<Option<Arc<Image>>> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.get_mut(key)?;
+        entry.used = clock;
+        Some(entry.image.clone())
+    }
+
+    fn insert(&mut self, key: String, image: Option<Arc<Image>>, pixel_bytes: u64) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.pixel_bytes);
+        }
+        self.clock += 1;
+        let used = self.clock;
+        self.entries.insert(
+            key,
+            DecodedImage {
+                image,
+                pixel_bytes,
+                used,
+            },
+        );
+        self.bytes += pixel_bytes;
+        self.evict();
+    }
+
+    /// Drop least-recently-used entries until both the byte budget and the
+    /// entry cap are satisfied.
+    fn evict(&mut self) {
+        while self.bytes > MAX_DECODED_IMAGE_BYTES || self.entries.len() > MAX_DECODED_IMAGES {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(entry.pixel_bytes);
+            }
         }
     }
-    cache.insert(key, image);
+}
+
+fn cache_decoded_image(
+    view: &ChatViewState,
+    key: String,
+    image: Option<Arc<Image>>,
+    pixel_bytes: u64,
+) {
+    view.tool_images
+        .borrow_mut()
+        .insert(key, image, pixel_bytes);
+}
+
+/// Decompressed footprint of an encoded raster, read from its header.
+///
+/// Only the header is parsed — the bytes are never walked — so this is safe to
+/// call on the decode path. Unrecognized formats report nothing and the caller
+/// falls back to a conservative constant.
+fn encoded_pixel_bytes(format: ImageFormat, bytes: &[u8]) -> Option<u64> {
+    fn rgba(width: u64, height: u64) -> Option<u64> {
+        (width > 0 && height > 0).then(|| width.saturating_mul(height).saturating_mul(4))
+    }
+
+    match format {
+        ImageFormat::Png => {
+            // 8-byte signature, 4-byte length, "IHDR", then width/height.
+            let header = bytes.get(16..24)?;
+            let width = u32::from_be_bytes(header[0..4].try_into().ok()?) as u64;
+            let height = u32::from_be_bytes(header[4..8].try_into().ok()?) as u64;
+            rgba(width, height)
+        }
+        ImageFormat::Jpeg => {
+            // Walk the segment chain to the first start-of-frame marker.
+            let mut index = 2usize;
+            while index + 9 < bytes.len() {
+                if bytes[index] != 0xFF {
+                    index += 1;
+                    continue;
+                }
+                let marker = bytes[index + 1];
+                // SOF0..SOF15 minus DHT/JPG/DAC carry the frame dimensions.
+                if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+                    let height =
+                        u16::from_be_bytes(bytes[index + 5..index + 7].try_into().ok()?) as u64;
+                    let width =
+                        u16::from_be_bytes(bytes[index + 7..index + 9].try_into().ok()?) as u64;
+                    return rgba(width, height);
+                }
+                let length =
+                    u16::from_be_bytes(bytes.get(index + 2..index + 4)?.try_into().ok()?) as usize;
+                index += 2 + length.max(2);
+            }
+            None
+        }
+        ImageFormat::Gif => {
+            let header = bytes.get(6..10)?;
+            let width = u16::from_le_bytes(header[0..2].try_into().ok()?) as u64;
+            let height = u16::from_le_bytes(header[2..4].try_into().ok()?) as u64;
+            rgba(width, height)
+        }
+        ImageFormat::Webp => {
+            let chunk = bytes.get(12..16)?;
+            match chunk {
+                b"VP8X" => {
+                    let header = bytes.get(24..30)?;
+                    let width = 1 + u32::from_le_bytes([header[0], header[1], header[2], 0]) as u64;
+                    let height =
+                        1 + u32::from_le_bytes([header[3], header[4], header[5], 0]) as u64;
+                    rgba(width, height)
+                }
+                b"VP8 " => {
+                    let header = bytes.get(26..30)?;
+                    let width = u16::from_le_bytes(header[0..2].try_into().ok()?) as u64 & 0x3FFF;
+                    let height = u16::from_le_bytes(header[2..4].try_into().ok()?) as u64 & 0x3FFF;
+                    rgba(width, height)
+                }
+                b"VP8L" => {
+                    let header = bytes.get(21..25)?;
+                    let bits = u32::from_le_bytes(header.try_into().ok()?);
+                    let width = (bits & 0x3FFF) as u64 + 1;
+                    let height = ((bits >> 14) & 0x3FFF) as u64 + 1;
+                    rgba(width, height)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Rasters attached by the user. Decoded once per path/size pair; the same
@@ -5193,18 +5395,25 @@ fn cache_decoded_image(view: &ChatViewState, key: String, image: Option<Arc<Imag
 fn attachment_image(view: &ChatViewState, attachment: &UserAttachment) -> Option<Arc<Image>> {
     let raster = attachment.image.as_ref()?;
     let key = format!("attachment:{}:{}", attachment.path, raster.data.len());
-    let cached = view.tool_images.borrow().get(&key).cloned();
+    let cached = view.tool_images.borrow_mut().get(&key);
     if let Some(cached) = cached {
         return cached;
     }
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&raster.data)
         .ok();
+    let pixel_bytes = bytes
+        .as_ref()
+        .and_then(|bytes| {
+            let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
+            encoded_pixel_bytes(format, bytes)
+        })
+        .unwrap_or(UNKNOWN_IMAGE_BYTES);
     let decoded = bytes.map(|bytes| {
         let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
         Arc::new(Image::from_bytes(format, bytes))
     });
-    cache_decoded_image(view, key, decoded.clone());
+    cache_decoded_image(view, key, decoded.clone(), pixel_bytes);
     decoded
 }
 
@@ -5218,18 +5427,21 @@ fn tool_image(
     index: usize,
 ) -> Option<Arc<Image>> {
     let key = format!("{call_id}:{index}");
-    let cached = view.tool_images.borrow().get(&key).cloned();
+    let cached = view.tool_images.borrow_mut().get(&key);
     if let Some(cached) = cached {
         return cached;
     }
-    let decoded = result.images.get(index).and_then(|image| {
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&image.data)
-            .ok()?;
-        let format = ImageFormat::from_mime_type(&image.mime_type).unwrap_or(ImageFormat::Png);
-        Some(Arc::new(Image::from_bytes(format, bytes)))
-    });
-    cache_decoded_image(view, key, decoded.clone());
+    let source = result.images.get(index)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&source.data)
+        .ok();
+    let format = ImageFormat::from_mime_type(&source.mime_type).unwrap_or(ImageFormat::Png);
+    let pixel_bytes = bytes
+        .as_ref()
+        .and_then(|bytes| encoded_pixel_bytes(format, bytes))
+        .unwrap_or(UNKNOWN_IMAGE_BYTES);
+    let decoded = bytes.map(|bytes| Arc::new(Image::from_bytes(format, bytes)));
+    cache_decoded_image(view, key, decoded.clone(), pixel_bytes);
     decoded
 }
 
@@ -5368,6 +5580,73 @@ mod tests {
         // transcript that has nowhere to go.
         chat.wheel(120.0);
         assert!(chat.pinned());
+    }
+
+    /// The decoded image cache must be bounded by *memory*, not by count.
+    ///
+    /// It used to hold 16 entries with FIFO eviction: sixteen 1080p screenshots
+    /// is ~128 MB of anon heap pinned for images that had long scrolled away,
+    /// and the accounting reported the compressed payload so nothing noticed.
+    #[test]
+    fn decoded_image_cache_is_bounded_by_bytes_and_evicts_lru() {
+        let mut cache = ImageCacheInner::default();
+        // Eight 4 MB rasters: two of them blow the entry cap's byte budget.
+        let page: u64 = 4 * 1024 * 1024;
+        let capacity = (MAX_DECODED_IMAGE_BYTES / page) as usize;
+        for index in 0..capacity {
+            cache.insert(format!("img{index}"), None, page);
+        }
+        assert!(cache.bytes <= MAX_DECODED_IMAGE_BYTES);
+        assert_eq!(cache.entries.len(), capacity);
+
+        // Touch the oldest so it is no longer the eviction victim.
+        assert!(cache.get("img0").is_some());
+        cache.insert("fresh".to_string(), None, page);
+
+        assert!(
+            cache.bytes <= MAX_DECODED_IMAGE_BYTES,
+            "cache still holds {} bytes after insert",
+            cache.bytes
+        );
+        assert!(
+            cache.entries.contains_key("img0"),
+            "the recently viewed image was evicted instead of the stalest one"
+        );
+        assert!(
+            !cache.entries.contains_key("img1"),
+            "LRU victim was not the least recently used entry"
+        );
+    }
+
+    /// Header parsing is what makes the budget meaningful; a wrong answer here
+    /// would silently disable the byte bound for one format.
+    #[test]
+    fn encoded_pixel_bytes_reads_png_and_gif_headers() {
+        // Minimal PNG signature + IHDR for a 1920×1080 raster.
+        let mut png = Vec::new();
+        png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1920u32.to_be_bytes());
+        png.extend_from_slice(&1080u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert_eq!(
+            encoded_pixel_bytes(ImageFormat::Png, &png),
+            Some(1920 * 1080 * 4)
+        );
+
+        let mut gif = Vec::new();
+        gif.extend_from_slice(b"GIF89a");
+        gif.extend_from_slice(&320u16.to_le_bytes());
+        gif.extend_from_slice(&240u16.to_le_bytes());
+        assert_eq!(
+            encoded_pixel_bytes(ImageFormat::Gif, &gif),
+            Some(320 * 240 * 4)
+        );
+
+        // Truncated input must not panic, just report nothing.
+        assert_eq!(encoded_pixel_bytes(ImageFormat::Png, b"\x89PNG"), None);
+        assert_eq!(encoded_pixel_bytes(ImageFormat::Jpeg, b"\xFF\xD8"), None);
     }
 
     /// Rebinding the same text must invalidate the cached assistant snapshot.
