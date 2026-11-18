@@ -499,6 +499,18 @@ impl SidePaneState {
             return;
         };
         let removed = self.tabs.remove(index);
+        // The pane keeps one buffer per page rather than per tab, so a closed
+        // page has to hand back what it was showing: the previewed file (up to
+        // 4000 lines) or the diff text plus its parsed IR (up to 6000 lines).
+        // Otherwise both stayed resident until the next session switch.
+        match removed.kind {
+            SidePaneTabKind::Files => self.file_tree.preview = None,
+            SidePaneTabKind::Changes => {
+                self.git.diff = None;
+                self.git.diff_ir_cache = None;
+            }
+            _ => {}
+        }
         self.recent_closed.retain(|tab| tab.id != removed.id);
         self.recent_closed.insert(0, removed);
         self.recent_closed.truncate(10);

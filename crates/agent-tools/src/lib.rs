@@ -4,6 +4,7 @@
 //!
 //! - file tools (`read_file`, `write_file`, `edit_file`, `list_dir`)
 //! - workspace search (`grep`)
+//! - reading one public web page (`webfetch`)
 //! - process execution (`shell`)
 //! - plan tracking (`todo_write`)
 //! - programmatic tool calling (`run_js`), backed by the Boa sandbox in
@@ -28,6 +29,7 @@ mod ptc;
 mod shell;
 pub mod state;
 mod todo;
+pub mod webfetch;
 pub mod workflow;
 pub mod workspace;
 
@@ -45,6 +47,7 @@ pub use ptc::RunJsTool;
 pub use shell::{SHELL_ENV, ShellSpec, ShellTool};
 pub use state::{SessionStateTool, forget_session as forget_session_state};
 pub use todo::TodoWriteTool;
+pub use webfetch::WebFetchTool;
 pub use workflow::WorkflowTool;
 pub use workspace::Workspace;
 
@@ -74,6 +77,7 @@ pub fn builtin_tools_with_roots(
     registry.register(EditFileTool::new(workspace.clone()));
     registry.register(ListDirTool::new(workspace.clone()));
     registry.register(GrepTool::new(workspace.clone()));
+    registry.register(WebFetchTool::new());
     registry.register(ShellTool::new(workspace));
     registry.register(TodoWriteTool::new());
     registry.register(SessionStateTool::new());
@@ -90,8 +94,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use effibuddy_agent_core::{
-        AgentHarness, AutoApprovalGate, Completion, FileCheckpointSink, HarnessConfig,
-        NestedToolInvoker, SessionState, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry,
+        AgentHarness, ApprovalDecision, ApprovalGate, ApprovalRequest, AutoApprovalGate,
+        Completion, FileCheckpointSink, HarnessConfig, ModeApprovalGate, NestedToolInvoker,
+        PermissionMode, SessionState, Tool, ToolCall, ToolContext, ToolOutput, ToolRegistry,
         new_shared_session,
     };
     use serde_json::{Value, json};
@@ -380,6 +385,62 @@ mod tests {
                 "after edit_file notes/a.txt 3".to_string(),
                 "shell echo checkpoint".to_string(),
             ]
+        );
+    }
+
+    /// Counts how often a call reached the *real* gate, i.e. how often the user
+    /// would have been asked.
+    #[derive(Default)]
+    struct CountingGate {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingGate {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalGate for CountingGate {
+        async fn request_approval(&self, _request: ApprovalRequest) -> ApprovalDecision {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ApprovalDecision::Deny
+        }
+    }
+
+    /// FullAccess means "don't ask me" — for every tool we ship, not just the
+    /// ones someone remembered to test.
+    ///
+    /// This is the regression guard for a whole class of bug: a tool that adds
+    /// its own policy layer (an invisible blocklist, a hidden consent step)
+    /// cannot be caught here, but any tool that starts routing around the
+    /// matrix, or a new builtin that quietly reintroduces a card, will.
+    #[tokio::test]
+    async fn full_access_approves_every_builtin_tool_without_a_card() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = builtin_tools(directory.path()).unwrap();
+        assert!(
+            registry.len() >= 10,
+            "expected the full builtin set, got {:?}",
+            registry.names()
+        );
+
+        let inner = Arc::new(CountingGate::default());
+        let gate = ModeApprovalGate::new(inner.clone(), Arc::new(|| PermissionMode::FullAccess));
+        for name in registry.names() {
+            let call = ToolCall::new(name.clone(), json!({}));
+            let request = ApprovalRequest::new(&call, format!("run {name}"));
+            assert_eq!(
+                gate.request_approval(request).await,
+                ApprovalDecision::Approve,
+                "full access must not card `{name}`"
+            );
+        }
+        assert_eq!(
+            inner.calls(),
+            0,
+            "full access must never reach the real approval gate"
         );
     }
 }

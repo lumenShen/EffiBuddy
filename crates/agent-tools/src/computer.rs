@@ -136,9 +136,9 @@ impl Tool for ComputerTool {
         // Desktop observation never changes state; every other action drives the
         // mouse or the keyboard, including unknown ones (fail closed).
         match arguments.get("action").and_then(Value::as_str) {
-            Some(
-                "status" | "list_displays" | "list_windows" | "list_desktops" | "screenshot",
-            ) => ToolRisk::ReadOnly,
+            Some("status" | "list_displays" | "list_windows" | "list_desktops" | "screenshot") => {
+                ToolRisk::ReadOnly
+            }
             _ => ToolRisk::Mutating,
         }
     }
@@ -564,7 +564,7 @@ mod tests {
     fn tool() -> (ComputerTool, Arc<FakeBackend>) {
         let backend = Arc::new(FakeBackend::new());
         let runtime = Arc::new(ComputerRuntime::new(backend.clone()));
-                (ComputerTool::new(runtime, true), backend)
+        (ComputerTool::new(runtime, true), backend)
     }
 
     fn context() -> ToolContext {
@@ -600,7 +600,7 @@ mod tests {
     async fn non_vision_screenshot_is_saved_to_disk() {
         let backend = Arc::new(FakeBackend::new());
         let runtime = Arc::new(ComputerRuntime::new(backend));
-                let tool = ComputerTool::new(runtime, false);
+        let tool = ComputerTool::new(runtime, false);
         let output = tool
             .execute(context(), json!({"action": "screenshot"}))
             .await

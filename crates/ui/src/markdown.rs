@@ -1154,6 +1154,16 @@ const MAX_CACHED_DOCS: usize = 64;
 /// every stable chunk on every frame, so the LRU stamps keep them resident
 /// while the streaming caret chunk churns.
 const MAX_CACHED_CHUNKS: usize = 2048;
+/// Source bytes of memoized documents. The entry count alone is not a bound:
+/// tool results arrive as multi-megabyte markdown, and a cached block keeps its
+/// own copy of that text plus highlight ranges, so 64 documents could pin far
+/// more than the transcript they serve. A session switch does not have to
+/// invalidate anything — the new session's documents are newer, so the LRU
+/// drains the old ones as the budget fills.
+const MAX_CACHED_DOC_BYTES: usize = 12 * 1024 * 1024;
+/// Source bytes of memoized chunks. One document's chunks add up to roughly
+/// its own size, so this is the second (and smaller) copy of what is on screen.
+const MAX_CACHED_CHUNK_BYTES: usize = 6 * 1024 * 1024;
 
 /// Cache identity: the theme fields that leak into cached highlights, plus
 /// the source content hash and length.
@@ -1168,6 +1178,10 @@ struct DocKey {
 struct MarkdownCache {
     docs: HashMap<DocKey, (u64, Blocks)>,
     chunks: HashMap<DocKey, (u64, Blocks)>,
+    /// Source bytes held by `docs` / `chunks`, maintained on insert and on
+    /// eviction so the byte budget is an O(1) comparison.
+    doc_bytes: usize,
+    chunk_bytes: usize,
     stamp: u64,
     hits: u64,
 }
@@ -1192,22 +1206,35 @@ fn cache_get(
     Some(entry.1.clone())
 }
 
+/// Insert one entry, then evict least-recently-used entries until both the
+/// count cap and the byte budget are satisfied. The entry just inserted has the
+/// highest stamp, so it is the last one to go even when it alone overflows the
+/// budget: the frame that asked for it must not pay for a re-parse.
 fn cache_put(
     map: &mut HashMap<DocKey, (u64, Blocks)>,
     key: DocKey,
     blocks: Blocks,
     stamp: &mut u64,
     cap: usize,
+    bytes: &mut usize,
+    byte_cap: usize,
 ) {
     *stamp += 1;
-    map.insert(key, (*stamp, blocks));
-    if map.len() > cap {
+    // A replacement of the same key costs nothing: the old blocks were just
+    // dropped and the new ones carry the same source length.
+    if map.insert(key, (*stamp, blocks)).is_none() {
+        *bytes += key.len;
+    }
+    while map.len() > 1 && (map.len() > cap || *bytes > byte_cap) {
         let victim = map
             .iter()
             .min_by_key(|(_, (entry_stamp, _))| *entry_stamp)
             .map(|(key, _)| *key);
-        if let Some(key) = victim {
-            map.remove(&key);
+        let Some(key) = victim else {
+            break;
+        };
+        if map.remove(&key).is_some() {
+            *bytes -= key.len.min(*bytes);
         }
     }
 }
@@ -1260,9 +1287,9 @@ pub fn markdown_cache_stats() -> MarkdownCacheStats {
         let cache = cache.borrow();
         MarkdownCacheStats {
             documents: cache.docs.len(),
-            document_bytes: cache.docs.keys().map(|key| key.len as u64).sum(),
+            document_bytes: cache.doc_bytes as u64,
             chunks: cache.chunks.len(),
-            chunk_bytes: cache.chunks.keys().map(|key| key.len as u64).sum(),
+            chunk_bytes: cache.chunk_bytes as u64,
         }
     })
 }
@@ -1304,13 +1331,25 @@ pub fn render_markdown_keyed_with(
     let blocks = CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         let MarkdownCache {
-            docs, stamp, hits, ..
+            docs,
+            stamp,
+            hits,
+            doc_bytes,
+            ..
         } = &mut *cache;
         match cache_get(docs, &cache_key, stamp, hits) {
             Some(blocks) => blocks,
             None => {
                 let blocks = build_blocks(source, theme);
-                cache_put(docs, cache_key, blocks.clone(), stamp, MAX_CACHED_DOCS);
+                cache_put(
+                    docs,
+                    cache_key,
+                    blocks.clone(),
+                    stamp,
+                    MAX_CACHED_DOCS,
+                    doc_bytes,
+                    MAX_CACHED_DOC_BYTES,
+                );
                 blocks
             }
         }
@@ -1395,13 +1434,22 @@ fn cached_chunk_blocks(theme: &Theme, source: &str, hash: u64) -> Blocks {
             chunks,
             stamp,
             hits,
+            chunk_bytes,
             ..
         } = &mut *cache;
         match cache_get(chunks, &key, stamp, hits) {
             Some(blocks) => blocks,
             None => {
                 let blocks = build_blocks(source, theme);
-                cache_put(chunks, key, blocks.clone(), stamp, MAX_CACHED_CHUNKS);
+                cache_put(
+                    chunks,
+                    key,
+                    blocks.clone(),
+                    stamp,
+                    MAX_CACHED_CHUNKS,
+                    chunk_bytes,
+                    MAX_CACHED_CHUNK_BYTES,
+                );
                 blocks
             }
         }
@@ -2395,11 +2443,23 @@ mod tests {
             cache.docs.remove(&key);
             let before = cache.hits;
             let MarkdownCache {
-                docs, stamp, hits, ..
+                docs,
+                stamp,
+                hits,
+                doc_bytes: bytes,
+                ..
             } = &mut *cache;
             assert!(cache_get(docs, &key, stamp, hits).is_none());
             let blocks = build_blocks(source, &theme);
-            cache_put(docs, key, blocks, stamp, MAX_CACHED_DOCS);
+            cache_put(
+                docs,
+                key,
+                blocks,
+                stamp,
+                MAX_CACHED_DOCS,
+                bytes,
+                MAX_CACHED_DOC_BYTES,
+            );
             let hit = cache_get(docs, &key, stamp, hits);
             assert!(hit.is_some());
             assert_eq!(*hits, before + 1);
@@ -2587,5 +2647,66 @@ mod tests {
             total = document.len() / 1024,
             speedup = uncached_steady / cached_steady.max(0.001),
         );
+    }
+
+    fn doc_key(hash: u64, len: usize) -> DocKey {
+        DocKey {
+            theme_key: 1,
+            hash,
+            len,
+        }
+    }
+
+    /// Entry count is not a bound: without the byte budget ten 1MB tool results
+    /// would sit in the cache even though only a screenful is ever visible.
+    #[test]
+    fn byte_budget_evicts_documents_before_the_count_cap() {
+        let mut map: HashMap<DocKey, (u64, Blocks)> = HashMap::new();
+        let mut stamp = 0;
+        let mut bytes = 0usize;
+        let budget = 4 * 1024 * 1024;
+        for hash in 0..10u64 {
+            let blocks: Blocks = Rc::from(Vec::new());
+            cache_put(
+                &mut map,
+                doc_key(hash, 1024 * 1024),
+                blocks,
+                &mut stamp,
+                MAX_CACHED_DOCS,
+                &mut bytes,
+                budget,
+            );
+        }
+        assert!(
+            bytes <= budget,
+            "缓存字节 {bytes} 超过预算 {budget}（条数上限不该是唯一约束）"
+        );
+        assert_eq!(map.len(), 4, "应当只保留 4 篇 1MB 文档");
+        assert!(
+            map.contains_key(&doc_key(9, 1024 * 1024)),
+            "刚插入的最新文档必须存活"
+        );
+        assert!(!map.contains_key(&doc_key(0, 1024 * 1024)), "最老的文档应被淘汰");
+    }
+
+    /// A single over-budget document stays cached: evicting the entry the
+    /// current frame asked for would turn every frame into a re-parse.
+    #[test]
+    fn a_document_bigger_than_the_budget_is_kept() {
+        let mut map: HashMap<DocKey, (u64, Blocks)> = HashMap::new();
+        let mut stamp = 0;
+        let mut bytes = 0usize;
+        let blocks: Blocks = Rc::from(Vec::new());
+        cache_put(
+            &mut map,
+            doc_key(7, 40 * 1024 * 1024),
+            blocks,
+            &mut stamp,
+            MAX_CACHED_DOCS,
+            &mut bytes,
+            4 * 1024 * 1024,
+        );
+        assert_eq!(map.len(), 1, "唯一的超大文档必须保留");
+        assert_eq!(bytes, 40 * 1024 * 1024, "字节计数要跟上实际条目");
     }
 }

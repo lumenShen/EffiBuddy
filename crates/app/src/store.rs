@@ -298,6 +298,16 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Whether this id was deleted in this run. Tombstones are kept so a queued
+    /// save cannot resurrect the file; background work that produces files for
+    /// a conversation reads this before writing them.
+    pub fn is_deleted(&self, id: &str) -> bool {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(id)
+    }
+
     pub fn summaries(&self) -> Vec<SessionSummary> {
         self.collect_summaries(false)
     }

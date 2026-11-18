@@ -41,7 +41,7 @@ use crate::chat::{
 };
 use crate::checkpoint::{RestoreAction, RestorePlan};
 use crate::composer_menu::ComposerMenuState;
-use crate::computer::{ComputerOverlayView, composer_hint};
+use crate::computer::ComputerOverlayView;
 use crate::config::{AppConfig, MAX_UI_ZOOM, MIN_UI_ZOOM};
 use crate::context_meter::{ContextUsage, SubagentUsage};
 use crate::draft_store::{DraftStore, TASK_SCOPE};
@@ -2025,6 +2025,44 @@ impl AppView {
         Some(shared)
     }
 
+    /// Build the thumbnails the chat list asked for, off the UI thread.
+    ///
+    /// A pasted 2560×1680 screenshot is 16 MB once decoded and would take a
+    /// whole 4096² sprite-atlas page, for a 184×120 card. Decoding it here and
+    /// painting a 512px copy keeps both the raster cache and the atlas small;
+    /// the conversation the raster belongs to is written under the data dir, so
+    /// reopening the session is a disk read instead of a second decode.
+    fn spawn_thumbnail_builds(&mut self, cx: &mut Context<Self>) {
+        for request in self.chat.take_thumbnail_requests() {
+            if self.store.is_deleted(&request.session_id) {
+                continue;
+            }
+            cx.spawn(async move |weak, cx| {
+                let crate::chat::ThumbnailRequest {
+                    session_id,
+                    key,
+                    data,
+                } = request;
+                let worker_key = key.clone();
+                let built = cx
+                    .background_executor()
+                    .spawn(async move { crate::thumbs::build(&session_id, &worker_key, &data) })
+                    .await;
+                weak.update(cx, |this, cx| {
+                    match built {
+                        Some(png) => this.chat.thumbnail_ready(&key, png),
+                        // No thumbnail is possible (an SVG, or a decode the
+                        // image crate refuses): paint the raster as it came.
+                        None => this.chat.thumbnail_unavailable(&key),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
     /// Park the outgoing conversation's run and its queue/approval/subagent UI.
     /// Called before `active` changes, so events that arrive during the switch
     /// still route by session id.
@@ -2142,6 +2180,10 @@ impl AppView {
         self.subagent_tasks.clear();
         self.subagent_task_index.clear();
         self.side.agent_views.clear();
+        // Hunk-expansion keys embed file paths, so they can never be reused by
+        // another conversation — without this they accumulated for the whole
+        // process lifetime.
+        self.side.expanded_hunks.clear();
         let ids: Vec<String> = self
             .side
             .tabs
@@ -2505,7 +2547,8 @@ impl AppView {
     /// Mark a conversation as just opened, for [`Self::trim_session_shares`].
     fn touch_share_stamp(&mut self, id: &str) {
         self.share_stamp_seq += 1;
-        self.share_stamp.insert(id.to_string(), self.share_stamp_seq);
+        self.share_stamp
+            .insert(id.to_string(), self.share_stamp_seq);
     }
 
     /// Drop the oldest idle transcripts so browsing many conversations cannot
@@ -2516,12 +2559,23 @@ impl AppView {
     /// transcripts (the sidebar's 13 live conversations here cost ~270MB of
     /// RSS). Anything with a live run, running children, a queued or in-flight
     /// save — i.e. anything whose file is not current yet — is kept.
+    ///
+    /// A count cap alone is not enough, because transcripts differ by two
+    /// orders of magnitude: measured on a real archive, the parked transcripts
+    /// range from 0.2MB to 15MB of tool output, so "the last four sessions"
+    /// could be 60MB of RSS while a switch-back costs a single JSON parse
+    /// (13ms for the biggest transcript here). The byte budget therefore
+    /// decides, and the count cap only stops a pile of tiny transcripts.
     fn trim_session_shares(&mut self) {
         /// Idle transcripts kept for instant switch-back.
         const IDLE_SHARE_LIMIT: usize = 4;
+        /// Total payload of the parked transcripts. Bigger ones are reloaded
+        /// from disk (on the UI thread, but a measured ~1ms per MB) instead of
+        /// being kept for the rest of the process.
+        const IDLE_SHARE_BYTES: u64 = 24 * 1024 * 1024;
         self.drain_persist_done();
         let active = self.active_id();
-        let mut idle: Vec<(u64, String)> = Vec::new();
+        let mut idle: Vec<(u64, String, u64)> = Vec::new();
         for id in self.session_shares.keys() {
             if Some(id.as_str()) == active.as_deref()
                 || self.background_runs.contains_key(id)
@@ -2534,14 +2588,21 @@ impl AppView {
             {
                 continue;
             }
-            idle.push((self.share_stamp.get(id).copied().unwrap_or(0), id.clone()));
+            let bytes = self.session_shares.get(id).map_or(0, |shared| {
+                let session = lock_session(shared);
+                session
+                    .messages
+                    .iter()
+                    .map(crate::memory::message_bytes)
+                    .sum::<u64>()
+            });
+            idle.push((
+                self.share_stamp.get(id).copied().unwrap_or(0),
+                id.clone(),
+                bytes,
+            ));
         }
-        if idle.len() <= IDLE_SHARE_LIMIT {
-            return;
-        }
-        idle.sort();
-        let excess = idle.len() - IDLE_SHARE_LIMIT;
-        for (_, id) in idle.into_iter().take(excess) {
+        for id in idle_share_evictions(idle, IDLE_SHARE_LIMIT, IDLE_SHARE_BYTES) {
             self.session_shares.remove(&id);
             self.share_stamp.remove(&id);
         }
@@ -6660,6 +6721,7 @@ impl AppView {
             return;
         }
         crate::checkpoint::remove_session_checkpoints(id);
+        crate::thumbs::remove_session(id);
         self.drafts.remove_session(id);
         self.save_drafts_now();
         if is_active {
@@ -6708,6 +6770,7 @@ impl AppView {
         match self.store.delete(id) {
             Ok(()) => {
                 crate::checkpoint::remove_session_checkpoints(id);
+                crate::thumbs::remove_session(id);
                 self.drafts.remove_session(id);
                 self.forget_session_runtime(id);
                 self.save_drafts_now();
@@ -9927,6 +9990,37 @@ impl AppView {
                 }
             };
 
+        // The shortcut hints used to sit in a footer row under the card, next to
+        // two "computer/browser 已允许" chips. Those chips went away (the
+        // permission chip on the controls row already states the mode), and the
+        // hints moved onto the placeholder line, so the area under the card is
+        // left empty.
+        let inline_hint: Option<AnyElement> = if !empty {
+            // While typing, the line belongs to the text.
+            None
+        } else {
+            let (text, color) = if permission_mode == PermissionMode::Plan {
+                (
+                    "计划模式：写操作将被拒绝，先出计划（Shift+Tab 切换）",
+                    theme.warning,
+                )
+            } else if running {
+                (
+                    "Enter 排队 · Ctrl+Enter 插入当前回合 · Shift+Enter 换行",
+                    theme.text_faint,
+                )
+            } else {
+                ("Ctrl K 命令 · / 技能·工具 · @ 文件", theme.text_faint)
+            };
+            Some(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(color)
+                    .child(text)
+                    .into_any_element(),
+            )
+        };
+
         let send = if running {
             div()
                 .id("composer-stop")
@@ -9934,7 +10028,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(34.0))
+                .size(px(26.0))
                 .rounded(px(999.0))
                 .bg(theme.danger_soft)
                 .cursor_pointer()
@@ -9954,7 +10048,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(34.0))
+                .size(px(26.0))
                 .rounded(px(999.0))
                 .bg(theme.disabled_bg)
                 .tooltip(effibuddy_ui::tooltip(theme, "输入消息后发送"))
@@ -9971,7 +10065,7 @@ impl AppView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(px(34.0))
+                .size(px(26.0))
                 .rounded(px(999.0))
                 .bg(theme.accent)
                 .cursor_pointer()
@@ -10035,130 +10129,160 @@ impl AppView {
         if let Some(chips) = self.render_composer_attachments(cx) {
             composer_card = composer_card.child(chips);
         }
-        let composer_card = composer_card.child(self.composer.clone()).child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .h(px(34.0))
+        let composer_card =
+            composer_card
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            IconButton::new("composer-add", icons::PLUS, theme)
-                                .size(26.0, 13.0)
-                                .tooltip("添加文件到会话（也可直接拖入）")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.pick_composer_files(cx);
-                                })),
-                        )
+                        .relative()
+                        .w_full()
+                        // Reserve room for the send button that floats on this line.
+                        .pr(px(34.0))
+                        .child(self.composer.clone())
+                        // The placeholder line now carries the shortcut hint and the
+                        // send button; both are absolute so the text keeps the full
+                        // width of the card and nothing shifts when a run starts.
                         .child(
                             div()
-                                .id("composer-permission")
+                                .absolute()
+                                .top(px(-3.0))
+                                .right(px(0.0))
                                 .flex()
                                 .items_center()
-                                .gap(px(5.0))
-                                .h(px(26.0))
-                                .px(px(9.0))
-                                .rounded(px(999.0))
-                                .bg(permission_bg)
-                                .text_color(permission_color)
-                                .text_size(px(11.0))
-                                .cursor_pointer()
-                                .tooltip(effibuddy_ui::tooltip(theme, "权限模式 · Shift+Tab 切换"))
-                                .hover(|style| style.bg(theme.active))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cycle_permission_mode(cx)),
-                                )
-                                .child(
-                                    svg()
-                                        .path(permission_icon)
-                                        .size(px(11.0))
-                                        .text_color(permission_color),
-                                )
-                                .child(permission_label.to_string())
-                                .child(
-                                    svg()
-                                        .path(icons::CHEVRON_DOWN)
-                                        .size(px(9.0))
-                                        .text_color(permission_color),
-                                ),
+                                .gap(px(10.0))
+                                .children(inline_hint)
+                                .child(send),
                         ),
                 )
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
+                        .justify_between()
+                        .h(px(34.0))
                         .child(
                             div()
-                                .id("composer-context")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(26.0))
-                                .rounded(px(999.0))
-                                .bg(theme.surface_alt)
-                                .cursor_pointer()
-                                .tooltip(crate::context_meter::context_tooltip(
-                                    theme,
-                                    context_usage.clone(),
-                                ))
-                                .hover(|style| style.bg(theme.active))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_sidebar_kind(SidePaneTab::overview(), cx);
-                                }))
-                                // 静止时只给进度环不给百分比；占用构成与累计
-                                // 消耗都在悬停 tips 里展开。
-                                .child(
-                                    ProgressRing::new(context_usage.fraction(), 16.0)
-                                        .stroke_width(2.2)
-                                        .track(theme.border_strong)
-                                        .progress(if context_pct > 75.0 {
-                                            theme.warning
-                                        } else {
-                                            theme.success
-                                        }),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("composer-model")
                                 .flex()
                                 .items_center()
                                 .gap(px(6.0))
-                                .h(px(26.0))
-                                .px(px(9.0))
-                                .rounded(px(999.0))
-                                .bg(theme.surface_alt)
-                                .text_size(px(11.0))
-                                .text_color(theme.text_muted)
-                                .cursor_pointer()
-                                .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
-                                .hover(|style| style.bg(theme.active))
-                                .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                                    this.open_model_menu(event.position(), cx);
-                                }))
-                                .child(div().size(px(6.0)).rounded(px(999.0)).bg(if demo_mode {
-                                    theme.warning
-                                } else if resolved.live {
-                                    theme.success
-                                } else {
-                                    theme.warning
-                                }))
-                                .child(resolved.model_label().to_string())
                                 .child(
-                                    svg()
-                                        .path(icons::CHEVRON_DOWN)
-                                        .size(px(10.0))
-                                        .text_color(theme.text_faint),
+                                    IconButton::new("composer-add", icons::PLUS, theme)
+                                        .size(26.0, 13.0)
+                                        .tooltip("添加文件到会话（也可直接拖入）")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.pick_composer_files(cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("composer-permission")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(5.0))
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(999.0))
+                                        .bg(permission_bg)
+                                        .text_color(permission_color)
+                                        .text_size(px(11.0))
+                                        .cursor_pointer()
+                                        .tooltip(effibuddy_ui::tooltip(
+                                            theme,
+                                            "权限模式 · Shift+Tab 切换",
+                                        ))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.cycle_permission_mode(cx)
+                                        }))
+                                        .child(
+                                            svg()
+                                                .path(permission_icon)
+                                                .size(px(11.0))
+                                                .text_color(permission_color),
+                                        )
+                                        .child(permission_label.to_string())
+                                        .child(
+                                            svg()
+                                                .path(icons::CHEVRON_DOWN)
+                                                .size(px(9.0))
+                                                .text_color(permission_color),
+                                        ),
                                 ),
                         )
-                        .child(send),
-                ),
-        );
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .id("composer-context")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .size(px(26.0))
+                                        .rounded(px(999.0))
+                                        .bg(theme.surface_alt)
+                                        .cursor_pointer()
+                                        .tooltip(crate::context_meter::context_tooltip(
+                                            theme,
+                                            context_usage.clone(),
+                                        ))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_sidebar_kind(SidePaneTab::overview(), cx);
+                                        }))
+                                        // 静止时只给进度环不给百分比；占用构成与累计
+                                        // 消耗都在悬停 tips 里展开。
+                                        .child(
+                                            ProgressRing::new(context_usage.fraction(), 16.0)
+                                                .stroke_width(2.2)
+                                                .track(theme.border_strong)
+                                                .progress(if context_pct > 75.0 {
+                                                    theme.warning
+                                                } else {
+                                                    theme.success
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("composer-model")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .h(px(26.0))
+                                        .px(px(9.0))
+                                        .rounded(px(999.0))
+                                        .bg(theme.surface_alt)
+                                        .text_size(px(11.0))
+                                        .text_color(theme.text_muted)
+                                        .cursor_pointer()
+                                        .tooltip(effibuddy_ui::tooltip(theme, "切换模型"))
+                                        .hover(|style| style.bg(theme.active))
+                                        .on_click(cx.listener(
+                                            |this, event: &gpui::ClickEvent, _, cx| {
+                                                this.open_model_menu(event.position(), cx);
+                                            },
+                                        ))
+                                        .child(div().size(px(6.0)).rounded(px(999.0)).bg(
+                                            if demo_mode {
+                                                theme.warning
+                                            } else if resolved.live {
+                                                theme.success
+                                            } else {
+                                                theme.warning
+                                            },
+                                        ))
+                                        .child(resolved.model_label().to_string())
+                                        .child(
+                                            svg()
+                                                .path(icons::CHEVRON_DOWN)
+                                                .size(px(10.0))
+                                                .text_color(theme.text_faint),
+                                        ),
+                                ),
+                        ),
+                );
 
         let mut column = div()
             .w_full()
@@ -10169,95 +10293,6 @@ impl AppView {
             .pt(px(8.0))
             .pb(px(20.0))
             .gap(px(10.0));
-
-        let computer_mode = self.config.computer_use_mode;
-        let computer_vision = resolved.model.capabilities.vision;
-        let computer_hint = composer_hint(computer_mode, computer_vision, permission_mode);
-        let browser_mode = self.config.browser_use_mode;
-        let browser_hint = crate::browser::composer_hint(browser_mode, permission_mode);
-
-        let mut footer_left = div().flex().items_center().gap(px(8.0)).child(
-            if permission_mode == PermissionMode::Plan {
-                "计划模式：写操作将被拒绝，先出计划（Shift+Tab 切换）"
-            } else if self.active_run.is_some() {
-                "任务运行中：Enter 排队 · Ctrl+Enter 插入当前回合 · Shift+Enter 换行"
-            } else {
-                "Enter 发送 · Shift+Enter 换行"
-            },
-        );
-        if let Some((label, tooltip_text)) = computer_hint {
-            let (hint_color, hint_bg) = if !computer_vision {
-                (theme.warning, theme.warning_soft)
-            } else if permission_mode == PermissionMode::FullAccess {
-                (theme.success, theme.success_soft)
-            } else {
-                (theme.text_muted, theme.surface_alt)
-            };
-            footer_left = footer_left
-                .child(div().w(px(1.0)).h(px(10.0)).bg(theme.border))
-                .child(
-                    div()
-                        .id("composer-computer")
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .h(px(20.0))
-                        .px(px(6.0))
-                        .rounded(px(999.0))
-                        .bg(hint_bg)
-                        .text_size(px(10.0))
-                        .text_color(hint_color)
-                        .cursor_pointer()
-                        .tooltip(effibuddy_ui::tooltip(theme, tooltip_text))
-                        .hover(|style| style.bg(theme.active))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_settings_section(SettingsSection::General, window, cx)
-                        }))
-                        .child(
-                            svg()
-                                .path(icons::MOUSE)
-                                .size(px(10.0))
-                                .text_color(hint_color),
-                        )
-                        .child(label),
-                );
-        }
-
-        if let Some((label, tooltip_text)) = browser_hint {
-            let (hint_color, hint_bg) = if permission_mode == PermissionMode::FullAccess {
-                (theme.success, theme.success_soft)
-            } else {
-                (theme.text_muted, theme.surface_alt)
-            };
-            footer_left = footer_left
-                .child(div().w(px(1.0)).h(px(10.0)).bg(theme.border))
-                .child(
-                    div()
-                        .id("composer-browser")
-                        .flex()
-                        .items_center()
-                        .gap(px(4.0))
-                        .h(px(20.0))
-                        .px(px(6.0))
-                        .rounded(px(999.0))
-                        .bg(hint_bg)
-                        .text_size(px(10.0))
-                        .text_color(hint_color)
-                        .cursor_pointer()
-                        .tooltip(effibuddy_ui::tooltip(theme, tooltip_text))
-                        .hover(|style| style.bg(theme.active))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_settings_section(SettingsSection::General, window, cx)
-                        }))
-                        .child(
-                            svg()
-                                .path(icons::GLOBE)
-                                .size(px(10.0))
-                                .text_color(hint_color),
-                        )
-                        .child(label),
-                );
-        }
 
         if let Some(pending) = self.pending_approvals.first() {
             column = column.child(self.render_approval(
@@ -10289,26 +10324,7 @@ impl AppView {
             column = column.child(menu);
         }
 
-        column
-            .child(composer_card)
-            .child(
-                div()
-                    .w_full()
-                    .max_w(px(760.0))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(2.0))
-                    .text_size(px(11.0))
-                    .text_color(if permission_mode == PermissionMode::Plan {
-                        theme.warning
-                    } else {
-                        theme.text_faint
-                    })
-                    .child(footer_left)
-                    .child("Ctrl K 命令 · / 技能·工具 · @ 文件"),
-            )
-            .into_any_element()
+        column.child(composer_card).into_any_element()
     }
 
     /// Composer banner shown while a user message is being edited. It states
@@ -11410,6 +11426,10 @@ impl Render for AppView {
         for image in self.chat.take_dropped_images() {
             gpui::ImageSource::Image(image).remove_asset(cx);
         }
+        // Rasters waiting for a downscaled thumbnail. The chat list can only
+        // record the request while it builds rows, so the decode happens here
+        // on the background executor and the next frame paints the result.
+        self.spawn_thumbnail_builds(cx);
 
         let theme = self.theme.clone();
 
@@ -13756,6 +13776,32 @@ struct UsageCache {
 /// streaming answer would otherwise re-walk it on every delta).
 const USAGE_CACHE_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
+/// Which parked transcripts [`AppView::trim_session_shares`] should drop.
+///
+/// Oldest first, so the conversation the user just left stays hot; never the
+/// newest one, even when it alone exceeds the budget (keeping zero would make
+/// every switch a disk parse); and never below one entry. Pure, so the policy
+/// can be pinned by a unit test without a window.
+fn idle_share_evictions(
+    mut idle: Vec<(u64, String, u64)>,
+    count_limit: usize,
+    byte_limit: u64,
+) -> Vec<String> {
+    idle.sort();
+    let mut remaining = idle.len();
+    let mut bytes: u64 = idle.iter().map(|(_, _, size)| *size).sum();
+    let mut evict = Vec::new();
+    for (_, id, size) in idle {
+        if remaining <= 1 || (remaining <= count_limit && bytes <= byte_limit) {
+            break;
+        }
+        remaining -= 1;
+        bytes = bytes.saturating_sub(size);
+        evict.push(id);
+    }
+    evict
+}
+
 /// Resident set size of this process in MiB, read straight from `/proc`.
 ///
 /// The chat list keeps several derived copies of the transcript (the item's
@@ -13778,4 +13824,62 @@ fn process_rss_mib() -> f64 {
         }
     }
     0.0
+}
+
+#[cfg(test)]
+mod share_trim_tests {
+    use super::idle_share_evictions;
+
+    fn parked(stamp: u64, id: &str, mb: u64) -> (u64, String, u64) {
+        (stamp, id.to_string(), mb * 1024 * 1024)
+    }
+
+    /// Small transcripts (a few hundred KB) are cheap: the count cap is what
+    /// keeps the parking lot tidy.
+    #[test]
+    fn count_cap_evicts_the_oldest_small_transcripts() {
+        let idle = vec![
+            parked(1, "a", 1),
+            parked(2, "b", 1),
+            parked(3, "c", 1),
+            parked(4, "d", 1),
+            parked(5, "e", 1),
+        ];
+        let evicted = idle_share_evictions(idle, 4, 24 * 1024 * 1024);
+        assert_eq!(evicted, vec!["a".to_string()]);
+    }
+
+    /// Four big transcripts are what made browsing expensive: the byte budget
+    /// evicts them oldest-first long before the count cap is reached.
+    #[test]
+    fn byte_budget_evicts_oldest_large_transcripts() {
+        let idle = vec![
+            parked(1, "old", 15),
+            parked(2, "mid", 15),
+            parked(3, "new", 15),
+        ];
+        let evicted = idle_share_evictions(idle, 4, 24 * 1024 * 1024);
+        assert_eq!(
+            evicted,
+            vec!["old".to_string(), "mid".to_string()],
+            "24MB budget must leave exactly the newest 15MB transcript"
+        );
+    }
+
+    /// Keeping at least one transcript means switch-back is a hash lookup; an
+    /// over-budget newest transcript still survives alone.
+    #[test]
+    fn the_newest_transcript_survives_alone() {
+        let idle = vec![parked(1, "tiny", 0), parked(2, "huge", 40)];
+        let evicted = idle_share_evictions(idle, 4, 24 * 1024 * 1024);
+        assert_eq!(evicted, vec!["tiny".to_string()]);
+    }
+
+    /// A single parked transcript is never evicted, so the trim can run on
+    /// every switch without emptying the parking lot.
+    #[test]
+    fn a_single_parked_transcript_is_kept() {
+        let idle = vec![parked(1, "only", 64)];
+        assert!(idle_share_evictions(idle, 4, 24 * 1024 * 1024).is_empty());
+    }
 }

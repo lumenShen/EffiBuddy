@@ -1,14 +1,13 @@
-//! Computer-use UI: the floating control bar and the composer hint.
+//! Computer-use UI: the floating control bar.
 //!
 //! The runtime lives in `effibuddy-computer`. Permission is *not* decided here:
 //! `computer` is a regular tool (`ToolClass::Device`) and the session's
 //! `PermissionMode` approves or denies it, for the main agent and for subagents
-//! alike. This module only renders the takeover/stop bar and the composer chip.
+//! alike. This module only renders the takeover/stop bar.
 
 use std::sync::Arc;
 
-use effibuddy_agent_core::tool::PermissionMode;
-use effibuddy_computer::{ComputerRuntime, ComputerUseMode, OverlayEvent, OverlayEventKind};
+use effibuddy_computer::{ComputerRuntime, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{Button, ButtonSize, ButtonVariant, Spinner, Theme, dot, shadow_float};
 use gpui::prelude::*;
 use gpui::{AnyElement, Context, IntoElement, Render, SharedString, WeakEntity, Window, div, px};
@@ -166,58 +165,5 @@ impl Render for ComputerOverlayView {
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                     ),
             )
-    }
-}
-
-/// Compact chip text for the composer. The chip only advertises the capability;
-/// whether a call interrupts the user is the permission mode's business, so the
-/// tooltip points at the mode chip instead of promising a consent card.
-pub(crate) fn composer_hint(
-    mode: ComputerUseMode,
-    vision: bool,
-    permission_mode: PermissionMode,
-) -> Option<(&'static str, &'static str)> {
-    if !mode.is_enabled() {
-        return None;
-    }
-    let label = if permission_mode == PermissionMode::FullAccess {
-        "电脑操作已允许 · 完全访问"
-    } else {
-        "电脑操作已开启 · 按键鼠审批"
-    };
-    let tooltip = if vision {
-        "已允许 AI 使用你的电脑键鼠模拟输入；是否弹审批卡由当前权限模式决定。点击打开设置。"
-    } else {
-        "已允许 AI 使用键鼠模拟输入，但当前模型未开启视觉能力，截图无法发给模型；点击打开设置。"
-    };
-    Some((label, tooltip))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hints_follow_the_capability_switch_and_permission_mode() {
-        assert!(composer_hint(ComputerUseMode::Off, true, PermissionMode::Default).is_none());
-        assert_eq!(
-            composer_hint(ComputerUseMode::On, true, PermissionMode::Default)
-                .unwrap()
-                .0,
-            "电脑操作已开启 · 按键鼠审批"
-        );
-        assert_eq!(
-            composer_hint(ComputerUseMode::On, true, PermissionMode::FullAccess)
-                .unwrap()
-                .0,
-            "电脑操作已允许 · 完全访问"
-        );
-        // The vision warning is carried by the tooltip, not by the label.
-        assert!(
-            composer_hint(ComputerUseMode::On, false, PermissionMode::Default)
-                .unwrap()
-                .1
-                .contains("视觉")
-        );
     }
 }

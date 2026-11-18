@@ -8,7 +8,6 @@
 mod agents;
 mod app;
 mod attachments;
-mod browser;
 mod chat;
 mod chat_agent;
 #[cfg(test)]
@@ -44,6 +43,7 @@ mod store;
 #[cfg(feature = "stress")]
 mod stress;
 mod subagent;
+mod thumbs;
 mod update;
 
 use gpui::{

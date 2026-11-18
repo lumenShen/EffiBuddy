@@ -988,7 +988,17 @@ fn get_window(
     mut state: &mut RefMut<WaylandClientState>,
     surface_id: &ObjectId,
 ) -> Option<WaylandWindowStatePtr> {
-    state.windows.get(surface_id).cloned()
+    // A dropped window stays in this table until the deferred close task
+    // removes it, but its wl_surface and Vulkan surface are already gone.
+    // Events that were in flight when it closed (`preferred_scale` from the
+    // compositor, frame callbacks, a configure ack) must not be delivered to
+    // it: the resize path ends in the driver, which segfaults on a destroyed
+    // wayland proxy.
+    state
+        .windows
+        .get(surface_id)
+        .filter(|window| !window.is_destroyed())
+        .cloned()
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {

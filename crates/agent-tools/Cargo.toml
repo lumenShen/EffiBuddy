@@ -15,9 +15,12 @@ effibuddy-browser.workspace = true
 effibuddy-computer.workspace = true
 futures.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+# `webfetch` resolves hostnames itself (tokio::net::lookup_host) so a private
+# address cannot hide behind DNS.
+tokio = { workspace = true, features = ["net"] }
 tokio-util.workspace = true
 
 [features]
@@ -29,4 +32,4 @@ effibuddy-agent-core = { path = "../agent-core", features = ["testing"] }
 effibuddy-browser = { path = "../browser-use", features = ["testing"] }
 effibuddy-computer = { path = "../computer-use", features = ["testing"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tokio = { workspace = true, features = ["rt", "macros", "time", "net", "io-util"] }

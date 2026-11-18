@@ -264,13 +264,24 @@ sequenceDiagram
 
 主会话的审批门是 `ModeApprovalGate`（`agent-core/src/tool.rs`）包装 `BrokerApprovalGate`，`ApprovalGate` trait 与子代理的门不变：
 
-- `ToolClass` 按工具名分类：`read_file` / `list_dir` / `grep` / `todo_write` 只读，`write_file` / `edit_file` 编辑，`shell` / `run_js` / `workflow_run` 命令，`computer` / `browser` 设备类（由 `Tool::risk` 分只读/改写），其余（`agent`、消息类）归 Other；
+- `ToolClass` 按工具名分类：`read_file` / `list_dir` / `grep` / `todo_write` / `webfetch` 只读，`write_file` / `edit_file` 编辑，`shell` / `run_js` / `workflow_run` 命令，`computer` / `browser` 设备类（由 `Tool::risk` 分只读/改写），其余（`agent`、消息类）归 Other；
+- **模式即全部策略**：`FullAccess` 就是用户说「完全别问我」，这一层下面的任何东西——harness、工具的 `execute`——都不得再加一道用户看不见也关不掉的门。工具只声明能力（`approval` / `risk` / `ToolClass`），愿不愿意花掉这些能力只由这个枚举决定。`webfetch` 曾经自己拒绝内网地址，结果让 `FullAccess` 变成空话，而 `shell` 一句 `curl` 又能绕开；正确的修法是删掉那道门而不是把它暴露出来（需要硬墙的宿主用 `WebFetchTool::public_only(true)`，默认关）。`agent-tools` 的 `full_access_approves_every_builtin_tool_without_a_card` 对全部内置工具守住这条契约；
 - 四档 `PermissionMode`（`default` / `accept_edits` / `plan` / `full_access`，Shift+Tab 循环）的本地决策：Default 全转发、AcceptEdits 编辑类本地批准、Plan 编辑/命令/改写类设备动作本地拒绝且只读类（含设备观察）本地放行、FullAccess 全放行（含电脑与浏览器）；本地决策不触达内层门，也不产生审批卡；
 - 模式闭包每次审批请求实时读 `SessionState.permission_mode`，运行中 Shift+Tab 对下一次工具调用即生效；
 - Plan 模式下 harness 对**所有**工具询问审批门，不受 `Auto` 策略与「本会话允许」缓存影响：只读工具零打断，编辑与命令被直接拒绝并附「先出计划」文案，`agent` 等其他类仍弹卡由用户决定；
 - 权限模式贯通整棵智能体树：`HarnessConfig.permission_mode` 携带主会话的模式闭包，子代理 harness 也装 `ModeApprovalGate` 包住自己的 `BrokerApprovalGate`（见 §10），因此主会话切到完全访问后子代理的编辑与命令同样不再弹卡，切到计划模式后子代理也会被本地拒绝。
 
 工具拿到的 `ToolContext` 包含：工作区 `cwd`、会话 id、调用 id、取消令牌，以及可选的 `NestedToolInvoker`（仅 PTC 使用）与 `FileCheckpointSink`（消息编辑/撤销的文件快照）。
+
+### `webfetch`（读一个网页）
+
+实现在 `agent-tools/src/webfetch.rs`，一次调用只发一个 `GET`，没有 cookie、自定义 header 与请求体：
+
+- **没有自己的能力开关**：能不能联网由权限矩阵决定——Default 弹卡（卡片上就是完整 URL）、Plan 当作只读放行、FullAccess 直接过，和 `shell` / `browser` 同一套规则。工具内部再塞一层地址黑名单属于用户看不见也关不掉的门，而且 `shell` 一句 `curl` 就能绕开，所以不做；需要硬墙的部署用 `WebFetchTool::public_only(true)` 显式打开（DNS 解析后判 loopback / 私有段 / link-local / ULA / CGNAT，每一跳重定向都重判）；
+- **只做资源边界，不做政策**：请求 30s（上限 120s）、正文 8MB 流式截断、返回文本默认 20k 字符（上限 100k）、重定向上限 5 跳，取消令牌直接打断请求——这些保护的是上下文窗口和进程，不是替用户做决定；
+- **HTML → 文本**：手写扫描器（不引入 HTML 解析依赖）丢弃 `script` / `style` / `head` / `svg` 等元素与注释，块级元素断行，`h1..h6` 渲染成 `#` 标题，`li` 渲染成 `- `，表格行按 `a | b` 输出，`pre` 去公共缩进并转成围栏代码块，常用 HTML 实体解码，链接输出为 `文本 (绝对 URL)`；空白折叠、连续空行压成一行；
+- **内容类型**：HTML 抽文本、JSON 美化、其余 `text/*` 原样返回，PDF / 图片等二进制直接报错并指向 `browser` 与 `shell`；
+- **提示注入**：页面一律当数据——抽取只产出纯文本，`<script>` 内容、注释和隐藏样式永远不会进 transcript。
 
 ### 文件检查点（消息编辑/撤销）
 
@@ -599,6 +610,8 @@ GPUI 没有跨帧元素复用：每帧都要重建可视区所有元素的树。
 - 自定义 keybindings（Enter 发送、Shift+Enter 换行、方向键、Home/End 等）；
 - `frameless` 模式嵌入 composer 卡片；
 - 提交时先在内部清空内容再把文本交给回调，避免回调里再次读同一实体导致 GPUI 的「already being updated」panic。
+
+**composer 卡片只有两行**（`app.rs::render_composer`）：第一行是输入区，占位文案在左、快捷键提示（`Ctrl K 命令 · / 技能·工具 · @ 文件`，计划模式换成计划提醒、运行中换成排队说明）在右，发送/停止按钮绝对定位在最右侧——文本列用 `pr(34px)` 预留按钮宽度，不会压字。第二行是控件：`+`、权限模式 chip、上下文环、模型 chip。卡片下面不再有第二行提示条：电脑/浏览器能力开关在设置里，是否弹审批由权限模式 chip 表达，同一件事不说两遍。
 
 ### 持久化
 

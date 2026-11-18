@@ -93,6 +93,7 @@ pub struct WaylandWindowState {
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     toplevel: xdg_toplevel::XdgToplevel,
     viewport: Option<wp_viewport::WpViewport>,
+    fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
     globals: Globals,
@@ -117,6 +118,16 @@ pub struct WaylandWindowState {
     in_progress_window_controls: Option<WindowControls>,
     window_controls: WindowControls,
     client_inset: Option<Pixels>,
+    /// Set at the start of `WaylandWindow::drop`. The window leaves the
+    /// client's dispatch table only in a deferred task (so the app's close
+    /// callback still runs first), and the compositor can deliver events
+    /// meant for the window after that point — typically the
+    /// `wp_fractional_scale_v1.preferred_scale` it sends just as the window
+    /// is unmapped. Every one of those paths has to be inert by then: the
+    /// wl_surface and the Vulkan surface it was presenting to are already
+    /// destroyed, and the NVIDIA driver segfaults inside
+    /// `wl_proxy_create_wrapper` when asked to resize a dead surface.
+    destroyed: bool,
 }
 
 pub struct WaylandWindowStatePtr {
@@ -147,6 +158,7 @@ impl WaylandWindowState {
         decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
         appearance: WindowAppearance,
         viewport: Option<wp_viewport::WpViewport>,
+        fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
         client: WaylandClientStatePtr,
         globals: Globals,
         gpu_context: &BladeContext,
@@ -183,6 +195,7 @@ impl WaylandWindowState {
             blur: None,
             toplevel,
             viewport,
+            fractional_scale,
             globals,
             outputs: HashMap::default(),
             display: None,
@@ -207,6 +220,7 @@ impl WaylandWindowState {
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
+            destroyed: false,
         })
     }
 
@@ -260,9 +274,17 @@ impl Drop for WaylandWindow {
         let surface_id = state.surface.id();
         let client = state.client.clone();
 
+        // Before anything is torn down: the window stays addressable from the
+        // client's dispatch table until the deferred task below runs, and an
+        // event already in flight must not reach the surface destroyed next.
+        state.destroyed = true;
+
         state.renderer.destroy();
         if let Some(decoration) = &state.decoration {
             decoration.destroy();
+        }
+        if let Some(fractional_scale) = state.fractional_scale.take() {
+            fractional_scale.destroy();
         }
         if let Some(blur) = &state.blur {
             blur.release();
@@ -319,9 +341,14 @@ impl WaylandWindow {
             toplevel.set_min_size(size.width.0 as i32, size.height.0 as i32);
         }
 
-        if let Some(fractional_scale_manager) = globals.fractional_scale_manager.as_ref() {
-            fractional_scale_manager.get_fractional_scale(&surface, &globals.qh, surface.id());
-        }
+        // Kept in the window state rather than dropped on the floor: the
+        // proxy outlives the window otherwise, so the compositor keeps a
+        // channel into a dead surface and the client never releases the
+        // object. `Drop` destroys it.
+        let fractional_scale = globals
+            .fractional_scale_manager
+            .as_ref()
+            .map(|manager| manager.get_fractional_scale(&surface, &globals.qh, surface.id()));
 
         // Attempt to set up window decorations based on the requested configuration
         let decoration = globals
@@ -345,6 +372,7 @@ impl WaylandWindow {
                 decoration,
                 appearance,
                 viewport,
+                fractional_scale,
                 client,
                 globals,
                 gpu_context,
@@ -378,6 +406,19 @@ impl WaylandWindowStatePtr {
         Rc::ptr_eq(&self.state, &other.state)
     }
 
+    /// `true` once `WaylandWindow::drop` started tearing the window down.
+    /// The client checks this before dispatching: teardown is committed to
+    /// the dispatch table's removal only from a deferred task, so events that
+    /// are already on the wire still resolve to this window. Borrowing rather
+    /// than assuming: a busy state means someone is mid-flight in the window
+    /// (and therefore it has not been dropped).
+    pub(crate) fn is_destroyed(&self) -> bool {
+        self.state
+            .try_borrow()
+            .map(|state| state.destroyed)
+            .unwrap_or(false)
+    }
+
     pub fn frame(&self) {
         let Ok(mut state) = self.state.try_borrow_mut() else {
             // A cycle is already running; its end-of-cycle repair picks up
@@ -385,6 +426,13 @@ impl WaylandWindowStatePtr {
             self.frame_pending.store(false, Ordering::Relaxed);
             return;
         };
+        // The compositor's frame callback can arrive after the window was
+        // dropped: the wl_surface below is gone, so there is nothing to
+        // paint and no proxy left to request a frame on.
+        if state.destroyed {
+            self.frame_pending.store(false, Ordering::Relaxed);
+            return;
+        }
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
         drop(state);
@@ -724,6 +772,14 @@ impl WaylandWindowStatePtr {
     pub fn set_size_and_scale(&self, size: Option<Size<Pixels>>, scale: Option<f32>) {
         let (size, scale) = {
             let mut state = self.state.borrow_mut();
+            // A late `preferred_scale` (or a resize still queued on the
+            // executor) can land after the window was dropped. Resizing the
+            // destroyed Vulkan surface panics in blade with
+            // `ERROR_EXTENSION_NOT_PRESENT`, or takes the NVIDIA driver down
+            // inside `wl_proxy_create_wrapper`.
+            if state.destroyed {
+                return;
+            }
             if size.is_none_or(|size| size == state.bounds.size)
                 && scale.is_none_or(|scale| scale == state.scale)
             {
@@ -766,7 +822,7 @@ impl WaylandWindowStatePtr {
     /// needed here.
     pub fn set_ui_zoom(&self, zoom: f32) {
         let mut state = self.state.borrow_mut();
-        if state.ui_zoom == zoom {
+        if state.destroyed || state.ui_zoom == zoom {
             return;
         }
         state.ui_zoom = zoom;
@@ -938,7 +994,12 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn set_vsync(&self, enabled: bool) {
-        self.0.state.borrow_mut().renderer.update_vsync(enabled);
+        let mut state = self.0.state.borrow_mut();
+        // Reconfigures the swap chain, which needs a live surface.
+        if state.destroyed {
+            return;
+        }
+        state.renderer.update_vsync(enabled);
     }
 
     fn vsync_enabled(&self) -> bool {
@@ -1103,11 +1164,19 @@ impl PlatformWindow for WaylandWindow {
 
     fn draw(&self, scene: &Scene) {
         let mut state = self.borrow_mut();
+        // A frame can still be in flight when the window is being torn down
+        // (the platform window is dropped while GPUI finishes the update).
+        if state.destroyed {
+            return;
+        }
         state.renderer.draw(scene);
     }
 
     fn completed_frame(&self) {
         let state = self.borrow();
+        if state.destroyed {
+            return;
+        }
         state.surface.commit();
     }
 
@@ -1184,6 +1253,11 @@ impl PlatformWindow for WaylandWindow {
 }
 
 fn update_window(mut state: RefMut<WaylandWindowState>) {
+    // Decorations, transparency and the opaque region all end up on the GPU
+    // surface and the wl_surface; a teardown in progress owns both.
+    if state.destroyed {
+        return;
+    }
     let opaque = !state.is_transparent();
 
     state.renderer.update_transparency(!opaque);

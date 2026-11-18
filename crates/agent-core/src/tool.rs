@@ -208,6 +208,21 @@ impl ApprovalGate for BrokerApprovalGate {
 /// Shift+Tab. [`ModeApprovalGate`] turns the mode into approval decisions
 /// without the harness knowing about it: the harness keeps asking the gate for
 /// every `Ask`-policy tool, and the gate decides who to bother.
+///
+/// # The mode is the whole policy
+///
+/// A mode is the user talking to the agent, not a hint. [`PermissionMode::FullAccess`]
+/// literally means "don't ask me": nothing below this layer — not the harness,
+/// not a tool's `execute` — may add a second gate that the user cannot see or
+/// switch off. Tools declare *capabilities* ([`Tool::approval`], [`Tool::risk`],
+/// [`ToolClass`]); deciding whether the user is willing to spend them is this
+/// enum's job alone.
+///
+/// The failure this rule prevents has happened: `webfetch` once refused
+/// loopback/private URLs on its own, which made `FullAccess` a lie and could be
+/// bypassed with `shell` anyway. The fix was to delete that gate, not to expose
+/// it — an opt-in `WebFetchTool::public_only` remains for hosts that want a
+/// wall, off by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
@@ -219,7 +234,9 @@ pub enum PermissionMode {
     /// Read-only research. Edits and commands are denied up front so the model
     /// produces a plan instead of acting.
     Plan,
-    /// Approve everything. Minimizes interruptions for trusted runs.
+    /// Approve everything, including what [`ToolRisk::Mutating`] would otherwise
+    /// deny. The user has said "don't ask me": tools must not second-guess it
+    /// with a policy of their own (see the type-level note above).
     FullAccess,
 }
 
@@ -261,7 +278,7 @@ pub enum ToolClass {
 impl ToolClass {
     pub fn of_tool_name(name: &str) -> Self {
         match name {
-            "read_file" | "list_dir" | "grep" | "todo_write" => ToolClass::ReadOnly,
+            "read_file" | "list_dir" | "grep" | "todo_write" | "webfetch" => ToolClass::ReadOnly,
             "write_file" | "edit_file" => ToolClass::Edit,
             "shell" | "run_js" | "workflow_run" => ToolClass::Command,
             "computer" | "browser" => ToolClass::Device,
@@ -446,6 +463,15 @@ pub trait Tool: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters(&self) -> Value;
+
+    /// Whether this capability needs a consent card at all.
+    ///
+    /// This declares *what the tool needs*, never *who is allowed*: the session
+    /// [`PermissionMode`] decides that, and it is the only layer that may.
+    /// A tool must not bury its own policy inside `execute` (refusing targets a
+    /// mode would allow, hiding an approval, capping a capability) — such a
+    /// gate is invisible to the user, cannot be switched off, and makes
+    /// [`PermissionMode::FullAccess`] a promise the app does not keep.
     fn approval(&self) -> ApprovalPolicy {
         ApprovalPolicy::Auto
     }
@@ -639,6 +665,7 @@ mod tests {
         assert_eq!(ToolClass::of_tool_name("list_dir"), ToolClass::ReadOnly);
         assert_eq!(ToolClass::of_tool_name("grep"), ToolClass::ReadOnly);
         assert_eq!(ToolClass::of_tool_name("todo_write"), ToolClass::ReadOnly);
+        assert_eq!(ToolClass::of_tool_name("webfetch"), ToolClass::ReadOnly);
         assert_eq!(ToolClass::of_tool_name("write_file"), ToolClass::Edit);
         assert_eq!(ToolClass::of_tool_name("edit_file"), ToolClass::Edit);
         assert_eq!(ToolClass::of_tool_name("shell"), ToolClass::Command);
@@ -704,6 +731,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_access_approves_webfetch_without_a_card() {
+        // The tool must not add a policy layer of its own: with the user on
+        // FullAccess a fetch goes straight through, local targets included.
+        let (gate, inner) = mode_gate(
+            PermissionMode::FullAccess,
+            Arc::new(CountingGate::new(ApprovalDecision::Deny)),
+        );
+        assert_eq!(
+            gate.request_approval(request("webfetch")).await,
+            ApprovalDecision::Approve
+        );
+        assert_eq!(inner.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn default_mode_still_asks_before_webfetch() {
+        // ...and in Default mode the URL shows up on a normal consent card.
+        let (gate, inner) = mode_gate(
+            PermissionMode::Default,
+            Arc::new(CountingGate::new(ApprovalDecision::ApproveForSession)),
+        );
+        assert_eq!(
+            gate.request_approval(request("webfetch")).await,
+            ApprovalDecision::ApproveForSession
+        );
+        assert_eq!(inner.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn default_and_accept_edits_still_ask_for_device_control() {
         for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             let (gate, inner) = mode_gate(
@@ -742,7 +798,7 @@ mod tests {
             Arc::new(CountingGate::new(ApprovalDecision::Approve)),
         );
         // Read-only research runs without prompting in Plan mode.
-        for tool in ["read_file", "list_dir", "grep", "todo_write"] {
+        for tool in ["read_file", "list_dir", "grep", "todo_write", "webfetch"] {
             assert_eq!(
                 gate.request_approval(request(tool)).await,
                 ApprovalDecision::Approve,

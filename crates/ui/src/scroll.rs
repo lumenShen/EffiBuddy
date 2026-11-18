@@ -365,7 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn external_movement_cancels_the_glide() {
+    fn external_offset_is_adopted_instead_of_cancelling() {
+        // A scrollbar drag or a layout snap moved the viewport behind the
+        // glide's back. `tick_at` adopts the read-back position instead of
+        // cancelling: cancelling here used to discard every accumulated wheel
+        // notch (flick ten times, move one notch). Movements that really are
+        // external call `cancel` explicitly — see `explicit_cancel_stops_the_glide`.
         let start = Instant::now();
         let mut glide = ScrollGlide::new();
         glide.wheel(-100.0, 0.0, 1_000.0);
@@ -373,12 +378,45 @@ mod tests {
             glide.tick_at(start, 0.0, 1_000.0),
             GlideTick::Continue
         ));
-        // A scrollbar drag moved the viewport behind the glide's back.
+
+        // 500 is nowhere near what the glide asked for; it is adopted as the
+        // new position and the chase continues.
+        let GlideTick::Step(delta) =
+            glide.tick_at(start + Duration::from_millis(16), 500.0, 1_000.0)
+        else {
+            panic!("glide must keep chasing after adopting an external offset");
+        };
+        assert!(delta < 0.0, "should head back to the wheel target: {delta}");
+        assert!(glide.active());
+
+        // ...and it lands on the wheel's target (100), not on the adopted 500.
+        let mut offset = 500.0;
+        for frame in 2..=600 {
+            let now = start + Duration::from_millis(16 * frame);
+            match glide.tick_at(now, offset, 1_000.0) {
+                GlideTick::Step(step) => offset += step,
+                GlideTick::Done { delta, .. } => {
+                    offset += delta;
+                    break;
+                }
+                other => panic!("glide ended unexpectedly: {other:?}"),
+            }
+        }
+        assert!((offset - 100.0).abs() < 1.5, "landed at {offset}");
+        assert!(!glide.active());
+    }
+
+    #[test]
+    fn explicit_cancel_stops_the_glide() {
+        let mut glide = ScrollGlide::new();
+        glide.wheel(-100.0, 0.0, 1_000.0);
+        assert!(glide.active());
+        glide.cancel();
+        assert!(!glide.active());
         assert!(matches!(
-            glide.tick_at(start + Duration::from_millis(16), 500.0, 1_000.0),
+            glide.tick_at(Instant::now(), 0.0, 1_000.0),
             GlideTick::Cancelled
         ));
-        assert!(!glide.active());
     }
 
     #[test]

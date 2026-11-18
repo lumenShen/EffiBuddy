@@ -161,6 +161,11 @@ pub(crate) struct ChatViewState {
     /// Lazily decoded tool-result rasters, keyed `call_id:index` (shared with
     /// the chat list so session switches drop the memory).
     pub tool_images: ImageCache,
+    /// Conversation these rows belong to: its thumbnails live in
+    /// `<data dir>/thumbs/<session id>/` (see [`crate::thumbs`]).
+    pub session_id: SharedString,
+    /// Downscale queue for rasters too large to hand to the renderer as-is.
+    pub thumbs: Rc<RefCell<ThumbnailState>>,
     /// Set by the rail after a jump: the target user bubble paints a one-shot
     /// accent border so the destination is obvious in a long transcript.
     pub jump_flash: Option<JumpFlash>,
@@ -520,6 +525,10 @@ pub(crate) struct ChatList {
     workspace: PathBuf,
     /// Decoded tool-result images, created lazily at render time.
     tool_images: ImageCache,
+    /// Conversation the current transcript belongs to (thumbnail directory).
+    session_id: SharedString,
+    /// Rasters waiting for a background downscale, shared with the view.
+    thumbs: Rc<RefCell<ThumbnailState>>,
     /// One mark per user query for the left-edge rail, in transcript order.
     prompt_marks: Rc<Vec<PromptMark>>,
     /// `item_ix → first virtual slot`, rebuilt with the slot plan. Jumping is
@@ -591,6 +600,8 @@ impl ChatList {
             code_scrolls: Rc::new(RefCell::new(HashMap::new())),
             workspace: PathBuf::new(),
             tool_images: Rc::new(RefCell::new(ImageCacheInner::default())),
+            session_id: SharedString::default(),
+            thumbs: Rc::new(RefCell::new(ThumbnailState::default())),
             prompt_marks: Rc::new(Vec::new()),
             first_slots: Vec::new(),
             plan_cache: None,
@@ -657,6 +668,8 @@ impl ChatList {
         // and release its contents, so the decoded pixels can be handed back
         // to GPUI's asset cache by the next frame.
         self.tool_images.borrow_mut().release_all();
+        // Queued downscales belong to the transcript leaving the screen.
+        self.thumbs.borrow_mut().cancel_pending();
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
         self.plan_cache = None;
@@ -705,6 +718,9 @@ impl ChatList {
         let mut marks: Vec<(&'static str, f64)> = Vec::new();
         let mut t0 = Instant::now();
         self.workspace = session.cwd.clone();
+        if self.session_id.as_ref() != session.id {
+            self.session_id = SharedString::from(session.id.clone());
+        }
         let now = Instant::now();
         let old_items = self.items.clone();
         let old_results = self.results.clone();
@@ -1049,6 +1065,8 @@ impl ChatList {
                 code_scrolls: Rc::clone(&self.code_scrolls),
                 markdown,
                 tool_images: Rc::clone(&self.tool_images),
+                session_id: self.session_id.clone(),
+                thumbs: Rc::clone(&self.thumbs),
                 jump_flash: None,
                 turn_expand_at: Rc::new(self.turn_expand_at.clone()),
                 turn_block_heights: Rc::clone(&self.turn_block_heights),
@@ -1213,6 +1231,8 @@ impl ChatList {
             code_scrolls: Rc::clone(&self.code_scrolls),
             markdown,
             tool_images: Rc::clone(&self.tool_images),
+            session_id: self.session_id.clone(),
+            thumbs: Rc::clone(&self.thumbs),
             jump_flash: None,
             turn_expand_at: Rc::new(self.turn_expand_at.clone()),
             turn_block_heights: Rc::clone(&self.turn_block_heights),
@@ -1229,6 +1249,27 @@ impl ChatList {
     /// from GPUI's asset cache (see [`ImageCacheInner::dropped`]).
     pub fn take_dropped_images(&mut self) -> Vec<Arc<Image>> {
         std::mem::take(&mut self.tool_images.borrow_mut().dropped)
+    }
+
+    /// Downscales the next frame asked for, for the host to run off the UI
+    /// thread (see [`ThumbnailState`]).
+    pub fn take_thumbnail_requests(&mut self) -> Vec<ThumbnailRequest> {
+        std::mem::take(&mut self.thumbs.borrow_mut().requests)
+    }
+
+    /// A built thumbnail: hold it so the next frame paints without touching
+    /// the disk, and charge the raster cache its real size.
+    pub fn thumbnail_ready(&mut self, key: &str, png: Vec<u8>) {
+        self.thumbs.borrow_mut().mark_ready(key);
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+        self.tool_images
+            .borrow_mut()
+            .insert(key.to_string(), Some(image), THUMBNAIL_PIXEL_BYTES);
+    }
+
+    /// No thumbnail for this raster: fall back to drawing it as it came.
+    pub fn thumbnail_unavailable(&mut self, key: &str) {
+        self.thumbs.borrow_mut().mark_unavailable(key);
     }
 
     /// Approximate footprint of this snapshot for the memory diagnostics
@@ -5192,6 +5233,7 @@ fn tool_verb(name: &str) -> &'static str {
         "edit_file" => "编辑",
         "list_dir" => "浏览",
         "grep" => "搜索",
+        "webfetch" => "抓取",
         "shell" => "执行",
         "todo_write" => "计划",
         "run_js" => "运行",
@@ -5256,6 +5298,7 @@ fn tool_icon(name: &str) -> &'static str {
         "read_file" | "write_file" | "edit_file" => icons::FILE,
         "list_dir" => icons::FOLDER,
         "grep" => icons::SEARCH,
+        "webfetch" => icons::GLOBE,
         "todo_write" => icons::CHECK,
         "run_js" => icons::CODE,
         _ => icons::WRENCH,
@@ -5294,6 +5337,11 @@ fn tool_detail(call: &ToolCall) -> String {
                 .map(Vec::len)
                 .unwrap_or(0)
         ),
+        "webfetch" => arguments
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         "run_js" => arguments
             .get("code")
             .and_then(serde_json::Value::as_str)
@@ -5319,6 +5367,78 @@ struct DecodedImage {
     pixel_bytes: u64,
     /// Last use, for LRU eviction.
     used: u64,
+}
+
+/// Rasters above this are shown through a downscaled thumbnail instead of being
+/// handed to the renderer at full size (2 MB ≈ 700×700).
+const THUMBNAIL_MIN_PIXEL_BYTES: u64 = 2 * 1024 * 1024;
+/// Accounting charge for a resident thumbnail: 512×512×4, its upper bound.
+const THUMBNAIL_PIXEL_BYTES: u64 = 1024 * 1024;
+
+/// Work queue for rasters that need a downscaled copy before they can be drawn.
+///
+/// The chat list can only take `&ChatViewState` while building rows, so it
+/// records the request here (shared through an `Rc`, like the image cache) and
+/// the host drains it in `render`, where a background task can be spawned.
+#[derive(Default)]
+pub(crate) struct ThumbnailState {
+    /// Keys already requested, so a 300 Hz frame cannot queue the same work
+    /// twice while the first one is still decoding.
+    pending: HashSet<String>,
+    requests: Vec<ThumbnailRequest>,
+    /// Keys whose downscale failed (a format the image decoder refuses). Those
+    /// render at full size, exactly like before thumbnails existed.
+    unavailable: HashSet<String>,
+}
+
+pub(crate) struct ThumbnailRequest {
+    pub(crate) session_id: String,
+    pub(crate) key: String,
+    /// Base64 payload, owned so the worker never touches the transcript.
+    pub(crate) data: String,
+}
+
+enum Thumb {
+    /// A cached thumbnail, ready to draw.
+    Ready(Vec<u8>),
+    /// Not built yet: keep this frame cheap and ask the host to build one.
+    Pending,
+    /// No thumbnail is possible; draw the raster itself.
+    Unavailable,
+}
+
+impl ThumbnailState {
+    fn thumbnail(&mut self, session_id: &str, key: &str, data: &str) -> Thumb {
+        if self.unavailable.contains(key) {
+            return Thumb::Unavailable;
+        }
+        if let Some(png) = crate::thumbs::cached(session_id, key) {
+            return Thumb::Ready(png);
+        }
+        if self.pending.insert(key.to_string()) {
+            self.requests.push(ThumbnailRequest {
+                session_id: session_id.to_string(),
+                key: key.to_string(),
+                data: data.to_string(),
+            });
+        }
+        Thumb::Pending
+    }
+
+    fn mark_ready(&mut self, key: &str) {
+        self.pending.remove(key);
+    }
+
+    fn mark_unavailable(&mut self, key: &str) {
+        self.pending.remove(key);
+        self.unavailable.insert(key.to_string());
+    }
+
+    /// The transcript leaving the screen owns the queue's entries.
+    fn cancel_pending(&mut self) {
+        self.pending.clear();
+        self.requests.clear();
+    }
 }
 
 /// Budget for decoded rasters. Chosen so a couple of full-screen screenshots
@@ -5497,24 +5617,61 @@ fn encoded_pixel_bytes(format: ImageFormat, bytes: &[u8]) -> Option<u64> {
 fn attachment_image(view: &ChatViewState, attachment: &UserAttachment) -> Option<Arc<Image>> {
     let raster = attachment.image.as_ref()?;
     let key = format!("attachment:{}:{}", attachment.path, raster.data.len());
-    let cached = view.tool_images.borrow_mut().get(&key);
-    if let Some(cached) = cached {
+    let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
+    let pixel_bytes = raster_pixel_bytes(&raster.data, format).unwrap_or(UNKNOWN_IMAGE_BYTES);
+    raster_image(view, key, &raster.data, format, pixel_bytes)
+}
+
+/// Footprint of a base64 raster, read from the header of a short prefix so a
+/// frame never has to decode a megabyte of base64 just to size it. Falls back to
+/// the caller's estimate when the format is not one the header parser knows.
+fn raster_pixel_bytes(base64_data: &str, format: ImageFormat) -> Option<u64> {
+    /// Enough for a PNG/GIF/WebP header and almost every JPEG frame header.
+    const PREFIX_CHARS: usize = 8 * 1024;
+    let end = base64_data.len().min(PREFIX_CHARS) & !3;
+    let prefix = base64::engine::general_purpose::STANDARD
+        .decode(base64_data.get(..end)?)
+        .ok()?;
+    encoded_pixel_bytes(format, &prefix)
+}
+
+/// One decoded or downscaled raster, shared by user attachments and tool
+/// screenshots.
+///
+/// Rasters above [`THUMBNAIL_MIN_PIXEL_BYTES`] are not handed to the renderer
+/// as they came: a 2560×1680 screenshot turns into a 4096² sprite-atlas page
+/// plus a 16 MB decoded copy for a 184×120 card. They go through
+/// [`crate::thumbs`] instead — the frame draws nothing until the downscale
+/// lands, which keeps both the atlas page and the raster cache small.
+fn raster_image(
+    view: &ChatViewState,
+    key: String,
+    base64_data: &str,
+    format: ImageFormat,
+    pixel_bytes: u64,
+) -> Option<Arc<Image>> {
+    if let Some(cached) = view.tool_images.borrow_mut().get(&key) {
         return cached;
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&raster.data)
-        .ok();
-    let pixel_bytes = bytes
-        .as_ref()
-        .and_then(|bytes| {
-            let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
-            encoded_pixel_bytes(format, bytes)
-        })
-        .unwrap_or(UNKNOWN_IMAGE_BYTES);
-    let decoded = bytes.map(|bytes| {
-        let format = ImageFormat::from_mime_type(&raster.mime_type).unwrap_or(ImageFormat::Png);
-        Arc::new(Image::from_bytes(format, bytes))
-    });
+    if pixel_bytes >= THUMBNAIL_MIN_PIXEL_BYTES {
+        let decision = view
+            .thumbs
+            .borrow_mut()
+            .thumbnail(&view.session_id, &key, base64_data);
+        match decision {
+            Thumb::Ready(png) => {
+                let image = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+                cache_decoded_image(view, key, Some(image.clone()), THUMBNAIL_PIXEL_BYTES);
+                return Some(image);
+            }
+            Thumb::Pending => return None,
+            Thumb::Unavailable => {}
+        }
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .ok()
+        .map(|bytes| Arc::new(Image::from_bytes(format, bytes)));
     cache_decoded_image(view, key, decoded.clone(), pixel_bytes);
     decoded
 }
@@ -5529,22 +5686,10 @@ fn tool_image(
     index: usize,
 ) -> Option<Arc<Image>> {
     let key = format!("{call_id}:{index}");
-    let cached = view.tool_images.borrow_mut().get(&key);
-    if let Some(cached) = cached {
-        return cached;
-    }
     let source = result.images.get(index)?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&source.data)
-        .ok();
     let format = ImageFormat::from_mime_type(&source.mime_type).unwrap_or(ImageFormat::Png);
-    let pixel_bytes = bytes
-        .as_ref()
-        .and_then(|bytes| encoded_pixel_bytes(format, bytes))
-        .unwrap_or(UNKNOWN_IMAGE_BYTES);
-    let decoded = bytes.map(|bytes| Arc::new(Image::from_bytes(format, bytes)));
-    cache_decoded_image(view, key, decoded.clone(), pixel_bytes);
-    decoded
+    let pixel_bytes = raster_pixel_bytes(&source.data, format).unwrap_or(UNKNOWN_IMAGE_BYTES);
+    raster_image(view, key, &source.data, format, pixel_bytes)
 }
 
 fn render_tool_images(
