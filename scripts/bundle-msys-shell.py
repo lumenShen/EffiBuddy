@@ -23,13 +23,25 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 # Canonical repository (no mirror redirect: `mirror.msys2.org` bounces to
 # third-party mirrors whose TLS chains vary by geography and can be stale).
-MIRROR = "https://repo.msys2.org/msys/x86_64"
+# The alternates are tried only after the canonical host refuses (GitHub runners
+# do get 403s from it when its CDN throttles a shared IP range).
+MIRRORS = [
+    "https://repo.msys2.org/msys/x86_64",
+    "https://mirror.msys2.org/msys/x86_64",
+]
+MIRROR = MIRRORS[0]
 DB_NAME = "msys.db.tar.zst"
+# A 403/429/5xx from the CDN is usually momentary backpressure, not a missing
+# file, so each mirror gets a few attempts with exponential backoff before the
+# script gives up.
+DOWNLOAD_ATTEMPTS = 4
 
 # bash 的 DEPENDS 元数据为空（msys2-runtime 被视作基础包），所以显式列出它。
 ROOT_PACKAGES = [
@@ -73,6 +85,32 @@ def download(url: str) -> bytes:
         return response.read()
 
 
+def download_package_rooted(path: str) -> bytes:
+    """Fetch `path` from the MSYS2 package repository.
+
+    GitHub runners regularly get `403 Forbidden` from the CDN that fronts
+    `repo.msys2.org`; a plain one-shot GET then fails the whole Windows job (and
+    with it the release, because publishing needs every platform). Retry with
+    backoff, then fall back to the mirror redirect before giving up.
+    """
+    errors: list[str] = []
+    for base in MIRRORS:
+        for attempt in range(DOWNLOAD_ATTEMPTS):
+            if attempt:
+                time.sleep(min(2**attempt, 20))
+            url = f"{base}/{path}"
+            try:
+                return download(url)
+            except urllib.error.HTTPError as error:
+                errors.append(f"{url} -> {error.code} {error.reason}")
+                # A 404 is a real answer: that mirror does not carry the file.
+                if error.code == 404:
+                    break
+            except OSError as error:  # timeouts, resets, DNS hiccups
+                errors.append(f"{url} -> {error}")
+    raise SystemExit("cannot download from the MSYS2 repository:\n" + "\n".join(errors))
+
+
 def zstd_decompress(data: bytes) -> bytes:
     # Windows runners ship zstd.exe; using the CLI keeps this script on the
     # standard library (compression.zstd only exists in Python 3.14+).
@@ -105,7 +143,7 @@ def first(fields: dict[str, list[str]], key: str) -> str:
 
 
 def load_database() -> dict[str, dict[str, object]]:
-    data = download(f"{MIRROR}/{DB_NAME}")
+    data = download_package_rooted(DB_NAME)
     packages: dict[str, dict[str, object]] = {}
     with tarfile.open(fileobj=io.BytesIO(zstd_decompress(data))) as archive:
         for member in archive.getmembers():
@@ -179,7 +217,7 @@ def resolve(packages: dict[str, dict[str, object]]) -> dict[str, dict[str, objec
 
 def fetch_package(meta: dict[str, object]) -> bytes:
     filename = str(meta["filename"])
-    data = download(f"{MIRROR}/{filename}")
+    data = download_package_rooted(filename)
     expected = str(meta.get("sha256") or "")
     digest = hashlib.sha256(data).hexdigest()
     if expected and digest != expected:
