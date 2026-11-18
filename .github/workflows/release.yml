@@ -243,7 +243,32 @@ jobs:
           }
 
       - name: 打包随包 bash（MSYS2）
-        run: python scripts/bundle-msys-shell.py runtime/msys
+        shell: pwsh
+        run: |
+          python scripts/bundle-msys-shell.py runtime/msys 2>&1 | Tee-Object -FilePath msys.log
+          if ($LASTEXITCODE -ne 0) {
+            $tail = (Get-Content msys.log -Tail 30) -join "%0A"
+            Write-Host "::error title=MSYS2 打包失败::$tail"
+            exit 1
+          }
+
+      # 失败时把仓库连通性单独打出来：这一步挂过几次都是网络/仓库侧的问题，
+      # 而 python 的 traceback 只有拉到 job 日志才看得到，annotation 一眼可见。
+      - name: MSYS2 仓库连通性诊断
+        if: failure()
+        shell: pwsh
+        run: |
+          foreach ($url in @(
+            "https://repo.msys2.org/msys/x86_64/msys.db.tar.zst",
+            "https://mirror.msys2.org/msys/x86_64/msys.db.tar.zst"
+          )) {
+            try {
+              $r = Invoke-WebRequest -Uri $url -Method Head -TimeoutSec 30 -ErrorAction Stop
+              Write-Host "::warning title=MSYS2 reachability::$url -> $($r.StatusCode)"
+            } catch {
+              Write-Host "::warning title=MSYS2 reachability::$url -> $($_.Exception.Message)"
+            }
+          }
 
       - name: 构建
         shell: pwsh
