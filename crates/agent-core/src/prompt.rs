@@ -132,7 +132,7 @@ The desktop composer lets the user insert compact references into a message. The
 - `$skill-name` activates a skill. Its full instructions arrive as an attached `<skill>` block in the same user message; follow that skill.
 - `@agent-name` where the name matches an agent type listed above means the user explicitly wants that agent to handle the task. Delegate with the `agent` tool (`subagent_type`); if that agent is already running, address it with `agent_send`.
 - `/tool-name` means the user explicitly requested that tool. Prefer it when it fits the task instead of a different tool.
-Attached files arrive in a `<user-attachments>` block before the user's text, with their contents inlined when they are text. Treat them as supplied context. Images are also saved inside the workspace: an `<image>` path can be revisited or processed with tools (for example the shell tool) in a later step."#,
+Attached files arrive in a `<user-attachments>` block before the user's text, with their contents inlined when they are text. Treat them as supplied context. Images are also saved inside the workspace: an `<image>` path can be revisited in a later step (`read_file` hands the image back as an image part when the model can see images) and processed there with other tools such as the shell."#,
     );
 
     let extra = ctx.extra.trim();

@@ -1920,9 +1920,27 @@ impl crate::tool::NestedToolInvoker for NestedInvoker {
         if result.is_error {
             Err(format!("`{}` failed: {}", result.name, result.content))
         } else {
-            Ok(result.content)
+            Ok(nested_observation(&result))
         }
     }
+}
+
+/// Observation text a nested (PTC) tool call hands back to the script.
+///
+/// A script cannot see rasters, so an image-bearing result is annotated: the
+/// tool text may claim the image was attached, and returning it verbatim would
+/// let the program believe it received the pixels.
+fn nested_observation(result: &ToolResult) -> String {
+    if result.images.is_empty() {
+        return result.content.clone();
+    }
+    format!(
+        "{}\n\n[{} image(s) were returned by this tool call but are not visible through \
+         `run_js`. Call `{}` directly if you need to look at them.]",
+        result.content,
+        result.images.len(),
+        result.name
+    )
 }
 
 enum ToolRunFailure {
@@ -1956,6 +1974,28 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::mpsc::UnboundedReceiver;
+
+    #[test]
+    fn nested_observation_flags_images_a_script_cannot_see() {
+        use crate::message::ImageAttachment;
+
+        let call = ToolCall::new("read_file", json!({"path": "logo.png"}));
+        let text_only = ToolResult::success(&call, "plain");
+        assert_eq!(nested_observation(&text_only), "plain");
+
+        let with_image = ToolResult::success(&call, "logo.png attached")
+            .with_images(vec![ImageAttachment::png("YQ==", 10, 10)]);
+        let observation = nested_observation(&with_image);
+        assert!(
+            observation.starts_with("logo.png attached"),
+            "{observation}"
+        );
+        assert!(observation.contains("1 image(s)"), "{observation}");
+        assert!(
+            observation.contains("Call `read_file` directly"),
+            "{observation}"
+        );
+    }
 
     /// Fails the first request after streaming a partial reasoning block (the
     /// shape of a dropped SSE connection), then answers normally. Used to pin

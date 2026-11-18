@@ -70,9 +70,23 @@ pub fn builtin_tools_with_roots(
     primary: impl Into<PathBuf>,
     additional: &[PathBuf],
 ) -> Result<ToolRegistry, ToolError> {
+    builtin_tools_with_vision(primary, additional, false)
+}
+
+/// Like [`builtin_tools_with_roots`], but `read_file` can also hand image files
+/// back as model-visible image parts.
+///
+/// Hosts pass the selected model's vision capability: a model that cannot see
+/// images must not receive them, so `read_file` describes an image instead of
+/// attaching it.
+pub fn builtin_tools_with_vision(
+    primary: impl Into<PathBuf>,
+    additional: &[PathBuf],
+    vision: bool,
+) -> Result<ToolRegistry, ToolError> {
     let workspace = Workspace::with_roots(primary, additional)?;
     let mut registry = ToolRegistry::new();
-    registry.register(ReadFileTool::new(workspace.clone()));
+    registry.register(ReadFileTool::new(workspace.clone()).with_vision(vision));
     registry.register(WriteFileTool::new(workspace.clone()));
     registry.register(EditFileTool::new(workspace.clone()));
     registry.register(ListDirTool::new(workspace.clone()));
@@ -232,6 +246,66 @@ mod tests {
             )
             .await;
         assert!(escape.is_err());
+    }
+
+    /// A PNG signature plus an `IHDR` chunk is enough for `read_file` to treat
+    /// the file as an image; the tool never decodes pixels.
+    fn png_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes
+    }
+
+    #[tokio::test]
+    async fn read_file_attaches_image_parts_for_vision_models() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("shot.png"), png_header(1920, 1080)).unwrap();
+
+        let registry = builtin_tools_with_vision(directory.path(), &[], true).unwrap();
+        let output = registry
+            .get("read_file")
+            .unwrap()
+            .execute(context(None), json!({"path": "shot.png"}))
+            .await
+            .unwrap();
+        assert_eq!(output.images.len(), 1, "{}", output.content);
+        assert_eq!(output.images[0].mime_type, "image/png");
+        assert_eq!(
+            (output.images[0].width, output.images[0].height),
+            (1920, 1080)
+        );
+        assert!(output.content.contains("1920x1080"), "{}", output.content);
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&output.images[0].data)
+            .unwrap();
+        assert_eq!(decoded, png_header(1920, 1080));
+    }
+
+    #[tokio::test]
+    async fn read_file_describes_images_for_text_only_models() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("shot.png"), png_header(640, 480)).unwrap();
+
+        // `builtin_tools` stays text-only: no image part reaches the provider…
+        let registry = builtin_tools(directory.path()).unwrap();
+        let output = registry
+            .get("read_file")
+            .unwrap()
+            .execute(context(None), json!({"path": "shot.png"}))
+            .await
+            .unwrap();
+        assert!(output.images.is_empty());
+        assert!(
+            output.content.contains("cannot see images"),
+            "{}",
+            output.content
+        );
+        assert!(output.content.contains("640x480"), "{}", output.content);
+        assert!(!output.is_error);
     }
 
     #[tokio::test]

@@ -239,9 +239,9 @@ fn render_user_attachments(attachments: &[UserAttachment]) -> (String, Vec<Image
         "</user-attachments>\n\
          The user attached these items to the message. Treat their contents as part of the \
          request. Files without inline content are on disk; read them with tools if needed. \
-         An image whose path points inside the workspace can be revisited or processed there \
-         (for example with the shell tool; `read_file` only returns text) when you need the \
-         image again in a later step.\n\n",
+         An image whose path points inside the workspace can be looked at again in a later \
+         step: `read_file` returns image files as image parts, and the shell tool can process \
+         them.\n\n",
     );
     (text, images)
 }
@@ -350,6 +350,10 @@ pub fn build_chat_messages(session: &SessionState, system_prompt: &str) -> Vec<C
     messages
 }
 
+/// Flush pending tool images as one user message after the tool-result run.
+///
+/// The wording has to cover both sources: screenshots (whose `frame_id` the
+/// next device action refers to) and image files read with `read_file`.
 fn flush_tool_images(
     messages: &mut Vec<ChatMessage>,
     pending: &mut Vec<(String, Vec<ImageAttachment>)>,
@@ -361,8 +365,9 @@ fn flush_tool_images(
     let images: Vec<ImageAttachment> = pending.drain(..).flat_map(|(_, images)| images).collect();
     messages.push(ChatMessage::user_with_images(
         format!(
-            "Image output for tool call(s) {}. These are the pixels the next computer action \
-             coordinates refer to; always use the frame_id returned with the screenshot.",
+            "Image output for tool call(s) {}. Screenshots are the pixels the next computer \
+             action coordinates refer to: always use the frame_id returned with the capture. \
+             Images read from files are the file contents themselves.",
             call_ids.join(", ")
         ),
         images,
@@ -1310,7 +1315,7 @@ mod tests {
         assert!(user.content.contains("fn main() {}"));
         assert!(user.content.contains("<skill name=\"review\""));
         assert!(user.content.contains("be strict"));
-        assert!(user.content.contains("can be revisited or processed there"));
+        assert!(user.content.contains("can be looked at again in a later"));
         assert!(user.content.ends_with("看看这两个"));
         assert_eq!(user.images.len(), 1);
     }

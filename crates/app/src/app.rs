@@ -17,7 +17,7 @@ use effibuddy_agent_core::{
     SubagentProfile, SubagentReport, SubagentSpawner, SubagentStatus, TodoStatus, ToolCall,
     ToolResult, Usage, UserAttachment, lock_session, new_shared_session,
 };
-use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_roots};
+use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_vision};
 use effibuddy_computer::{ComputerUseMode, OverlayEvent, OverlayEventKind};
 use effibuddy_ui::{
     BadgeTone, Button, ButtonSize, ButtonVariant, CONTROL_MOTION, IconButton, MotionController,
@@ -2837,7 +2837,11 @@ impl AppView {
         // tool execution happens, so the registry is only measured. It mirrors
         // the run path so the estimate matches what a real request would cost.
         let (workspace, additional_workspaces) = self.workspace_roots_for_session(&shared);
-        let mut tools = match builtin_tools_with_roots(&workspace, &additional_workspaces) {
+        let mut tools = match builtin_tools_with_vision(
+            &workspace,
+            &additional_workspaces,
+            resolved.model.capabilities.vision,
+        ) {
             Ok(tools) => tools,
             Err(error) => {
                 self.last_error = Some(format!("无法打开工作区 {}：{error}", workspace.display()));
@@ -3662,7 +3666,11 @@ impl AppView {
                 }
             }
         };
-        let mut tools = match builtin_tools_with_roots(&workspace, &additional_workspaces) {
+        let mut tools = match builtin_tools_with_vision(
+            &workspace,
+            &additional_workspaces,
+            resolved.model.capabilities.vision,
+        ) {
             Ok(tools) => tools,
             Err(error) => {
                 self.note_session_error(
@@ -3688,7 +3696,7 @@ impl AppView {
         // and by `child_tools()` for children when the capability is on.
         // Uploads reuse the same workspace sandbox as file tools.
         if self.config.browser_use_mode.is_enabled() {
-            // `builtin_tools_with_roots` already validated the workspace, so
+            // `builtin_tools_with_vision` already validated the workspace, so
             // this reuses the same roots for upload sandboxing.
             if let Ok(sandbox) = Workspace::with_roots(&workspace, &additional_workspaces) {
                 tools.register(BrowserTool::new(

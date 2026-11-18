@@ -20,7 +20,7 @@ use effibuddy_agent_core::{
     SubagentReport, SubagentRequest, SubagentSpawner, SubagentStatus, ToolError, ToolRegistry,
     extract_json_value, lock_session, new_shared_session, validate_json,
 };
-use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_roots};
+use effibuddy_agent_tools::{BrowserTool, ComputerTool, Workspace, builtin_tools_with_vision};
 use effibuddy_browser::BrowserRuntime;
 use effibuddy_computer::ComputerRuntime;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -381,7 +381,7 @@ impl SubagentService {
         vision: bool,
     ) -> Result<ToolRegistry, ToolError> {
         let mut registry =
-            builtin_tools_with_roots(&request.workspace, &request.additional_workspaces)?;
+            builtin_tools_with_vision(&request.workspace, &request.additional_workspaces, vision)?;
         // Device tools are ordinary tools: register them for children whenever
         // the capability is on. `filtered()` below then applies the profile
         // allow/deny lists and the read-only contract exactly as for files.

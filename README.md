@@ -117,6 +117,8 @@ cargo run -p effibuddy-app -- --settings                    # 设置 → 通用
 
 文件工具被限制在工作区内；写文件、改文件、shell、`computer` 与 `browser` 都走同一套权限矩阵：默认询问、计划模式只放行只读动作、完全访问直接放行（主代理与子代理一致）。`webfetch` 是只读能力（默认仍询问一次），没有自己的地址黑名单：能不能联网由权限矩阵决定，和 `shell` / `browser` 一致；需要硬墙的宿主可以 `WebFetchTool::public_only(true)`。
 
+`read_file` 不只读文本：PNG / JPEG / GIF / WebP / BMP 会被当成图片上传进会话（`ToolOutput::images`，和截图同一条通道），模型能直接看到像素；选中的模型不支持视觉时则返回格式、尺寸与大小说明，不会把图片错当二进制文件报错。宿主用 `builtin_tools_with_vision(..., vision)` 按模型能力打开这项功能，`builtin_tools*` 默认保持纯文本。
+
 ## 工作区结构
 
 ```text
@@ -157,7 +159,7 @@ cargo build --workspace
 - 写文件、改文件、shell、电脑操作与浏览器操作默认需要显式批准；审批超时按拒绝处理。
 - Wayland 仅支持全屏读图/输入；macOS 发布包未签名，且暂不支持 Computer Use。
 - 默认 DeepSeek 模型不支持视觉输入，使用 Computer Use 截图前需要切换到支持图片的模型。
-- 项目仍在早期（0.2.12），接口与数据格式可能变化。
+- 项目仍在早期（0.2.13），接口与数据格式可能变化。
 
 ## 许可证
 

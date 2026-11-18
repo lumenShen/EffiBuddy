@@ -801,3 +801,5 @@ CdpConnection（protocol）→ WebSocket → Chromium DevTools
 ### 图片管线
 
 `ToolOutput.images` → `ToolResult.images`（绕过文本截断）→ `context::build_chat_messages` 把连续 tool 结果之后的图片合并成一条 user 消息（避免 OpenAI 在多个 tool 消息之间插入 user 消息）→ 三种 provider 分别序列化为 `image_url` / Anthropic `image` / Responses `input_image`。token 估算按像素计入。模型无视觉能力时截图落盘并返回路径。
+
+同一个通道也服务文件读取：`read_file` 按魔数识别 PNG / JPEG / GIF / WebP / BMP，仅解析文件头取尺寸（不解码像素），把原字节 base64 后作为图像部件随 tool 结果返回；`ReadFileTool::with_vision(false)`（`builtin_tools*` 的默认）改为返回格式 / 尺寸 / 大小说明。`run_js` 的嵌套调用只回传文本，因此带图结果会附一句"脚本看不到图片，请直接调用该工具"。
