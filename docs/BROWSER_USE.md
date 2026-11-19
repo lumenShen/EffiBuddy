@@ -79,6 +79,7 @@ page: 登录 | https://app.test/login | 6 nodes
 | `tabs` / `new_tab` / `select_tab` / `close_tab` | 标签页管理；`new_tab` / `select_tab` 会把该标签页设为本会话的标签页。 |
 | `eval` | 在页面域执行 JS（高危，见下）；`timeout_ms` 到点后返回**已有输出**而不是整段丢弃；`await=true`（默认）等待返回的 Promise。 |
 | `end_session` | 关闭本会话的标签页并清理会话；只有最后一个会话才会关闭浏览器进程。 |
+| `fresh_profile` | 用一次性 profile 重启浏览器（默认是一个共享 profile，见第 5 节）；其它会话仍持有标签页时会被拒绝。 |
 
 ### 会话与标签页
 
@@ -234,10 +235,21 @@ page: 登录 | https://app.test/login | 6 nodes
 端口从 `<profile>/DevToolsActivePort` 读取，避免固定端口冲突。启动前清理上次崩溃遗留的
 `SingletonLock`。应用退出或 `end_session` 会关闭浏览器进程。
 
-**profile 是持久的**（`<数据目录>/browser/profiles/<引擎>-default`）：浏览器中途崩溃或重启后，
-登录态、cookie、localStorage 都还在，长任务不用从头登录。需要干净环境时：
-`EFFIBUDDY_BROWSER_PROFILE_FRESH=1`（每次启动用一次性目录），或用
-`EFFIBUDDY_BROWSER_PROFILE` 指向固定路径。
+**默认只有一份 profile**（`<数据目录>/browser/profiles/<引擎>-default`），而且它是持久的：浏览器
+中途崩溃或重启后，登录态、cookie、localStorage 都还在，长任务不用从头登录。**默认不会为每次启动
+新建副本**，只有下面两种情况才会多出一份：
+
+- 模型显式请求：`browser({action:"fresh_profile"})` —— 把浏览器重启到一次性 profile（全新登录态），
+  这份副本在浏览器关闭时删除，之后的启动回到共享 profile。其它会话还持有标签页时会拒绝，
+  因为重启会连带关掉它们的页。
+- 开发者/测试覆盖：`EFFIBUDDY_BROWSER_PROFILE_FRESH=1`（每次启动一次性目录），或用
+  `EFFIBUDDY_BROWSER_PROFILE` 指向固定路径。
+
+一次性目录是有主的、可回收的：名字形如 `<引擎>-<pid>-<时间戳>`，浏览器正常退出时整个目录会被
+删除；进程被强杀（调试时最常见）留下的副本，会在**下一次启动**时被扫描回收 —— 目录名里的 pid
+已经不存在的副本一律删掉，并且按实际字节数写进 `browser` 的状态 notes。共享的
+`<引擎>-default`、`EFFIBUDDY_BROWSER_PROFILE` 指定的目录，以及名字不符合该形状的目录都不会被碰；
+在 Linux 上用 `/proc/<pid>` 判断存活，其它平台退化成"超过 24 小时未改动才回收"。
 
 ## 6. URL 与文件策略
 
@@ -282,10 +294,15 @@ cargo test -p effibuddy-browser --test live -- --ignored --nocapture
 | --- | --- |
 | `EFFIBUDDY_BROWSER_PATH` | 指定浏览器可执行文件。 |
 | `EFFIBUDDY_BROWSER_PROFILE` | 固定 profile 目录（默认是持久的 `<引擎>-default`）。 |
-| `EFFIBUDDY_BROWSER_PROFILE_FRESH` | `1` 时每次启动用一次性 profile（重置登录态 / 跑测试）。 |
+| `EFFIBUDDY_BROWSER_PROFILE_FRESH` | 开发/测试覆盖：`1` 时每次启动用一次性 profile。模型侧的等价能力是 `fresh_profile` 动作。 |
 | `EFFIBUDDY_BROWSER_ALLOW_FILE` | 允许 `file://`。 |
 
 启动日志写在 `<数据目录>/browser/launch.log`（超过 200KB 自动清空）。
+
+profile 目录不会无限增长：EffiBuddy 启动时和每次启动浏览器前都会扫一遍
+`<数据目录>/browser/profiles/`，回收 owner 进程已消失的一次性副本（单份约 200MB、
+上万个小文件，不回收的话几次调试就能堆到 GB）。想知道回收了什么，看 `browser({action:"status"})`
+的 notes。
 
 ## 9. 稳定性：会话、状态与审批
 
@@ -294,8 +311,9 @@ cargo test -p effibuddy-browser --test live -- --ignored --nocapture
 ### 登录态
 
 profile 持久化（见第 5 节）解决"浏览器重启就要重新登录"：cookie、localStorage、
-IndexedDB 都留在 EffiBuddy 自己的 profile 目录里。需要彻底重置时删掉该目录或设置
-`EFFIBUDDY_BROWSER_PROFILE_FRESH=1`。
+IndexedDB 都留在 EffiBuddy 自己那一份 profile 目录里，默认不会被复制出第二份。需要一次
+"干净的、未登录的"浏览器时用 `browser({action:"fresh_profile"})`（用完即删，共享 profile
+里的登录态不受影响）；要彻底重置共享 profile 就删掉那个目录。
 
 ### 事实：`state` 工具
 

@@ -72,6 +72,10 @@ impl FakeTabs {
 pub struct FakeBrowser {
     tabs: std::sync::Mutex<FakeTabs>,
     init_scripts: std::sync::Mutex<Vec<String>>,
+    /// How many times a throwaway profile was requested. The real backend turns
+    /// this into a one-shot launch flag; the fake only records it so tests can
+    /// prove the tool → runtime → backend plumbing.
+    fresh_profile_requests: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for FakeBrowser {
@@ -79,6 +83,7 @@ impl Default for FakeBrowser {
         Self {
             tabs: std::sync::Mutex::new(FakeTabs::seeded()),
             init_scripts: std::sync::Mutex::new(Vec::new()),
+            fresh_profile_requests: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -105,6 +110,12 @@ impl FakeBrowser {
         self.lock().tabs.iter().map(|tab| tab.id.clone()).collect()
     }
 
+    /// Throwaway-profile requests seen so far (`set_fresh_profile(true)`).
+    pub fn fresh_profile_requests(&self) -> usize {
+        self.fresh_profile_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, FakeTabs> {
         self.tabs
             .lock()
@@ -129,6 +140,13 @@ impl BrowserBackend for FakeBrowser {
 
     async fn ensure_ready(&self) -> Result<PageInfo, BrowserError> {
         Ok(self.lock().page_info())
+    }
+
+    fn set_fresh_profile(&self, fresh: bool) {
+        if fresh {
+            self.fresh_profile_requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     async fn end_session(&self) -> Result<(), BrowserError> {

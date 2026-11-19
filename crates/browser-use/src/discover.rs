@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::types::{BrowserError, EngineKind};
 
@@ -251,6 +251,11 @@ pub struct LaunchedBrowser {
     pub debug_url: String,
     pub port: u16,
     pub profile_dir: PathBuf,
+    /// True when this run owns a throwaway profile copy
+    /// (`EFFIBUDDY_BROWSER_PROFILE_FRESH=1`). Such a copy belongs to nobody
+    /// else, so it is deleted when the browser exits instead of being left
+    /// behind for the next run to trip over.
+    pub disposable_profile: bool,
     pub headless: bool,
     pub notes: Vec<String>,
 }
@@ -265,7 +270,183 @@ impl LaunchedBrowser {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+        if self.disposable_profile {
+            // Reap the child first: Chrome still writes into its profile while
+            // it exits, and a half-deleted profile throws away the whole point
+            // of launching it.
+            self.disposable_profile = false;
+            let dir = self.profile_dir.clone();
+            let moved = dir.clone();
+            if tokio::task::spawn_blocking(move || discard_profile(&moved))
+                .await
+                .is_err()
+            {
+                discard_profile(&dir);
+            }
+        }
     }
+}
+
+/// Delete one throwaway profile directory (best effort, synchronous).
+///
+/// Also used by [`crate::cdp::CdpBackend`]'s drop path, where no runtime is
+/// guaranteed to still be around for an async shutdown.
+pub fn discard_profile(dir: &Path) {
+    if dir.as_os_str().is_empty() {
+        return;
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// What one reclamation sweep removed: for log lines and tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimedProfiles {
+    pub dirs: usize,
+    pub bytes: u64,
+}
+
+impl ReclaimedProfiles {
+    pub fn is_empty(&self) -> bool {
+        self.dirs == 0
+    }
+
+    pub fn describe(&self) -> String {
+        format!(
+            "回收了 {} 个一次性浏览器 profile（{}）",
+            self.dirs,
+            format_bytes(self.bytes)
+        )
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if bytes >= MIB {
+        format!("{} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KB", bytes / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Throwaway profiles nobody has touched for this long are reclaimed even when
+/// the platform cannot cheaply tell whether the owner still runs.
+const DISPOSABLE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Sweep throwaway profiles left behind by runs that died before shutdown.
+///
+/// `EFFIBUDDY_BROWSER_PROFILE_FRESH=1` gives every launch its own copy of a
+/// Chromium profile: a couple of hundred megabytes and thousands of files each,
+/// and nothing else ever deletes them. A debugging afternoon that launches the
+/// app a handful of times therefore leaks gigabytes. The owning pid is part of
+/// the directory name, so a copy whose process is gone can be reclaimed without
+/// guessing — while a copy that is still in use, the shared `<engine>-default`
+/// profile and any user-chosen directory are left alone.
+pub fn reclaim_disposable_profiles() -> ReclaimedProfiles {
+    reclaim_disposable_profiles_in(&profiles_dir(), custom_profile().as_deref())
+}
+
+/// [`reclaim_disposable_profiles`] against an explicit directory.
+///
+/// `protected` is the `EFFIBUDDY_BROWSER_PROFILE` override, which is exempt
+/// even when its name happens to look throwaway-shaped.
+pub(crate) fn reclaim_disposable_profiles_in(
+    dir: &Path,
+    protected: Option<&Path>,
+) -> ReclaimedProfiles {
+    let mut reclaimed = ReclaimedProfiles::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return reclaimed;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if protected.is_some_and(|keep| keep == path) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        // Only names this module generates are candidates: an unrelated
+        // directory a user dropped in here must survive.
+        let Some((_engine, pid, _stamp)) = parse_disposable_name(name) else {
+            continue;
+        };
+        let stale = match process_alive(pid) {
+            Some(true) => false,
+            Some(false) => true,
+            None => older_than(&path, now, DISPOSABLE_MAX_AGE),
+        };
+        if !stale {
+            continue;
+        }
+        let bytes = dir_size(&path);
+        if std::fs::remove_dir_all(&path).is_ok() {
+            reclaimed.dirs += 1;
+            reclaimed.bytes += bytes;
+        }
+    }
+    reclaimed
+}
+
+/// Parse `<engine>-<pid>-<nanos>` back into its parts.
+///
+/// Engine labels may contain `-` (`chrome-headless-shell`), so the split runs
+/// from the right. The timestamp must look like `subsec_nanos`, which keeps
+/// arbitrary `name-1-2` directories from being mistaken for throwaway copies.
+fn parse_disposable_name(name: &str) -> Option<(&str, u32, u128)> {
+    let mut parts = name.rsplitn(3, '-');
+    let stamp = parts.next()?.parse::<u128>().ok()?;
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let engine = parts.next()?;
+    if engine.is_empty() || stamp >= 1_000_000_000 {
+        return None;
+    }
+    Some((engine, pid, stamp))
+}
+
+/// `Some(true)`/`Some(false)` when the platform can answer, `None` when it
+/// cannot and the caller has to fall back to age-based reclamation.
+fn process_alive(pid: u32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(Path::new(&format!("/proc/{pid}")).exists())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn older_than(path: &Path, now: SystemTime, age: Duration) -> bool {
+    let Ok(modified) = std::fs::metadata(path).and_then(|meta| meta.modified()) else {
+        return false;
+    };
+    now.duration_since(modified)
+        .map(|elapsed| elapsed > age)
+        .unwrap_or(false)
+}
+
+/// Total size of a directory tree, skipping entries that vanish mid-walk.
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.is_dir() {
+            total += dir_size(&entry.path());
+        } else if meta.is_file() {
+            total += meta.len();
+        }
+    }
+    total
 }
 
 /// Chrome writes this into a fresh profile; a stale one blocks startup.
@@ -283,7 +464,7 @@ fn clear_stale_profile_lock(profile_dir: &Path, notes: &mut Vec<String>) {
                 .and_then(|text| text.rsplit('-').next())
                 .and_then(|pid| pid.parse::<u32>().ok())
         })
-        .map(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .and_then(process_alive)
         .unwrap_or(false);
     if alive {
         notes.push(format!(
@@ -298,46 +479,98 @@ fn clear_stale_profile_lock(profile_dir: &Path, notes: &mut Vec<String>) {
     notes.push("清理了上次遗留的 profile 锁".to_string());
 }
 
+/// An explicitly chosen profile directory, empty values ignored.
+pub fn custom_profile() -> Option<PathBuf> {
+    std::env::var_os("EFFIBUDDY_BROWSER_PROFILE")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn fresh_profile_requested() -> bool {
+    std::env::var("EFFIBUDDY_BROWSER_PROFILE_FRESH")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Name of the throwaway copy made by `EFFIBUDDY_BROWSER_PROFILE_FRESH=1`.
+///
+/// The owning pid is part of the name so a later run can tell an abandoned copy
+/// from one that is still in use (see [`reclaim_disposable_profiles`]).
+fn disposable_profile_name(label: &str) -> String {
+    let stamp = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|value| value.subsec_nanos())
+        .unwrap_or(0);
+    format!("{label}-{}-{stamp}", std::process::id())
+}
+
+/// A resolved profile directory plus whether this run owns it.
+#[derive(Debug, Clone, PartialEq)]
+struct ProfileChoice {
+    path: PathBuf,
+    /// Throwaway copy: deleted on shutdown and swept away if the run crashes.
+    disposable: bool,
+}
+
 /// Where this engine keeps its user data.
 ///
 /// The profile is deliberately **stable** across launches: cookies, sessions
 /// and local storage are exactly what makes a long task possible after the
 /// browser crashes, and Chrome only rewrites them when it shuts down cleanly.
-/// `EFFIBUDDY_BROWSER_PROFILE` points at a specific directory;
-/// `EFFIBUDDY_BROWSER_PROFILE_FRESH=1` restores the old throwaway behaviour,
-/// which is what tests and "log out everything" runs want.
-fn profile_for(engine: EngineKind) -> PathBuf {
-    if let Some(custom) = std::env::var_os("EFFIBUDDY_BROWSER_PROFILE")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-    {
-        return custom;
+/// One profile per engine is the default; a throwaway copy is only made when
+/// the model asks for one (`requested_fresh`, surfaced as
+/// `browser({action:"fresh_profile"})`) or when a developer/test forces it with
+/// `EFFIBUDDY_BROWSER_PROFILE_FRESH=1`. `EFFIBUDDY_BROWSER_PROFILE` points at a
+/// specific directory and wins over both.
+fn profile_for(engine: EngineKind, requested_fresh: bool) -> ProfileChoice {
+    if let Some(custom) = custom_profile() {
+        return ProfileChoice {
+            path: custom,
+            disposable: false,
+        };
     }
     let label = engine.label().to_lowercase();
-    let fresh = std::env::var("EFFIBUDDY_BROWSER_PROFILE_FRESH")
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if fresh {
-        let stamp = format!(
-            "{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.subsec_nanos())
-                .unwrap_or(0)
-        );
-        return profiles_dir().join(format!("{label}-{stamp}"));
+    if requested_fresh || fresh_profile_requested() {
+        return ProfileChoice {
+            path: profiles_dir().join(disposable_profile_name(&label)),
+            disposable: true,
+        };
     }
-    profiles_dir().join(format!("{label}-default"))
+    ProfileChoice {
+        path: profiles_dir().join(format!("{label}-default")),
+        disposable: false,
+    }
 }
 
 /// Launch (or attach to) a browser and return its DevTools WebSocket URL.
+///
+/// `fresh_profile` is the model-visible way to ask for a throwaway profile
+/// (`browser({action:"fresh_profile"})`). The default is one shared,
+/// persisted `<engine>-default` profile per engine: logins survive restarts and
+/// nothing is copied per launch.
 pub async fn launch(
     preference: &[EngineKind],
     headless: bool,
+    fresh_profile: bool,
 ) -> Result<LaunchedBrowser, BrowserError> {
     let started = Instant::now();
     let mut notes = Vec::new();
+
+    // Sweep throwaway profiles from earlier runs before this one adds another.
+    // Deleting a few hundred megabytes is IO-bound, so it happens on a blocking
+    // thread instead of the worker that is about to wait on a browser launch.
+    let reclaimed = tokio::task::spawn_blocking(reclaim_disposable_profiles)
+        .await
+        .unwrap_or_default();
+    if !reclaimed.is_empty() {
+        notes.push(reclaimed.describe());
+    }
+    if fresh_profile && custom_profile().is_some() {
+        notes.push(
+            "EFFIBUDDY_BROWSER_PROFILE 固定了 profile 目录，本次忽略一次性 profile 请求"
+                .to_string(),
+        );
+    }
 
     let mut candidates: Vec<EngineCandidate> = discover_engines()
         .into_iter()
@@ -357,7 +590,7 @@ pub async fn launch(
             notes.push("启动总超时".to_string());
             break;
         }
-        match launch_candidate(&candidate, headless, &mut notes).await {
+        match launch_candidate(&candidate, headless, fresh_profile, &mut notes).await {
             Ok(mut browser) => {
                 browser.notes.append(&mut notes);
                 return Ok(browser);
@@ -373,7 +606,7 @@ pub async fn launch(
         match ensure_headless_shell() {
             Ok(path) => {
                 let candidate = EngineCandidate::new(EngineKind::HeadlessShell, path, true);
-                match launch_candidate(&candidate, true, &mut notes).await {
+                match launch_candidate(&candidate, true, fresh_profile, &mut notes).await {
                     Ok(mut browser) => {
                         browser.notes.append(&mut notes);
                         return Ok(browser);
@@ -397,9 +630,11 @@ pub async fn launch(
 async fn launch_candidate(
     candidate: &EngineCandidate,
     headless: bool,
+    fresh_profile: bool,
     notes: &mut Vec<String>,
 ) -> Result<LaunchedBrowser, BrowserError> {
-    let profile_dir = profile_for(candidate.kind);
+    let profile = profile_for(candidate.kind, fresh_profile);
+    let profile_dir = profile.path.clone();
     std::fs::create_dir_all(&profile_dir)?;
     clear_stale_profile_lock(&profile_dir, notes);
 
@@ -468,6 +703,7 @@ async fn launch_candidate(
         debug_url,
         port,
         profile_dir,
+        disposable_profile: profile.disposable,
         headless,
         notes: Vec::new(),
     };
@@ -613,11 +849,101 @@ mod tests {
         assert!(profiles_dir().ends_with("profiles"));
 
         // The default profile is stable: that is what keeps logins alive
-        // across browser restarts.
-        let first = profile_for(EngineKind::Chrome);
-        let second = profile_for(EngineKind::Chrome);
-        assert_eq!(first, second);
-        assert!(first.ends_with("chrome-default"));
+        // across browser restarts, and it must never be treated as throwaway.
+        let first = profile_for(EngineKind::Chrome, false);
+        let second = profile_for(EngineKind::Chrome, false);
+        assert_eq!(first.path, second.path);
+        assert!(first.path.ends_with("chrome-default"));
+        assert!(!first.disposable);
+
+        // Asking for a fresh copy is opt-in and always disposable.
+        let fresh = profile_for(EngineKind::Chrome, true);
+        assert!(fresh.disposable);
+        assert_ne!(
+            fresh.path, first.path,
+            "a fresh copy never reuses the shared one"
+        );
+    }
+
+    #[test]
+    fn disposable_names_round_trip_through_the_parser() {
+        let name = disposable_profile_name("edge");
+        let (engine, pid, _stamp) = parse_disposable_name(&name).expect("parses back");
+        assert_eq!(engine, "edge");
+        assert_eq!(pid, std::process::id());
+
+        // Labels may contain dashes, so the split has to run from the right.
+        let shell = disposable_profile_name("chrome-headless-shell");
+        let (engine, _, _) = parse_disposable_name(&shell).expect("parses back");
+        assert_eq!(engine, "chrome-headless-shell");
+
+        // A shared profile, an unrelated directory and a bad stamp are not
+        // throwaway copies.
+        assert!(parse_disposable_name("edge-default").is_none());
+        assert!(parse_disposable_name("my-notes").is_none());
+        assert!(parse_disposable_name("edge-x-2").is_none());
+        assert!(parse_disposable_name("edge-42-notnanos").is_none());
+        assert!(parse_disposable_name("edge-42-1234567890123").is_none());
+    }
+
+    #[test]
+    fn reclaim_removes_only_abandoned_throwaway_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        let write = |name: &str| {
+            let path = root.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("Cache.data"), vec![0u8; 512]).unwrap();
+            path
+        };
+
+        let shared = write("edge-default");
+        let unrelated = write("my-export");
+        let malformed = write("edge-x-2");
+        let live = write(&disposable_profile_name("edge"));
+        // `u32::MAX - 1` cannot be a running pid, so its copy is abandoned.
+        let abandoned = write("edge-4294967294-123456789");
+        let abandoned_nested = root.join("chrome-4294967294-987654321");
+        std::fs::create_dir_all(abandoned_nested.join("Default")).unwrap();
+        std::fs::write(
+            abandoned_nested.join("Default").join("Cookies"),
+            vec![7u8; 4096],
+        )
+        .unwrap();
+
+        let reclaimed = reclaim_disposable_profiles_in(root, None);
+
+        assert_eq!(reclaimed.dirs, 2, "{reclaimed:?}");
+        assert!(reclaimed.bytes >= 512 + 4096);
+        assert!(!abandoned.exists());
+        assert!(!abandoned_nested.exists());
+        for kept in [&shared, &unrelated, &malformed, &live] {
+            assert!(kept.exists(), "{} was removed", kept.display());
+        }
+    }
+
+    #[test]
+    fn reclaim_never_touches_the_configured_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Even a throwaway-looking name is preserved when it is the directory
+        // the user pointed `EFFIBUDDY_BROWSER_PROFILE` at.
+        let pinned = root.join("edge-4294967294-123456789");
+        std::fs::create_dir_all(&pinned).unwrap();
+
+        let reclaimed = reclaim_disposable_profiles_in(root, Some(&pinned));
+
+        assert!(reclaimed.is_empty());
+        assert!(pinned.exists());
+    }
+
+    #[test]
+    fn discard_profile_ignores_an_empty_path() {
+        // `std::mem::take` in `shutdown` leaves an empty path behind; removing
+        // "" must stay a no-op rather than resolve to the working directory.
+        discard_profile(Path::new(""));
+        assert!(data_dir().is_absolute() || !data_dir().as_os_str().is_empty());
     }
 
     #[test]

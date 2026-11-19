@@ -13,7 +13,7 @@
 //! protocol  WebSocket transport with id correlation and event fan-out
 //! snapshot  AX tree → [ref] nodes (shared by the CDP and fake backends)
 //! journal   console/network ring buffers with cursors
-//! discover  engine discovery, launch, DevToolsActivePort attach
+//! discover  engine discovery, launch, DevToolsActivePort attach, profile reclamation
 //! keys      key-chord parsing → CDP key events
 //! ```
 
@@ -35,7 +35,9 @@ pub mod runtime;
 pub use backend::{
     BrowserBackend, KeyChord, KeyModifier, UnsupportedBackend, WaitCondition, WaitRequest,
 };
-pub use discover::{EngineCandidate, LaunchedBrowser};
+pub use discover::{
+    EngineCandidate, LaunchedBrowser, ReclaimedProfiles, reclaim_disposable_profiles,
+};
 pub use journal::Journal;
 pub use runtime::{BrowserRuntime, ConsoleQuery, OverlayEmitter, OverlayEvent, OverlayEventKind};
 pub use snapshot::{AX_TREE_JS, PAGE_TEXT_JS, build_snapshot, render_snapshot};

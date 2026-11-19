@@ -8,6 +8,7 @@
 //! ```
 
 use effibuddy_browser::cdp::CdpBackend;
+use effibuddy_browser::discover;
 use effibuddy_browser::discover::default_engine_preference;
 use effibuddy_browser::{
     BrowserBackend, EditorOp, EditorRequest, EvalRequest, RequestWait, SnapshotMode, WaitPolicy,
@@ -293,4 +294,44 @@ async fn a_timed_out_evaluation_returns_the_partial_log() {
     );
 
     backend.end_session().await.expect("end session");
+}
+
+/// One shared profile by default; a throwaway copy only on request, deleted on
+/// close. This is the contract that keeps a debugging session from leaving
+/// hundreds of megabytes of Chromium cache behind.
+#[tokio::test]
+#[ignore = "launches a real browser"]
+async fn the_default_profile_is_shared_and_fresh_copies_are_deleted_on_close() {
+    let preference = default_engine_preference();
+
+    let mut shared = discover::launch(&preference, true, false)
+        .await
+        .expect("launch the shared profile");
+    assert!(
+        shared.profile_dir.to_string_lossy().ends_with("-default"),
+        "{:?}",
+        shared.profile_dir
+    );
+    assert!(!shared.disposable_profile);
+    assert!(shared.profile_dir.is_dir());
+    shared.shutdown().await;
+    assert!(
+        shared.profile_dir.is_dir(),
+        "the shared profile survives shutdown: {:?}",
+        shared.profile_dir
+    );
+
+    let mut fresh = discover::launch(&preference, true, true)
+        .await
+        .expect("launch a throwaway profile");
+    assert!(fresh.disposable_profile);
+    assert_ne!(fresh.profile_dir, shared.profile_dir);
+    let throwaway = fresh.profile_dir.clone();
+    assert!(throwaway.is_dir(), "{throwaway:?}");
+    fresh.shutdown().await;
+    assert!(
+        !throwaway.exists(),
+        "throwaway profile must be deleted on shutdown: {}",
+        throwaway.display()
+    );
 }

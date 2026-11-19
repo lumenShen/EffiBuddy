@@ -1124,6 +1124,12 @@ impl AppView {
         ));
         browser.set_mode(config.browser_use_mode);
 
+        // Reclaim throwaway browser profiles left behind by an earlier run that
+        // never shut down cleanly. Sweeping at startup means a debugging session
+        // cannot pile up gigabytes even when the browser tool is never used; the
+        // launch path sweeps again before creating another copy.
+        std::thread::spawn(effibuddy_browser::reclaim_disposable_profiles);
+
         // Read the collapse flags before `config` moves into the struct.
         let sidebar_collapsed = config.sidebar_collapsed;
         let side_bar_open = config.side_bar_open;

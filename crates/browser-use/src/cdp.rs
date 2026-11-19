@@ -95,6 +95,9 @@ pub struct CdpBackend {
     /// Bodies already fetched, so `network` + `wait_for_request` on the same
     /// request do not re-fetch (and survive Chromium evicting them).
     bodies: Mutex<HashMap<String, CachedBody>>,
+    /// One-shot request for a throwaway profile on the next launch. The shared
+    /// profile stays the default; see `BrowserBackend::set_fresh_profile`.
+    fresh_profile: AtomicBool,
 }
 
 struct CachedBody {
@@ -124,8 +127,17 @@ impl Drop for CdpBackend {
             let mut browser = live.browser;
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move { browser.shutdown().await });
-            } else if let Some(child) = browser.child.as_mut() {
-                let _ = child.start_kill();
+            } else {
+                if let Some(child) = browser.child.as_mut() {
+                    let _ = child.start_kill();
+                }
+                // With no runtime left there is no way to wait for the reaped
+                // child, so the throwaway profile goes right now: leaving it
+                // behind is what turns a killed debug run into a gigabyte of
+                // orphaned Chromium cache.
+                if browser.disposable_profile {
+                    discover::discard_profile(&browser.profile_dir);
+                }
             }
         }
     }
@@ -142,6 +154,7 @@ impl CdpBackend {
             generation: AtomicU64::new(0),
             init_scripts: Mutex::new(Vec::new()),
             bodies: Mutex::new(HashMap::new()),
+            fresh_profile: AtomicBool::new(false),
         }
     }
 
@@ -1088,7 +1101,11 @@ impl BrowserBackend for CdpBackend {
         }
 
         let headless = self.headless.load(Ordering::SeqCst);
-        let browser = discover::launch(&self.preference, headless).await?;
+        let fresh = self.fresh_profile.load(Ordering::SeqCst);
+        let browser = discover::launch(&self.preference, headless, fresh).await?;
+        // One-shot: only a launch that actually happened consumes the request,
+        // so a failed attempt still leaves the model's intent intact.
+        self.fresh_profile.store(false, Ordering::SeqCst);
         let connection = CdpConnection::connect(&browser.debug_url).await?;
         let (page, task, last_console) =
             Self::attach_page(&connection, self.journal.clone(), None).await?;
@@ -1120,6 +1137,10 @@ impl BrowserBackend for CdpBackend {
         // Re-register whatever the conversation had installed before a restart.
         let _ = self.apply_init_scripts().await;
         self.read_page().await
+    }
+
+    fn set_fresh_profile(&self, fresh: bool) {
+        self.fresh_profile.store(fresh, Ordering::SeqCst);
     }
 
     async fn end_session(&self) -> Result<(), BrowserError> {

@@ -102,6 +102,17 @@ pub trait BrowserBackend: Send + Sync {
     /// Launch or attach, enable the event domains, and return the active tab.
     async fn ensure_ready(&self) -> Result<PageInfo, BrowserError>;
 
+    /// Route the **next** launch through a throwaway profile instead of the
+    /// shared `<engine>-default` one.
+    ///
+    /// This exists because the default is one persisted profile per engine, and
+    /// creating a second copy is the model's explicit choice
+    /// (`browser({action:"fresh_profile"})`), never an automatic one. The flag
+    /// should be one-shot: clear it once a launch consumed it.
+    ///
+    /// Backends that cannot isolate a profile keep the no-op body.
+    fn set_fresh_profile(&self, _fresh: bool) {}
+
     /// Close the browser (or detach) and release the profile lock.
     async fn end_session(&self) -> Result<(), BrowserError>;
 

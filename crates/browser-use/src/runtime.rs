@@ -1351,6 +1351,55 @@ impl BrowserRuntime {
         with_cancel(cancel, self.backend.ref_bounds(r#ref)).await
     }
 
+    /// Relaunch the browser on a throwaway profile.
+    ///
+    /// The default is one shared, persisted `<engine>-default` profile per
+    /// engine: logins survive restarts and each launch writes no copy. This is
+    /// the only path that makes a second profile, and it exists because the
+    /// model explicitly asked for one — e.g. to test a logged-out state. The
+    /// copy is deleted when the browser closes, and the next launch goes back to
+    /// the shared profile.
+    ///
+    /// Restarting the browser kills every tab in it, so the request is refused
+    /// while another conversation still holds a tab.
+    pub async fn restart_with_fresh_profile(
+        &self,
+        session_id: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PageInfo, BrowserError> {
+        if !self.mode().is_enabled() {
+            return Err(BrowserError::Disabled);
+        }
+        let others: Vec<String> = {
+            let sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sessions
+                .iter()
+                .filter(|(id, session)| id.as_str() != session_id && session.tab_id.is_some())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if !others.is_empty() {
+            return Err(BrowserError::Invalid(format!(
+                "浏览器被 {} 个其它会话共用；一次性 profile 需要重启浏览器进程，\
+                 会连带关掉它们的标签页。请先在这些会话里调用 end_session。",
+                others.len()
+            )));
+        }
+
+        self.note(session_id, "正在用一次性 profile 重启浏览器…");
+        self.backend.set_fresh_profile(true);
+        // Closing first is what forces the relaunch: `ensure_ready` reuses the
+        // live browser otherwise and the fresh copy would never be created.
+        self.backend.end_session().await?;
+        self.forget_active_tab();
+        self.clear_page_state(session_id);
+        self.set_tab(session_id, None);
+        self.ensure_ready(session_id, cancel).await
+    }
+
     /// End the browser session for one conversation.
     ///
     /// Other agents may still be driving their own tabs, so this only closes
@@ -1736,6 +1785,42 @@ mod tests {
         runtime.gate("a", &cancel).await.unwrap();
         assert_eq!(backend.active_tab().as_deref(), Some(tab_a.as_str()));
         assert_eq!(runtime.session_tab("a").as_deref(), Some(tab_a.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_profile_restart_is_refused_while_another_conversation_holds_a_tab() {
+        let (runtime, _backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime.gate("a", &cancel).await.unwrap();
+        runtime.gate("b", &cancel).await.unwrap();
+
+        let error = runtime
+            .restart_with_fresh_profile("a", &cancel)
+            .await
+            .expect_err("must refuse while b is driving a tab");
+        assert!(matches!(error, BrowserError::Invalid(_)), "{error:?}");
+        assert!(error.to_string().contains("其它会话"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_profile_restart_reuses_the_only_conversation() {
+        let (runtime, backend) = fake_runtime();
+        let cancel = CancellationToken::new();
+        runtime.gate("a", &cancel).await.unwrap();
+
+        let info = runtime
+            .restart_with_fresh_profile("a", &cancel)
+            .await
+            .expect("single conversation may restart into a throwaway profile");
+
+        // The flag reaches the backend exactly once per request, and the
+        // conversation is bound to a live page again afterwards.
+        assert_eq!(backend.fresh_profile_requests(), 1);
+        assert!(!info.tab_id.is_empty());
+        assert_eq!(
+            runtime.session_tab("a").as_deref(),
+            Some(info.tab_id.as_str())
+        );
     }
 
     #[tokio::test]
