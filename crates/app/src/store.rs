@@ -14,6 +14,10 @@ use crate::config::base_dir;
 pub struct SessionSummary {
     pub id: String,
     pub title: String,
+    /// Time the history row displays and sorts by: the end of the last
+    /// completed round, clamped to never be earlier than `created_at`
+    /// ([`SessionState::activity_at`]). Opening a transcript does not move it —
+    /// `normalize_after_load` deliberately leaves the stamp alone.
     pub updated_at: DateTime<Utc>,
     pub message_count: usize,
     /// Project the conversation belongs to; `None` puts it in the sidebar's
@@ -138,15 +142,16 @@ impl SessionStore {
         Some(session)
     }
 
-    /// Load without reopening side effects (`normalize_after_load` refreshes
-    /// `updated_at` and repairs tool calls). Used for metadata-only edits such
-    /// as pin, archive and restore so reordering the sidebar is left intact.
+    /// Load without reopening side effects (`normalize_after_load` repairs
+    /// dangling tool calls and resets transient run state). Used for
+    /// metadata-only edits such as pin, archive and restore so neither the
+    /// sidebar order nor its time indicator changes.
     pub fn load_for_update(&self, id: &str) -> Option<SessionState> {
         let contents = std::fs::read_to_string(self.path_for(id)).ok()?;
         session_from_json(&contents)
     }
 
-    /// Raw transcript read for export: no status/`updated_at` rewrite and no
+    /// Raw transcript read for export: no status rewrite and no
     /// dangling-tool-call repair. The archive mirrors what was saved.
     pub fn load_raw(&self, id: &str) -> Option<SessionState> {
         self.load_for_update(id)
@@ -349,7 +354,7 @@ impl SessionStore {
                             let summary = SessionSummary {
                                 id: session.id.clone(),
                                 title: session.display_title(),
-                                updated_at: session.updated_at,
+                                updated_at: session.activity_at(),
                                 message_count: session.messages.len(),
                                 project: session.project.clone(),
                                 project_id: session.project_id.clone(),
@@ -520,6 +525,45 @@ mod tests {
 
         let raw = store.load_raw(&session.id).unwrap();
         assert_eq!(raw.updated_at, stamp);
+    }
+
+    #[test]
+    fn opening_a_transcript_does_not_refresh_its_sidebar_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let mut session = session("opened", "/tmp/project");
+        let stamp = "2026-11-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        session.created_at = stamp;
+        session.updated_at = stamp;
+        store.save(&session).unwrap();
+
+        // Open it the way the app does, then persist the reopened copy.
+        let mut opened = store.load(&session.id).unwrap();
+        assert_eq!(opened.updated_at, stamp);
+        opened.title = "renamed while open".to_string();
+        store.save(&opened).unwrap();
+
+        let summaries = store.summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].updated_at, stamp);
+    }
+
+    #[test]
+    fn summary_time_is_clamped_to_creation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::with_directory(directory.path());
+        let mut session = session("stale", "/tmp/project");
+        let created = "2026-11-01T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        session.created_at = created;
+        session.updated_at = created - chrono::Duration::days(2);
+        store.save(&session).unwrap();
+
+        let summaries = store.summaries();
+        assert_eq!(summaries[0].updated_at, created);
     }
 
     #[test]

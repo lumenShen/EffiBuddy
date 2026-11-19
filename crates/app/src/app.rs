@@ -1691,7 +1691,7 @@ impl AppView {
         self.sessions = vec![SessionSummary {
             id: session.id.clone(),
             title: session.title.clone(),
-            updated_at: session.updated_at,
+            updated_at: session.activity_at(),
             message_count: session.messages.len(),
             project: session.project.clone(),
             project_id: session.project_id.clone(),
@@ -6583,14 +6583,15 @@ impl AppView {
             {
                 let mut session = lock_session(&shared);
                 session.archived = true;
-                session.touch();
+                // Archiving is bookkeeping: keep the row's activity stamp.
+                session.touch_metadata();
             }
             self.save_active_metadata(&shared)
         } else {
             match self.store.load_for_update(id) {
                 Some(mut session) => {
                     session.archived = true;
-                    session.touch();
+                    session.touch_metadata();
                     self.store.save(&session)
                 }
                 None => Err("无法读取该会话。".to_string()),
@@ -6749,7 +6750,8 @@ impl AppView {
         let result = match self.store.load_for_update(id) {
             Some(mut session) => {
                 session.archived = false;
-                session.touch();
+                // Restoring must not move the row to the top of the history.
+                session.touch_metadata();
                 self.store.save(&session)
             }
             None => Err("无法读取该会话。".to_string()),

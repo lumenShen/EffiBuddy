@@ -365,6 +365,34 @@ impl SessionState {
         self.revision = self.revision.wrapping_add(1);
     }
 
+    /// Invalidates derived caches for a metadata-only change (archive,
+    /// restore, …) **without** moving `updated_at`.
+    ///
+    /// `updated_at` is the time the history row shows, so only real work may
+    /// move it: ticking a todo, switching a model mid-turn or completing a
+    /// round. Filing a conversation away and taking it back out is bookkeeping,
+    /// and the row must keep the timestamp of the work it represents instead of
+    /// jumping to “刚刚”.
+    pub fn touch_metadata(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Timestamp the UI shows for this conversation: the end of the last
+    /// completed round, and never earlier than the moment it was created.
+    ///
+    /// `updated_at` is stamped by [`Self::touch`], which the harness calls when
+    /// a run reaches its terminal state, so it already *is* the last round's
+    /// end for anything that actually ran. The `created_at` clamp covers
+    /// transcripts that have no round yet (and files written by an older build
+    /// where a clock skew left `updated_at` behind `created_at`).
+    ///
+    /// Reading a transcript must never move this stamp: opening a conversation
+    /// is not activity, and [`Self::normalize_after_load`] deliberately leaves
+    /// both fields alone.
+    pub fn activity_at(&self) -> DateTime<Utc> {
+        self.updated_at.max(self.created_at)
+    }
+
     /// Switch the model for this conversation. The harness is rebuilt from the
     /// session on the next turn, so this never mutates a running harness.
     pub fn set_model_selection(
@@ -598,7 +626,11 @@ impl SessionState {
     /// shape on the next request.
     pub fn normalize_after_load(&mut self) {
         self.status = RunStatus::Idle;
-        self.updated_at = Utc::now();
+        // `updated_at` is deliberately *not* refreshed here. Loading is a read,
+        // and re-stamping it made the sidebar's time indicator jump to “刚刚”
+        // (and the row jump to the top) every time a conversation was opened or
+        // restored at launch. The stamp belongs to the last completed round
+        // (`Harness::run_turn_inner` touches the session when the run ends).
         // Held summaries are in-memory only; a loaded session starts clean.
         self.held_compaction = None;
         self.repair_dangling_tool_calls();
@@ -716,6 +748,30 @@ mod tests {
             .expect("session serializes to an object")
             .insert("permission_mode".to_string(), serde_json::json!("yolo"));
         assert!(serde_json::from_value::<SessionState>(value).is_err());
+    }
+
+    #[test]
+    fn loading_a_transcript_keeps_its_time_stamp() {
+        let mut session = sample_session();
+        let stamp = "2026-11-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        session.created_at = stamp - chrono::Duration::hours(1);
+        session.updated_at = stamp;
+
+        session.normalize_after_load();
+
+        // Opening is a read: the sidebar indicator must not jump to “刚刚”.
+        assert_eq!(session.updated_at, stamp);
+        assert_eq!(session.activity_at(), stamp);
+    }
+
+    #[test]
+    fn activity_time_never_precedes_creation() {
+        let mut session = sample_session();
+        let created = "2026-11-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        session.created_at = created;
+        // A file written by an older build with a stale `updated_at`.
+        session.updated_at = created - chrono::Duration::days(3);
+        assert_eq!(session.activity_at(), created);
     }
 
     #[test]
