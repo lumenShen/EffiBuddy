@@ -127,6 +127,7 @@ actions!(
         StopRun,
         OpenCommandPalette,
         ToggleGraph,
+        ToggleMobileLayout,
         CyclePermissionMode,
         ZoomIn,
         ZoomOut,
@@ -226,8 +227,8 @@ pub(crate) struct ActiveRun {
     shared: SharedSession,
     run_id: Option<String>,
     handle: AgentHandle,
-    approval: Arc<BrokerApprovalGate>,
-    started_at: Instant,
+    pub(crate) approval: Arc<BrokerApprovalGate>,
+    pub(crate) started_at: Instant,
     /// Bound to the user message that owns this run once `RunStarted` lands.
     checkpoint: Option<Arc<crate::checkpoint::CheckpointRecorder>>,
     /// True for a `/compact` pass: it owns no user turn, must not resume the
@@ -336,6 +337,16 @@ pub(crate) struct EditConflictState {
 /// Visual state of one sidebar conversation row. Running children count as
 /// activity too, so a session whose main turn ended but whose background agents
 /// still work keeps its indicator.
+/// One pending user message as the mobile queue strip renders it.
+#[derive(Clone)]
+pub(crate) struct MobileQueueRow {
+    pub(crate) id: String,
+    pub(crate) text: String,
+    /// A steered message waits for the next step boundary instead of the next
+    /// turn, so the strip labels it differently.
+    pub(crate) steer: bool,
+}
+
 #[derive(Clone, Copy, Default)]
 pub(crate) struct SessionRowStatus {
     pub(crate) running: bool,
@@ -590,7 +601,7 @@ pub struct AppView {
     /// since the section's inputs notify the whole view.
     pub(crate) agents_catalog: Option<Rc<(Vec<SubagentProfile>, Vec<ProfileDiagnostic>)>>,
 
-    palette_open: bool,
+    pub(crate) palette_open: bool,
     palette_query: Entity<TextInputState>,
     palette_input: Entity<TextInputView>,
     /// Keyboard-selected row in the palette (index into the filtered list).
@@ -606,7 +617,7 @@ pub struct AppView {
     _palette_keys_subscription: gpui::Subscription,
 
     pub(crate) composer_state: Entity<TextInputState>,
-    composer: Entity<TextInputView>,
+    pub(crate) composer: Entity<TextInputView>,
     _composer_subscription: gpui::Subscription,
     /// `/`, `$` and `@` autocomplete state (trigger, filtered items, selection).
     pub(crate) composer_menu: ComposerMenuState,
@@ -641,6 +652,8 @@ pub struct AppView {
     _palette_subscription: gpui::Subscription,
 
     pub(crate) theme: Theme,
+    /// Phone-shell state (drawer, filters, settings page, virtual list).
+    pub(crate) mobile: crate::mobile::MobileState,
     pub(crate) expanded_reasoning: HashSet<String>,
     pub(crate) expanded_tools: HashSet<String>,
     /// Turn blocks the user explicitly expanded / collapsed; both override
@@ -655,7 +668,7 @@ pub struct AppView {
     /// chat. Cleared together with `chat` on session switches.
     prompt_rail: PromptRailState,
     /// User bubble the last rail jump landed on; paints a one-shot ring.
-    jump_flash: Option<JumpFlash>,
+    pub(crate) jump_flash: Option<JumpFlash>,
     jump_flash_seq: u64,
     /// Guards the extra frame requested while the rail's list viewport is not
     /// measured yet (first frame after a session opens or the window resizes).
@@ -702,14 +715,22 @@ pub struct AppView {
 impl AppView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut config = AppConfig::load();
-        let theme = if std::env::args().any(|argument| argument == "--dark") {
-            Theme::dark()
+        let dark_theme = if std::env::args().any(|argument| argument == "--dark") {
+            true
         } else if std::env::args().any(|argument| argument == "--light") {
-            Theme::light()
-        } else if config.theme == "light" {
-            Theme::light()
+            false
         } else {
-            Theme::dark()
+            config.theme != "light"
+        };
+        if std::env::args().any(|argument| argument == "--mobile") {
+            config.ui_layout = crate::config::UiLayout::Mobile;
+        }
+        let accent = effibuddy_ui::AccentId::from_id(&config.mobile_accent);
+        let theme = match (config.ui_layout.is_mobile(), dark_theme) {
+            (true, true) => Theme::mobile_dark(accent),
+            (true, false) => Theme::mobile_light(accent),
+            (false, true) => Theme::dark(),
+            (false, false) => Theme::light(),
         };
         theme.clone().set_global(cx);
 
@@ -865,7 +886,19 @@ impl AppView {
             TextInputView::new(composer_state.clone(), cx)
                 .frameless(true)
                 .on_submit(move |text, window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.send_message(text, false, window, cx));
+                    let _ = weak.update(cx, |this, cx| {
+                        // Phones send from the round key, not from Return: on
+                        // the mobile shell Return inserts a newline so a
+                        // multi-line draft never fires by accident.
+                        if this.config.ui_layout.is_mobile() {
+                            let caret = this.composer_state.read(cx).cursor_offset();
+                            this.composer_state.update(cx, |state, cx| {
+                                state.replace_byte_range(caret..caret, "\n", window, cx);
+                            });
+                            return;
+                        }
+                        this.send_message(text, false, window, cx);
+                    });
                 })
                 .on_submit_alternate(move |text, window, cx| {
                     let _ =
@@ -875,6 +908,13 @@ impl AppView {
                     let _ = weak_paste.update(cx, |this, cx| this.paste_media(media, cx));
                 })
         });
+        if config.ui_layout.is_mobile() {
+            // The phone layout words the empty input as a message box rather
+            // than a task box; the draft itself is unchanged.
+            composer_state.update(cx, |state, _| {
+                state.set_placeholder("给 EffiBuddy 发消息…")
+            });
+        }
         let composer_subscription = cx.observe(&composer_state, |this, state, cx| {
             this.composer_draft_changed(state.read(cx).content().to_string(), cx);
             this.sync_composer_menu(cx);
@@ -1222,6 +1262,7 @@ impl AppView {
             project_editor_name_view,
             _project_editor_name_subscription: project_editor_name_subscription,
             theme,
+            mobile: crate::mobile::MobileState::new(cx),
             expanded_reasoning: HashSet::new(),
             expanded_tools: HashSet::new(),
             expanded_turns: HashSet::new(),
@@ -1995,7 +2036,7 @@ impl AppView {
         self.active.as_ref().map(|active| active.shared.clone())
     }
 
-    fn session_is_active(&self, id: &str) -> bool {
+    pub(crate) fn session_is_active(&self, id: &str) -> bool {
         self.active
             .as_ref()
             .is_some_and(|active| lock_session(&active.shared).id == id)
@@ -2004,7 +2045,7 @@ impl AppView {
     /// True when this conversation has a live main run, either in front or
     /// parked in the background. A session with only running children counts
     /// as busy for wake/queue purposes, but not for the main run.
-    fn run_active_for(&self, id: &str) -> bool {
+    pub(crate) fn run_active_for(&self, id: &str) -> bool {
         (self.session_is_active(id) && self.active_run.is_some())
             || self.background_runs.contains_key(id)
     }
@@ -2235,7 +2276,7 @@ impl AppView {
 
     /// Sidebar status for one row: live main run, running children, or a
     /// pending approval while the conversation sits in the background.
-    fn session_row_status(&self, id: &str) -> SessionRowStatus {
+    pub(crate) fn session_row_status(&self, id: &str) -> SessionRowStatus {
         if self.session_is_active(id) {
             let running = self.active_run.is_some()
                 || self
@@ -2682,7 +2723,7 @@ impl AppView {
         .detach();
     }
 
-    fn send_message(
+    pub(crate) fn send_message(
         &mut self,
         text: String,
         steer: bool,
@@ -4013,7 +4054,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn respond_approval(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
+    pub(crate) fn respond_approval(&mut self, decision: ApprovalDecision, cx: &mut Context<Self>) {
         let Some(pending) = self.pending_approvals.first().cloned() else {
             return;
         };
@@ -5729,7 +5770,7 @@ impl AppView {
         usage
     }
 
-    fn agent_cards(&self) -> HashMap<String, AgentCard> {
+    pub(crate) fn agent_cards(&self) -> HashMap<String, AgentCard> {
         self.subagent_tasks
             .iter()
             // Group members are represented by the workflow tool's group card
@@ -6007,7 +6048,7 @@ impl AppView {
         }
     }
 
-    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_session_in_project(None, None, window, cx);
     }
 
@@ -6516,7 +6557,7 @@ impl AppView {
 
     /// Toggle a session's pinned flag. Pinned conversations move into the
     /// sidebar's 置顶 section and out of their project/task group.
-    fn toggle_pin(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_pin(&mut self, id: &str, cx: &mut Context<Self>) {
         let (result, pinned) = if let Some(shared) = self.shared_for_session(id) {
             let pinned = {
                 let mut session = lock_session(&shared);
@@ -6571,7 +6612,7 @@ impl AppView {
     /// Archive a conversation: it leaves the sidebar and is kept in
     /// Settings → 归档 until restored or deleted. Archiving is the "this work
     /// is finished" action, so it replaces the old per-row delete button.
-    fn archive_session(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn archive_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let is_active = self.active_id().as_deref() == Some(id);
         if self.session_row_status(id).running {
             self.notice = Some(if is_active {
@@ -6717,7 +6758,7 @@ impl AppView {
 
     /// Permanently remove a conversation from the sidebar's “more” menu. The
     /// menu arms the confirmation first; this performs the second click.
-    fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
+    pub(crate) fn delete_session(&mut self, id: &str, cx: &mut Context<Self>) {
         let is_active = self.active_id().as_deref() == Some(id);
         if self.session_row_status(id).running {
             self.notice = Some(if is_active {
@@ -7268,15 +7309,112 @@ impl AppView {
     }
 
     pub(crate) fn toggle_theme(&mut self, cx: &mut Context<Self>) {
-        self.theme = self.theme.toggle();
-        self.config.theme = if self.theme.is_dark() {
-            "dark".to_string()
-        } else {
-            "light".to_string()
-        };
-        self.theme.clone().set_global(cx);
+        // Flip the persisted brightness, then rebuild the palette the active
+        // layout uses: the mobile shell needs its glass tokens, the desktop
+        // shell its flat neutrals.
+        let dark = !self.theme.is_dark();
+        self.config.theme = if dark { "dark" } else { "light" }.to_string();
+        self.apply_theme(cx);
         let _ = self.config.save();
         cx.notify();
+    }
+
+    /// Set the active session's permission mode (mobile 通用 page) and adopt it
+    /// as the default for new sessions.
+    pub(crate) fn set_permission_mode(
+        &mut self,
+        mode: effibuddy_agent_core::tool::PermissionMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.config.default_permission_mode = Some(mode);
+        let _ = self.config.save();
+        if let Some(shared) = self.active_shared() {
+            {
+                let mut session = lock_session(&shared);
+                session.permission_mode = mode;
+                session.touch();
+            }
+            if let Err(error) = self.save_active_metadata(&shared) {
+                self.last_error = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Pending user messages in admission order, for the mobile queue strip.
+    pub(crate) fn mobile_queue_rows(&self) -> Vec<MobileQueueRow> {
+        self.pending_inputs
+            .iter()
+            .map(|input| MobileQueueRow {
+                id: input.id.clone(),
+                text: input.text.replace('\n', " "),
+                steer: input.kind == PendingInputKind::Steer,
+            })
+            .collect()
+    }
+
+    /// Put a suggestion (or any text) into the shared composer and focus it.
+    pub(crate) fn mobile_prefill(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.fill_composer(&text, window, cx);
+    }
+
+    /// Everything Escape does, in one place so both shells share it.
+    pub(crate) fn handle_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mobile.drawer_open {
+            self.mobile.drawer_open = false;
+            cx.notify();
+        } else if self.edit_conflict.is_some() {
+            self.dismiss_edit_conflict(window, cx);
+        } else if self.undo_dialog.is_some() {
+            self.close_undo_dialog(window, cx);
+        } else if self.reward_open {
+            self.reward_open = false;
+            cx.notify();
+        } else if self.edit_message.is_some() {
+            self.cancel_edit_message(window, cx);
+        } else if self.palette_open {
+            self.close_palette(window, cx);
+        } else if self.model_menu.open {
+            self.close_model_menu(cx);
+        } else if self.project_menu.target.is_some() {
+            self.close_project_menu(cx);
+        } else if self.session_menu.target.is_some() {
+            self.close_session_menu(cx);
+        } else if self.link_menu.target.is_some() {
+            self.close_link_menu(cx);
+        } else if self.session_rename.is_some() {
+            self.close_session_rename(window, cx);
+        } else if self.project_editor.is_some() {
+            self.close_project_editor(cx);
+        } else if self.settings.model_editor.open {
+            self.close_model_editor(cx);
+        } else if self.mobile.sheet.is_some() {
+            self.mobile.sheet = None;
+            cx.notify();
+        } else if self.view_mode == ViewMode::Graph && self.graph.selected.is_some() {
+            self.graph.clear_selection();
+            cx.notify();
+        } else if self.side.overlay.is_some() {
+            self.side.overlay = None;
+            cx.notify();
+        } else if self
+            .side
+            .active()
+            .is_some_and(|tab| matches!(tab.kind, SidePaneTabKind::Agent(_)))
+        {
+            self.close_agent_view(cx);
+        } else if self.settings_open {
+            self.settings_open = false;
+            self.mobile.page = crate::mobile::pages::SettingsPage::Root;
+            cx.notify();
+        } else {
+            self.interrupt(cx);
+        }
     }
 
     /// Step the whole-app UI zoom (see `Window::set_ui_zoom`) by `delta`,
@@ -7432,7 +7570,7 @@ impl AppView {
 
     // --- command palette --------------------------------------------------
 
-    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer_menu.close();
         self.palette_open = true;
         self.palette_selected = 0;
@@ -7989,7 +8127,7 @@ impl AppView {
     /// Popover for a conversation row's “more” button. Deleting is
     /// intentionally two-step: the row arms, the second click removes the
     /// transcript (and any draft held for it).
-    fn render_session_menu(
+    pub(crate) fn render_session_menu(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -8271,7 +8409,7 @@ impl AppView {
 
     /// Popover for a project's "more" button: new task, folder management,
     /// per-root reveal, collapse/expand and removal.
-    fn render_project_menu(
+    pub(crate) fn render_project_menu(
         &self,
         _window: &mut Window,
         cx: &mut Context<Self>,
@@ -10804,7 +10942,7 @@ impl AppView {
     /// edited turns whose files cannot be restored safely. Both list every
     /// affected path and state explicitly that EffiBuddy cannot recover the
     /// change afterwards (no Git snapshots are involved).
-    fn render_restore_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_restore_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let (title, subtitle, excerpt, plan, undo) = if let Some(dialog) = &self.undo_dialog {
             (
@@ -11176,7 +11314,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_palette(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_palette(&self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let query = self.palette_query.read(cx).content().to_string();
         let items = self.palette_items(&query);
@@ -11435,6 +11573,30 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // EFFIBUDDY_PERF=1 measures the element-tree build cost per frame.
         let perf_frame = perf::frame_start();
+
+        // The phone shell owns the whole window: no titlebar, no side panes,
+        // no desktop palette of panels. It still drains the same caches and
+        // ticks the same smooth-scroll controller, because the underlying
+        // chat list is shared.
+        if self.config.ui_layout.is_mobile() {
+            crate::nav_bench::note_frame();
+            for image in self.chat.take_dropped_images() {
+                gpui::ImageSource::Image(image).remove_asset(cx);
+            }
+            self.spawn_thumbnail_builds(cx);
+            if self.scrolls.tick() && !self.scroll_frame_scheduled {
+                self.scroll_frame_scheduled = true;
+                cx.on_next_frame(window, |this, _, cx| {
+                    this.scroll_frame_scheduled = false;
+                    cx.notify();
+                });
+            }
+            let tree = div().size_full().child(self.render_mobile(window, cx));
+            if let Some(started) = perf_frame {
+                perf::frame_end(started);
+            }
+            return tree;
+        }
 
         crate::nav_bench::note_frame();
         // Rasters the chat let go of (session switch, cache eviction) still
@@ -13108,7 +13270,7 @@ fn session_title(
 }
 
 /// Open a project folder in the platform file manager.
-fn open_in_file_manager(path: &Path) -> Result<(), String> {
+pub(crate) fn open_in_file_manager(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     let mut command = {
         let mut command = std::process::Command::new("explorer.exe");

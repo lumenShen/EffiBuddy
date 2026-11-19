@@ -21,6 +21,7 @@ effibuddy-agent-core.workspace = true
 effibuddy-agent-tools.workspace = true
 effibuddy-browser.workspace = true
 effibuddy-computer.workspace = true
+effibuddy-mobile.workspace = true
 effibuddy-ui.workspace = true
 gpui.workspace = true
 # Transcript thumbnails: decoding a pasted screenshot and downscaling it to a

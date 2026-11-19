@@ -28,6 +28,7 @@ mod events;
 mod file_menu;
 mod graph;
 mod memory;
+mod mobile;
 mod model_config;
 mod model_picker;
 mod nav_bench;
@@ -52,7 +53,8 @@ use gpui::{
 
 use crate::app::{
     AppView, CyclePermissionMode, FocusComposer, NewSession, OpenCommandPalette, StopRun,
-    ToggleGraph, ToggleSettings, ToggleSidebar, ToggleTheme, ZoomIn, ZoomOut, ZoomReset,
+    ToggleGraph, ToggleMobileLayout, ToggleSettings, ToggleSidebar, ToggleTheme, ZoomIn,
+    ZoomOut, ZoomReset,
 };
 use crate::config::AppConfig;
 use effibuddy_ui::{EffiBuddyAssets, install_keybindings};
@@ -112,6 +114,7 @@ fn main() {
                 KeyBinding::new("ctrl-l", FocusComposer, Some("EffiBuddy")),
                 KeyBinding::new("ctrl-k", OpenCommandPalette, Some("EffiBuddy")),
                 KeyBinding::new("ctrl-shift-g", ToggleGraph, Some("EffiBuddy")),
+                KeyBinding::new("ctrl-shift-m", ToggleMobileLayout, Some("EffiBuddy")),
                 KeyBinding::new("shift-tab", CyclePermissionMode, Some("EffiBuddy")),
                 KeyBinding::new("escape", StopRun, Some("EffiBuddy")),
                 // Whole-app zoom; `=` and `+` cover both the unshifted and
@@ -123,10 +126,29 @@ fn main() {
             ]);
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(840.0)), cx);
+            // `--mobile` opens the phone shell; `--mobile-fullscreen` also takes
+            // the whole display, which is how the shell is meant to feel on a
+            // small screen and how screenshots are taken on Wayland (no window
+            // stacking control there).
+            let mobile_shell = std::env::args().any(|argument| argument == "--mobile")
+                || std::env::args().any(|argument| argument == "--mobile-fullscreen")
+                || AppConfig::load().ui_layout.is_mobile();
+            let window_bounds = if std::env::args().any(|argument| argument == "--mobile-fullscreen")
+            {
+                WindowBounds::Fullscreen(bounds)
+            } else if mobile_shell {
+                WindowBounds::Windowed(Bounds::centered(None, size(px(430.0), px(780.0)), cx))
+            } else {
+                WindowBounds::Windowed(bounds)
+            };
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
                 titlebar: None,
-                window_min_size: Some(size(px(980.0), px(640.0))),
+                window_min_size: Some(if mobile_shell {
+                    size(px(340.0), px(480.0))
+                } else {
+                    size(px(980.0), px(640.0))
+                }),
                 ..Default::default()
             };
 
@@ -161,6 +183,51 @@ fn main() {
                 let vsync = config.vsync && lab_vsync;
                 if !vsync {
                     window.set_vsync(false);
+                }
+                // Mobile-shell preview knobs: open the drawer or one settings
+                // page at startup so screenshots can verify them on a Wayland
+                // session where window focus (and therefore input) cannot be
+                // handed to the app from a script.
+                let args: Vec<String> = std::env::args().collect();
+                let page_arg = args
+                    .iter()
+                    .find_map(|argument| argument.strip_prefix("--mobile-settings="))
+                    .map(str::to_string);
+                if args.iter().any(|argument| argument == "--mobile-drawer") {
+                    view.mobile.drawer_open = true;
+                    view.mobile.drawer_p = 1.0;
+                }
+                if args.iter().any(|argument| argument == "--mobile-settings")
+                    || page_arg.is_some()
+                {
+                    view.settings_open = true;
+                    view.mobile.page = match page_arg.as_deref() {
+                        Some("appearance") => crate::mobile::pages::SettingsPage::Appearance,
+                        Some("general") => crate::mobile::pages::SettingsPage::General,
+                        Some("models") => crate::mobile::pages::SettingsPage::Models,
+                        Some("about") => crate::mobile::pages::SettingsPage::About,
+                        _ => crate::mobile::pages::SettingsPage::Root,
+                    };
+                    cx.notify();
+                }
+                // `--mobile-sheet=model|actions|session` seeds a bottom sheet
+                // so its layout can be verified without input focus.
+                if let Some(kind) = args
+                    .iter()
+                    .find_map(|argument| argument.strip_prefix("--mobile-sheet="))
+                {
+                    view.mobile.sheet = match kind {
+                        "actions" => Some(crate::mobile::MobileSheet::Actions),
+                        "session" => view
+                            .sessions
+                            .first()
+                            .map(|summary| {
+                                crate::mobile::MobileSheet::Session(summary.id.clone())
+                            }),
+                        _ => Some(crate::mobile::MobileSheet::Model),
+                    };
+                    view.mobile.sheet_p = 1.0;
+                    cx.notify();
                 }
                 if std::env::args().any(|argument| argument == "--preview-composer") {
                     view.seed_composer_preview(window, cx);

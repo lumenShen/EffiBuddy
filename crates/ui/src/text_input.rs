@@ -334,6 +334,13 @@ impl TextInputState {
         &self.placeholder
     }
 
+    /// Swap the placeholder text. Layouts use different wording ("发消息" on
+    /// the phone, "给 EffiBuddy 一个任务" on the desktop), and the draft itself
+    /// is shared, so the wording has to be switchable at runtime.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>) {
+        self.placeholder = placeholder.into();
+    }
+
     pub fn multiline(&self) -> bool {
         self.multiline
     }

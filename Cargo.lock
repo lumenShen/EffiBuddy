@@ -1771,6 +1771,7 @@ dependencies = [
  "effibuddy-agent-tools",
  "effibuddy-browser",
  "effibuddy-computer",
+ "effibuddy-mobile",
  "effibuddy-ui",
  "gpui",
  "image",
@@ -1824,6 +1825,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "effibuddy-mobile"
+version = "0.2.15"
+
+[[package]]
 name = "effibuddy-stress"
 version = "0.2.15"
 dependencies = [
@@ -1840,6 +1845,7 @@ name = "effibuddy-ui"
 version = "0.2.15"
 dependencies = [
  "anyhow",
+ "effibuddy-mobile",
  "gpui",
  "pulldown-cmark",
  "unicode-segmentation",

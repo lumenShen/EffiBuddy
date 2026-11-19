@@ -1148,6 +1148,13 @@ impl AppView {
                                 this.settings.demo = !this.settings.demo;
                                 cx.notify();
                             }),
+                        ))
+                        .child(toggle_row(
+                            theme,
+                            "手机视图模式",
+                            "把桌面换成手机布局（Ctrl+Shift+M 切换，--mobile 启动）。",
+                            self.config.ui_layout.is_mobile(),
+                            cx.listener(|this, _, _, cx| this.toggle_ui_layout(cx)),
                         )),
                 )
                 .child(

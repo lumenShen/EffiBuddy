@@ -4,6 +4,7 @@
 //! editor and a Markdown renderer. The application composes these pieces into
 //! its shell.
 
+pub mod accent;
 pub mod assets;
 pub mod button;
 pub mod clipboard_paths;
@@ -15,6 +16,7 @@ pub mod table;
 pub mod text_input;
 pub mod theme;
 
+pub use accent::{AccentColors, AccentId};
 pub use assets::{EffiBuddyAssets, icons, images};
 pub use button::{Button, ButtonSize, ButtonVariant, IconButton};
 pub use markdown::{
@@ -41,4 +43,4 @@ pub use scroll::{
     WHEEL_LINE_HEIGHT, wheel_capture_overlay,
 };
 pub use text_input::{TextInputOptions, TextInputState, TextInputView, install_keybindings};
-pub use theme::{Theme, ThemeMode, alpha_color, color, line, radius, space, text};
+pub use theme::{Theme, ThemeMode, alpha_color, color, line, mobile, radius, space, text};

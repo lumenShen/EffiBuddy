@@ -8,6 +8,7 @@ description = "EffiBuddy design system built on GPUI primitives"
 
 [dependencies]
 anyhow.workspace = true
+effibuddy-mobile.workspace = true
 gpui.workspace = true
 pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true

@@ -98,6 +98,40 @@ pub struct AppConfig {
     /// only for the performance lab, which measures unlocked throughput.
     #[serde(default = "default_true")]
     pub vsync: bool,
+    /// Which shell to render: the desktop three-pane layout or the phone-shaped
+    /// mobile view. Persisted so the app reopens in the layout the user chose;
+    /// the mobile view also fills the window when it is narrower than a phone.
+    #[serde(default)]
+    pub ui_layout: UiLayout,
+    /// Accent preset for the mobile shell (`effibuddy_ui::AccentId::id`).
+    /// Ignored by the desktop layout, which keeps its neutral palette.
+    #[serde(default = "default_mobile_accent")]
+    pub mobile_accent: String,
+}
+
+/// Shell layout selector.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UiLayout {
+    /// Sidebar + chat + side pane, the desktop default.
+    #[default]
+    Desktop,
+    /// Phone-shaped column: top bar, drawer, full-bleed chat, floating
+    /// composer and mobile settings pages.
+    Mobile,
+}
+
+impl UiLayout {
+    pub fn is_mobile(self) -> bool {
+        matches!(self, UiLayout::Mobile)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            UiLayout::Desktop => "桌面",
+            UiLayout::Mobile => "手机",
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -141,6 +175,12 @@ fn default_theme() -> String {
     "light".to_string()
 }
 
+fn default_mobile_accent() -> String {
+    // Neutral by default: the phone shell inherits the desktop's ink palette,
+    // with a near-black seed for primary buttons. Other accents are opt-in.
+    "graphite".to_string()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -168,6 +208,8 @@ impl Default for AppConfig {
             ui_zoom: default_ui_zoom(),
             compaction: CompactionConfig::default(),
             vsync: true,
+            ui_layout: UiLayout::default(),
+            mobile_accent: default_mobile_accent(),
         }
     }
 }
@@ -211,6 +253,10 @@ impl AppConfig {
             config.compaction.max_consecutive_failures.clamp(1, 10);
         config.compaction.background_start_percent =
             config.compaction.background_start_percent.clamp(5.0, 90.0);
+        // Unknown accent ids (hand-edited config, a preset removed later) fall
+        // back to 雾蓝 instead of rendering an unthemed shell.
+        let accent = effibuddy_ui::AccentId::from_id(&config.mobile_accent);
+        config.mobile_accent = accent.id().to_string();
         config
     }
 
@@ -377,6 +423,26 @@ mod tests {
         assert!(config.palette_recent.is_empty());
         assert!(!config.sidebar_collapsed);
         assert_eq!(config.effective_default_mode(), PermissionMode::FullAccess);
+    }
+
+    #[test]
+    fn ui_layout_defaults_to_desktop_and_roundtrips() {
+        assert_eq!(AppConfig::default().ui_layout, UiLayout::Desktop);
+        assert!(!AppConfig::default().ui_layout.is_mobile());
+
+        let legacy: AppConfig =
+            serde_json::from_value(serde_json::json!({"theme": "dark"})).unwrap();
+        assert_eq!(legacy.ui_layout, UiLayout::Desktop);
+        assert_eq!(legacy.mobile_accent, "graphite");
+
+        let mut config = AppConfig::default();
+        config.ui_layout = UiLayout::Mobile;
+        config.mobile_accent = "dusk".to_string();
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("\"ui_layout\":\"mobile\""));
+        let restored: AppConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(restored.ui_layout, UiLayout::Mobile);
+        assert_eq!(restored.mobile_accent, "dusk");
     }
 
     #[test]

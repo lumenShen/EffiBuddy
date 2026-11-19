@@ -52,6 +52,23 @@ cargo run -p effibuddy-app
 
 会话工作区下的 `AGENTS.md`、`EFFIBUDDY.md`、`CLAUDE.md` 会作为项目指令自动附加到系统提示。
 
+### 手机视图
+
+同一个窗口可以切换成手机布局（会话、工具、审批、权限模型完全共用）：
+
+```bash
+cargo run -p effibuddy-app -- --mobile                # 手机列（430px），普通窗口
+cargo run -p effibuddy-app -- --mobile-fullscreen     # 全屏手机布局
+cargo run -p effibuddy-app -- --preview --mobile --mobile-drawer        # 抽屉
+cargo run -p effibuddy-app -- --preview --mobile --mobile-settings=appearance
+cargo run -p effibuddy-app -- --preview --mobile --mobile-sheet=model
+```
+
+运行中按 `Ctrl+Shift+M` 随时切换；也可以在「设置 → 通用 → 手机视图模式」里开关，选择会写进 `config.json`（`ui_layout` / `mobile_accent`）。
+手机视图默认使用与桌面一致的灰白黑基色，强调色（雾蓝/黛青/暮紫/松石/琥珀/石墨）只作用于主按钮、发送键、选中态与链接。
+
+手机布局与真机方案见 [docs/mobile/MOBILE_BUILD.md](docs/mobile/MOBILE_BUILD.md)。
+
 ### 快捷键
 
 | 快捷键 | 行为 |

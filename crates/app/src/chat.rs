@@ -2427,7 +2427,7 @@ fn advance_chars(text: &str, from: usize, count: usize) -> usize {
 
 /// Markdown click hook shared by every row: the app owns the menu, the
 /// renderer only reports the target and the click position.
-fn markdown_interaction(
+pub(crate) fn markdown_interaction(
     base_dir: &std::path::Path,
     entity: &WeakEntity<AppView>,
 ) -> MarkdownInteraction {
@@ -2853,7 +2853,7 @@ fn render_user(
 /// the message is streaming, the finished snapshot otherwise. The `RefCell`
 /// guards live as long as the struct; the slices are taken through accessor
 /// methods so nothing copies per frame.
-struct AssistantTexts<'a> {
+pub(crate) struct AssistantTexts<'a> {
     /// Live reveal state (buffers, revealed byte lengths, activity clock).
     stream: Option<StreamBorrow<'a>>,
     text: &'a str,
@@ -2870,7 +2870,7 @@ struct StreamBorrow<'a> {
 
 impl<'a> AssistantTexts<'a> {
     /// The revealed (or finished) markdown source of this row.
-    fn text(&'a self) -> &'a str {
+    pub(crate) fn text(&'a self) -> &'a str {
         match &self.stream {
             Some(stream) => {
                 let buffer = &stream.text[..stream.shown.min(stream.text.len())];
@@ -2881,7 +2881,7 @@ impl<'a> AssistantTexts<'a> {
     }
 
     /// The revealed (or finished) reasoning text of this row.
-    fn reasoning(&'a self) -> &'a str {
+    pub(crate) fn reasoning(&'a self) -> &'a str {
         match &self.stream {
             Some(stream) => {
                 let buffer = &stream.reasoning[..];
@@ -2891,12 +2891,12 @@ impl<'a> AssistantTexts<'a> {
         }
     }
 
-    fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         self.stream.as_ref().is_some_and(|stream| stream.active)
     }
 }
 
-fn assistant_texts<'a>(
+pub(crate) fn assistant_texts<'a>(
     assistant: &'a AssistantItem,
     view: &'a ChatViewState,
 ) -> AssistantTexts<'a> {
@@ -2970,7 +2970,7 @@ fn assistant_column(message_group: &SharedString) -> Div {
 
 /// Markdown source with the streaming caret appended (flows inline with the
 /// last sentence, exactly like the old whole-document streaming path).
-fn with_stream_caret(chunk_text: &str) -> String {
+pub(crate) fn with_stream_caret(chunk_text: &str) -> String {
     let mut streaming = String::with_capacity(chunk_text.len() + 2);
     streaming.push_str(chunk_text);
     if !streaming.is_empty() {
@@ -3156,7 +3156,7 @@ fn turn_body_index(turn: &TurnItem, streaming_id: Option<&str>) -> usize {
         .unwrap_or(last)
 }
 
-fn turn_body<'a>(turn: &'a TurnItem, view: &ChatViewState) -> &'a AssistantItem {
+pub(crate) fn turn_body<'a>(turn: &'a TurnItem, view: &ChatViewState) -> &'a AssistantItem {
     let streaming_id = view
         .stream
         .as_ref()
@@ -3202,7 +3202,7 @@ fn turn_expanded(turn: &TurnItem, view: &ChatViewState) -> bool {
 
 /// `turn_expanded` 的参数化版本：`prepare_frame` 在构造 `ChatViewState` 之前
 /// 也要判断展开态（做 slot key 指纹与自动展开计时）。
-fn turn_expanded_with(
+pub(crate) fn turn_expanded_with(
     turn: &TurnItem,
     collapsed_turns: &HashSet<String>,
     expanded_turns: &HashSet<String>,
@@ -3906,7 +3906,7 @@ fn render_copy_footer(
 
 /// ZCode message timestamp: local clock, `HH:mm` today, `M/D HH:mm` within
 /// the year, and a full date once the year differs.
-fn message_time_label(created_at: chrono::DateTime<chrono::Utc>) -> String {
+pub(crate) fn message_time_label(created_at: chrono::DateTime<chrono::Utc>) -> String {
     use chrono::{Datelike, Duration, Local, TimeZone};
     let local = Local.from_utc_datetime(&created_at.naive_utc());
     let now = Local::now();
@@ -5204,7 +5204,7 @@ pub(crate) fn format_elapsed(duration: Duration) -> String {
     }
 }
 
-fn format_duration_ms(milliseconds: u64) -> String {
+pub(crate) fn format_duration_ms(milliseconds: u64) -> String {
     if milliseconds < 1000 {
         format!("{milliseconds} ms")
     } else {
@@ -5226,7 +5226,7 @@ fn with_alpha(mut color: Hsla, alpha: f32) -> Hsla {
     color
 }
 
-fn tool_verb(name: &str) -> &'static str {
+pub(crate) fn tool_verb(name: &str) -> &'static str {
     match name {
         "read_file" => "读取",
         "write_file" => "写入",
@@ -5253,7 +5253,7 @@ fn tool_unit(name: &str) -> &'static str {
 
 /// Status folded into the tool verb, ZCode-style: 「正在读取」→「已读取」,
 /// failures degrade to the plain status word.
-fn tool_action_label(name: &str, result: Option<&ToolResult>, running: bool) -> String {
+pub(crate) fn tool_action_label(name: &str, result: Option<&ToolResult>, running: bool) -> String {
     if result.is_some_and(|result| result.is_error) {
         return "执行失败".to_string();
     }
@@ -5283,7 +5283,7 @@ fn notification_summary(text: &str) -> String {
     "任务通知已注入上下文".to_string()
 }
 
-fn latest_reasoning_line(text: &str) -> String {
+pub(crate) fn latest_reasoning_line(text: &str) -> String {
     text.lines()
         .rev()
         .map(str::trim)
@@ -5292,7 +5292,7 @@ fn latest_reasoning_line(text: &str) -> String {
         .unwrap_or_default()
 }
 
-fn tool_icon(name: &str) -> &'static str {
+pub(crate) fn tool_icon(name: &str) -> &'static str {
     match name {
         "shell" => icons::TERMINAL,
         "read_file" | "write_file" | "edit_file" => icons::FILE,
@@ -5305,7 +5305,7 @@ fn tool_icon(name: &str) -> &'static str {
     }
 }
 
-fn tool_detail(call: &ToolCall) -> String {
+pub(crate) fn tool_detail(call: &ToolCall) -> String {
     let arguments = &call.arguments;
     let detail = match call.name.as_str() {
         "read_file" | "write_file" | "edit_file" | "list_dir" => arguments
@@ -5679,7 +5679,7 @@ fn raster_image(
 /// Rasters attached to a tool result (usually computer-use screenshots).
 /// Base64 decoding is cached per `call_id:index`; the map lives on the chat
 /// list so a session switch releases the decoded pixels.
-fn tool_image(
+pub(crate) fn tool_image(
     view: &ChatViewState,
     call_id: &str,
     result: &ToolResult,
