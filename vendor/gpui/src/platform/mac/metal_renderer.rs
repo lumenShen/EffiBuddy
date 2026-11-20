@@ -454,6 +454,19 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::BackdropFilters(filters) => {
+                    // Metal has no backdrop blur pass: draw the tint quad so the
+                    // panel keeps its veil and rounded corners (see
+                    // `BackdropFilter::tint_quad`).
+                    let quads: Vec<Quad> = filters.iter().map(|filter| filter.tint_quad()).collect();
+                    self.draw_quads(
+                        &quads,
+                        instance_buffer,
+                        &mut instance_offset,
+                        viewport_size,
+                        command_encoder,
+                    )
+                }
                 PrimitiveBatch::Paths(paths) => {
                     command_encoder.end_encoding();
 

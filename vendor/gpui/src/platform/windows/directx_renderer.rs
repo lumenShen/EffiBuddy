@@ -289,6 +289,14 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
                 PrimitiveBatch::Quads(quads) => self.draw_quads(quads),
+                PrimitiveBatch::BackdropFilters(filters) => {
+                    // DirectX has no backdrop blur pass: draw the tint quad so
+                    // the panel keeps its veil and rounded corners (see
+                    // `BackdropFilter::tint_quad`).
+                    let quads: Vec<Quad> =
+                        filters.iter().map(|filter| filter.tint_quad()).collect();
+                    self.draw_quads(&quads)
+                }
                 PrimitiveBatch::Paths(paths) => {
                     self.draw_paths_to_intermediate(paths)?;
                     self.draw_paths_from_intermediate(paths)

@@ -509,6 +509,28 @@ pub(crate) struct BackdropFilter {
     pub tint: Hsla,
 }
 
+impl BackdropFilter {
+    /// The tint alone, as an ordinary rounded quad.
+    ///
+    /// The blade renderer blurs the captured framebuffer and composites this
+    /// exact quad through the shader. Renderers without an offscreen blur pass
+    /// (DirectX, Metal) use the quad itself: the panel keeps its veil, corner
+    /// mask and clipping, and only the blur is missing — a plain translucent
+    /// card on that platform instead of a compile error or an invisible panel.
+    pub(crate) fn tint_quad(&self) -> Quad {
+        Quad {
+            order: self.order,
+            border_style: Default::default(),
+            bounds: self.bounds,
+            content_mask: self.content_mask.clone(),
+            background: crate::solid_background(self.tint),
+            border_color: Default::default(),
+            corner_radii: self.corner_radii,
+            border_widths: Default::default(),
+        }
+    }
+}
+
 impl From<BackdropFilter> for Primitive {
     fn from(filter: BackdropFilter) -> Self {
         Primitive::BackdropFilter(filter)

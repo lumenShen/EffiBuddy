@@ -1167,16 +1167,7 @@ impl BladeRenderer {
                             },
                         );
 
-                        let quad = Quad {
-                            order: filter.order,
-                            border_style: Default::default(),
-                            bounds: filter.bounds,
-                            content_mask: filter.content_mask.clone(),
-                            background: crate::solid_background(filter.tint),
-                            border_color: Default::default(),
-                            corner_radii: filter.corner_radii,
-                            border_widths: Default::default(),
-                        };
+                        let quad = filter.tint_quad();
                         let instance_buf =
                             unsafe { self.instance_belt.alloc_typed(&[quad], &self.gpu) };
                         let mut encoder = pass.with(&self.pipelines.backdrop);
