@@ -1,0 +1,27 @@
+[package]
+name = "effibuddy-backdrop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Backdrop-filter (glass) pipeline with CPU and Vulkan compute backends"
+
+[lib]
+name = "effibuddy_backdrop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "backdrop-bench"
+path = "src/bin/backdrop_bench.rs"
+
+[dependencies]
+rayon = "1"
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
+blade-graphics = "0.7.0"
+blade-macros = "0.3.0"
+bytemuck = { version = "1", features = ["derive"] }
+log = "0.4"
+
+[dev-dependencies]
+ash = "0.38"

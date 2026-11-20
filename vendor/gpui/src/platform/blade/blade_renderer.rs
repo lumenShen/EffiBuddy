@@ -3,8 +3,8 @@
 
 use super::{BladeAtlas, BladeContext};
 use crate::{
-    Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point, PolychromeSprite,
-    PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
+    Background, BackdropFilter, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
+    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, Underline,
 };
 use blade_graphics as gpu;
 use blade_util::{BufferBelt, BufferBeltDescriptor};
@@ -14,6 +14,8 @@ use media::core_video::CVMetalTextureCache;
 use std::sync::Arc;
 
 const MAX_FRAME_TIME_MS: u32 = 10000;
+/// Backdrop blurs run at 1/4 resolution in each axis.
+const BACKDROP_BLUR_DIVISOR: u32 = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -107,6 +109,55 @@ struct ShaderSurfacesData {
     s_surface: gpu::Sampler,
 }
 
+/// Parameters for compositing the blurred backdrop under a quad.
+#[derive(Clone, Copy, Debug, Pod, Zeroable, Default)]
+#[repr(C)]
+struct BackdropParams {
+    uv_scale: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    pad: [f32; 2],
+}
+
+/// Parameters for one separable blur direction.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+struct BlurParams {
+    uv_scale: [f32; 2],
+    tap_step: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    weights: [f32; 12],
+}
+
+impl Default for BlurParams {
+    fn default() -> Self {
+        Self {
+            uv_scale: [0.0; 2],
+            tap_step: [0.0; 2],
+            uv_min: [0.0; 2],
+            uv_max: [1.0; 2],
+            weights: [0.0; 12],
+        }
+    }
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ShaderBackdropData {
+    globals: GlobalParams,
+    backdrop: BackdropParams,
+    t_backdrop: gpu::TextureView,
+    s_backdrop: gpu::Sampler,
+    b_quads: gpu::BufferPiece,
+}
+
+#[derive(blade_macros::ShaderData)]
+struct ShaderBackdropBlurData {
+    blur: BlurParams,
+    t_blur_source: gpu::TextureView,
+    s_blur_source: gpu::Sampler,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[repr(C)]
 struct PathSprite {
@@ -124,6 +175,8 @@ struct PathRasterizationVertex {
 
 struct BladePipelines {
     quads: gpu::RenderPipeline,
+    backdrop: gpu::RenderPipeline,
+    backdrop_blur: gpu::RenderPipeline,
     shadows: gpu::RenderPipeline,
     path_rasterization: gpu::RenderPipeline,
     paths: gpu::RenderPipeline,
@@ -179,6 +232,40 @@ impl BladePipelines {
                 depth_stencil: None,
                 fragment: Some(shader.at("fs_quad")),
                 color_targets,
+                multisample_state: gpu::MultisampleState::default(),
+            }),
+            // Composites the blurred backdrop through a quad's tint/rounding.
+            backdrop: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "backdrop",
+                data_layouts: &[&ShaderBackdropData::layout()],
+                vertex: shader.at("vs_quad"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_backdrop")),
+                color_targets,
+                multisample_state: gpu::MultisampleState::default(),
+            }),
+            // Separable blur passes overwrite their scissored region: no blend.
+            backdrop_blur: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "backdrop_blur",
+                data_layouts: &[&ShaderBackdropBlurData::layout()],
+                vertex: shader.at("vs_fullscreen"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_blur")),
+                color_targets: &[gpu::ColorTargetState {
+                    format: surface_info.format,
+                    blend: None,
+                    write_mask: gpu::ColorWrites::default(),
+                }],
                 multisample_state: gpu::MultisampleState::default(),
             }),
             shadows: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
@@ -305,6 +392,8 @@ impl BladePipelines {
 
     fn destroy(&mut self, gpu: &gpu::Context) {
         gpu.destroy_render_pipeline(&mut self.quads);
+        gpu.destroy_render_pipeline(&mut self.backdrop);
+        gpu.destroy_render_pipeline(&mut self.backdrop_blur);
         gpu.destroy_render_pipeline(&mut self.shadows);
         gpu.destroy_render_pipeline(&mut self.path_rasterization);
         gpu.destroy_render_pipeline(&mut self.paths);
@@ -395,6 +484,15 @@ pub struct BladeRenderer {
     path_intermediate_texture_view: gpu::TextureView,
     path_intermediate_msaa_texture: Option<gpu::Texture>,
     path_intermediate_msaa_texture_view: Option<gpu::TextureView>,
+    /// Snapshot of the framebuffer used as the backdrop source.
+    backdrop_capture: gpu::Texture,
+    backdrop_capture_view: gpu::TextureView,
+    /// Quarter-resolution ping-pong buffers for the separable blur.
+    backdrop_blur_a: gpu::Texture,
+    backdrop_blur_a_view: gpu::TextureView,
+    backdrop_blur_b: gpu::Texture,
+    backdrop_blur_b_view: gpu::TextureView,
+    backdrop_blur_size: (u32, u32),
     rendering_parameters: RenderingParameters,
 }
 
@@ -406,7 +504,8 @@ impl BladeRenderer {
     ) -> anyhow::Result<Self> {
         let surface_config = gpu::SurfaceConfig {
             size: config.size,
-            usage: gpu::TextureUsage::TARGET,
+            // COPY lets the backdrop filter snapshot the frame.
+            usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::COPY,
             display_sync: config.display_sync(),
             color_space: gpu::ColorSpace::Srgb,
             allow_exclusive_full_screen: false,
@@ -448,6 +547,32 @@ impl BladeRenderer {
                 config.size.width,
                 config.size.height,
             );
+        let (backdrop_capture, backdrop_capture_view) = create_backdrop_textures(
+            &context.gpu,
+            "backdrop capture",
+            surface.info().format,
+            config.size.width,
+            config.size.height,
+        );
+        let backdrop_blur_size = (
+            config.size.width.div_ceil(BACKDROP_BLUR_DIVISOR).max(1),
+            config.size.height.div_ceil(BACKDROP_BLUR_DIVISOR).max(1),
+        );
+        let (backdrop_blur_a, backdrop_blur_a_view) = create_backdrop_textures(
+            &context.gpu,
+            "backdrop blur a",
+            surface.info().format,
+            backdrop_blur_size.0,
+            backdrop_blur_size.1,
+        );
+        let (backdrop_blur_b, backdrop_blur_b_view) = create_backdrop_textures(
+            &context.gpu,
+            "backdrop blur b",
+            surface.info().format,
+            backdrop_blur_size.0,
+            backdrop_blur_size.1,
+        );
+
         let (path_intermediate_msaa_texture, path_intermediate_msaa_texture_view) =
             create_msaa_texture_if_needed(
                 &context.gpu,
@@ -482,6 +607,13 @@ impl BladeRenderer {
             path_intermediate_texture_view,
             path_intermediate_msaa_texture,
             path_intermediate_msaa_texture_view,
+            backdrop_capture,
+            backdrop_capture_view,
+            backdrop_blur_a,
+            backdrop_blur_a_view,
+            backdrop_blur_b,
+            backdrop_blur_b_view,
+            backdrop_blur_size,
             rendering_parameters,
         })
     }
@@ -575,6 +707,44 @@ impl BladeRenderer {
                 .unzip();
             self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
             self.path_intermediate_msaa_texture_view = path_intermediate_msaa_texture_view;
+
+            self.gpu.destroy_texture_view(self.backdrop_capture_view);
+            self.gpu.destroy_texture(self.backdrop_capture);
+            self.gpu.destroy_texture_view(self.backdrop_blur_a_view);
+            self.gpu.destroy_texture(self.backdrop_blur_a);
+            self.gpu.destroy_texture_view(self.backdrop_blur_b_view);
+            self.gpu.destroy_texture(self.backdrop_blur_b);
+            let (capture, capture_view) = create_backdrop_textures(
+                &self.gpu,
+                "backdrop capture",
+                self.surface.info().format,
+                gpu_size.width,
+                gpu_size.height,
+            );
+            self.backdrop_capture = capture;
+            self.backdrop_capture_view = capture_view;
+            self.backdrop_blur_size = (
+                gpu_size.width.div_ceil(BACKDROP_BLUR_DIVISOR).max(1),
+                gpu_size.height.div_ceil(BACKDROP_BLUR_DIVISOR).max(1),
+            );
+            let (blur_a, blur_a_view) = create_backdrop_textures(
+                &self.gpu,
+                "backdrop blur a",
+                self.surface.info().format,
+                self.backdrop_blur_size.0,
+                self.backdrop_blur_size.1,
+            );
+            self.backdrop_blur_a = blur_a;
+            self.backdrop_blur_a_view = blur_a_view;
+            let (blur_b, blur_b_view) = create_backdrop_textures(
+                &self.gpu,
+                "backdrop blur b",
+                self.surface.info().format,
+                self.backdrop_blur_size.0,
+                self.backdrop_blur_size.1,
+            );
+            self.backdrop_blur_b = blur_b;
+            self.backdrop_blur_b_view = blur_b_view;
         }
     }
 
@@ -732,6 +902,206 @@ impl BladeRenderer {
         if let Some(msaa_view) = self.path_intermediate_msaa_texture_view {
             self.gpu.destroy_texture_view(msaa_view);
         }
+        self.gpu.destroy_texture_view(self.backdrop_capture_view);
+        self.gpu.destroy_texture(self.backdrop_capture);
+        self.gpu.destroy_texture_view(self.backdrop_blur_a_view);
+        self.gpu.destroy_texture(self.backdrop_blur_a);
+        self.gpu.destroy_texture_view(self.backdrop_blur_b_view);
+        self.gpu.destroy_texture(self.backdrop_blur_b);
+    }
+
+    /// Snapshot the framebuffer through `filter`, then blur it with two
+    /// separable passes into `backdrop_blur_b`. Called with the main render
+    /// pass ended, right before the element's own geometry is drawn.
+    fn capture_and_blur_backdrop(
+        &mut self,
+        filter: &BackdropFilter,
+        target_texture: gpu::Texture,
+        target_view: gpu::TextureView,
+    ) {
+        let window_width = self.surface_config.size.width.max(1);
+        let window_height = self.surface_config.size.height.max(1);
+        let (blur_width, blur_height) = self.backdrop_blur_size;
+        let format = self.surface.info().format;
+
+        let region = backdrop_region(filter, window_width, window_height);
+        let Some((origin_x, origin_y, width, height)) = region else {
+            return;
+        };
+        let _ = format;
+
+        self.command_encoder.init_texture(self.backdrop_capture);
+
+        {
+            let mut transfer = self.command_encoder.transfer("backdrop capture");
+            transfer.copy_texture_to_texture(
+                gpu::TexturePiece {
+                    texture: target_texture,
+                    mip_level: 0,
+                    array_layer: 0,
+                    origin: [origin_x, origin_y, 0],
+                },
+                gpu::TexturePiece {
+                    texture: self.backdrop_capture,
+                    mip_level: 0,
+                    array_layer: 0,
+                    origin: [origin_x, origin_y, 0],
+                },
+                gpu::Extent {
+                    width,
+                    height,
+                    depth: 1,
+                },
+            );
+        }
+
+        // Region in blur-texture texels.
+        let blur_x = origin_x / BACKDROP_BLUR_DIVISOR;
+        let blur_y = origin_y / BACKDROP_BLUR_DIVISOR;
+        let blur_w = width.div_ceil(BACKDROP_BLUR_DIVISOR).max(1);
+        let blur_h = height.div_ceil(BACKDROP_BLUR_DIVISOR).max(1);
+
+        let weights = backdrop_blur_weights(filter.blur_radius);
+        let window_uv = [
+            BACKDROP_BLUR_DIVISOR as f32 / window_width as f32,
+            BACKDROP_BLUR_DIVISOR as f32 / window_height as f32,
+        ];
+        let blur_uv = [1.0 / blur_width as f32, 1.0 / blur_height as f32];
+
+        // Horizontal pass: capture -> blur_a.
+        self.command_encoder.init_texture(self.backdrop_blur_a);
+        let horizontal = BlurParams {
+            uv_scale: window_uv,
+            tap_step: [window_uv[0], 0.0],
+            uv_min: [
+                (origin_x as f32 + 0.5) / window_width as f32,
+                (origin_y as f32 + 0.5) / window_height as f32,
+            ],
+            uv_max: [
+                ((origin_x + width) as f32 - 0.5) / window_width as f32,
+                ((origin_y + height) as f32 - 0.5) / window_height as f32,
+            ],
+            weights,
+        };
+        if let mut pass = self.command_encoder.render(
+            "backdrop blur x",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: self.backdrop_blur_a_view,
+                    init_op: gpu::InitOp::Load,
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
+            pass.set_viewport(&gpu::Viewport {
+                x: blur_x as f32,
+                y: blur_y as f32,
+                w: blur_w as f32,
+                h: blur_h as f32,
+                depth: 0.0..1.0,
+            });
+            pass.set_scissor_rect(&gpu::ScissorRect {
+                x: blur_x as i32,
+                y: blur_y as i32,
+                w: blur_w,
+                h: blur_h,
+            });
+            let mut encoder = pass.with(&self.pipelines.backdrop_blur);
+            encoder.bind(
+                0,
+                &ShaderBackdropBlurData {
+                    blur: horizontal,
+                    t_blur_source: self.backdrop_capture_view,
+                    s_blur_source: self.atlas_sampler,
+                },
+            );
+            encoder.draw(0, 3, 0, 1);
+        }
+
+        // Vertical pass: blur_a -> blur_b.
+        self.command_encoder.init_texture(self.backdrop_blur_b);
+        let vertical = BlurParams {
+            uv_scale: blur_uv,
+            tap_step: [0.0, blur_uv[1]],
+            uv_min: [
+                (blur_x as f32 + 0.5) / blur_width as f32,
+                (blur_y as f32 + 0.5) / blur_height as f32,
+            ],
+            uv_max: [
+                ((blur_x + blur_w) as f32 - 0.5) / blur_width as f32,
+                ((blur_y + blur_h) as f32 - 0.5) / blur_height as f32,
+            ],
+            weights,
+        };
+        if let mut pass = self.command_encoder.render(
+            "backdrop blur y",
+            gpu::RenderTargetSet {
+                colors: &[gpu::RenderTarget {
+                    view: self.backdrop_blur_b_view,
+                    init_op: gpu::InitOp::Load,
+                    finish_op: gpu::FinishOp::Store,
+                }],
+                depth_stencil: None,
+            },
+        ) {
+            pass.set_viewport(&gpu::Viewport {
+                x: blur_x as f32,
+                y: blur_y as f32,
+                w: blur_w as f32,
+                h: blur_h as f32,
+                depth: 0.0..1.0,
+            });
+            pass.set_scissor_rect(&gpu::ScissorRect {
+                x: blur_x as i32,
+                y: blur_y as i32,
+                w: blur_w,
+                h: blur_h,
+            });
+            let mut encoder = pass.with(&self.pipelines.backdrop_blur);
+            encoder.bind(
+                0,
+                &ShaderBackdropBlurData {
+                    blur: vertical,
+                    t_blur_source: self.backdrop_blur_a_view,
+                    s_blur_source: self.atlas_sampler,
+                },
+            );
+            encoder.draw(0, 3, 0, 1);
+        }
+
+        let _ = target_view;
+    }
+
+    /// Composite parameters for the final glass quad.
+    fn backdrop_composite_params(&self, filter: &BackdropFilter) -> BackdropParams {
+        let window_width = self.surface_config.size.width.max(1);
+        let window_height = self.surface_config.size.height.max(1);
+        let (blur_width, blur_height) = self.backdrop_blur_size;
+        let (origin_x, origin_y, width, height) =
+            backdrop_region(filter, window_width, window_height).unwrap_or((0, 0, 1, 1));
+        let blur_x = origin_x / BACKDROP_BLUR_DIVISOR;
+        let blur_y = origin_y / BACKDROP_BLUR_DIVISOR;
+        let blur_w = width.div_ceil(BACKDROP_BLUR_DIVISOR).max(1);
+        let blur_h = height.div_ceil(BACKDROP_BLUR_DIVISOR).max(1);
+
+        BackdropParams {
+            // Fragment positions are in window pixels; the blur texture holds
+            // one texel per BLUR_DIVISOR pixels.
+            uv_scale: [
+                1.0 / (blur_width as f32 * BACKDROP_BLUR_DIVISOR as f32),
+                1.0 / (blur_height as f32 * BACKDROP_BLUR_DIVISOR as f32),
+            ],
+            uv_min: [
+                (blur_x as f32 + 0.5) / blur_width as f32,
+                (blur_y as f32 + 0.5) / blur_height as f32,
+            ],
+            uv_max: [
+                ((blur_x + blur_w) as f32 - 0.5) / blur_width as f32,
+                ((blur_y + blur_h) as f32 - 0.5) / blur_height as f32,
+            ],
+            pad: [0.0; 2],
+        }
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -771,6 +1141,58 @@ impl BladeRenderer {
         profiling::scope!("render pass");
         for batch in scene.batches() {
             match batch {
+                PrimitiveBatch::BackdropFilters(filters) => {
+                    for filter in filters {
+                        // Snapshot + blur with the main pass closed, then
+                        // reopen it and composite the glass quad.
+                        drop(pass);
+                        self.capture_and_blur_backdrop(
+                            filter,
+                            frame.texture(),
+                            frame.texture_view(),
+                        );
+
+                        // Compute the uv mapping before `self` is borrowed by
+                        // the render pass.
+                        let params = self.backdrop_composite_params(filter);
+                        pass = self.command_encoder.render(
+                            "main",
+                            gpu::RenderTargetSet {
+                                colors: &[gpu::RenderTarget {
+                                    view: frame.texture_view(),
+                                    init_op: gpu::InitOp::Load,
+                                    finish_op: gpu::FinishOp::Store,
+                                }],
+                                depth_stencil: None,
+                            },
+                        );
+
+                        let quad = Quad {
+                            order: filter.order,
+                            border_style: Default::default(),
+                            bounds: filter.bounds,
+                            content_mask: filter.content_mask.clone(),
+                            background: crate::solid_background(filter.tint),
+                            border_color: Default::default(),
+                            corner_radii: filter.corner_radii,
+                            border_widths: Default::default(),
+                        };
+                        let instance_buf =
+                            unsafe { self.instance_belt.alloc_typed(&[quad], &self.gpu) };
+                        let mut encoder = pass.with(&self.pipelines.backdrop);
+                        encoder.bind(
+                            0,
+                            &ShaderBackdropData {
+                                globals,
+                                backdrop: params,
+                                t_backdrop: self.backdrop_blur_b_view,
+                                s_backdrop: self.atlas_sampler,
+                                b_quads: instance_buf,
+                            },
+                        );
+                        encoder.draw(0, 4, 0, 1);
+                    }
+                }
                 PrimitiveBatch::Quads(quads) => {
                     let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.quads);
@@ -1010,6 +1432,88 @@ impl BladeRenderer {
         self.wait_for_gpu();
         self.last_sync_point = Some(sync_point);
     }
+}
+
+/// Textures used by the backdrop filter: one full-size capture and two
+/// quarter-resolution blur targets. All three are copy + sample + render
+/// targets so the passes can hand off to each other.
+fn create_backdrop_textures(
+    gpu: &gpu::Context,
+    name: &'static str,
+    format: gpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (gpu::Texture, gpu::TextureView) {
+    let texture = gpu.create_texture(gpu::TextureDesc {
+        name,
+        format,
+        size: gpu::Extent {
+            width: width.max(1),
+            height: height.max(1),
+            depth: 1,
+        },
+        array_layer_count: 1,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: gpu::TextureDimension::D2,
+        usage: gpu::TextureUsage::COPY | gpu::TextureUsage::RESOURCE | gpu::TextureUsage::TARGET,
+        external: None,
+    });
+    let view = gpu.create_texture_view(
+        texture,
+        gpu::TextureViewDesc {
+            name,
+            format,
+            dimension: gpu::ViewDimension::D2,
+            subresources: &Default::default(),
+        },
+    );
+    (texture, view)
+}
+
+/// Nine Gaussian weights for a blur of `radius` physical pixels, evaluated at
+/// quarter resolution (the blur passes work at 1/4 scale, one tap per blur
+/// pixel).
+fn backdrop_blur_weights(radius: f32) -> [f32; 12] {
+    let mut weights = [0.0f32; 12];
+    let sigma = (radius * 0.5 / 4.0).clamp(0.0, 5.0);
+    if sigma < 0.05 {
+        weights[4] = 1.0;
+        return weights;
+    }
+    let mut total = 0.0;
+    for tap in -4i32..=4 {
+        let weight = (-(tap * tap) as f32 / (2.0 * sigma * sigma)).exp();
+        weights[(tap + 4) as usize] = weight;
+        total += weight;
+    }
+    for weight in weights.iter_mut().take(9) {
+        *weight /= total;
+    }
+    weights
+}
+
+/// The drawable-space rectangle a backdrop filter covers, as
+/// `(x, y, width, height)` in whole pixels, or `None` when it is empty.
+fn backdrop_region(
+    filter: &BackdropFilter,
+    window_width: u32,
+    window_height: u32,
+) -> Option<(u32, u32, u32, u32)> {
+    let left = filter.bounds.origin.x.0.floor().clamp(0.0, window_width as f32);
+    let top = filter.bounds.origin.y.0.floor().clamp(0.0, window_height as f32);
+    let right = (filter.bounds.origin.x.0 + filter.bounds.size.width.0)
+        .ceil()
+        .clamp(0.0, window_width as f32);
+    let bottom = (filter.bounds.origin.y.0 + filter.bounds.size.height.0)
+        .ceil()
+        .clamp(0.0, window_height as f32);
+    let width = (right - left) as u32;
+    let height = (bottom - top) as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some((left as u32, top as u32, width, height))
 }
 
 fn create_path_intermediate_texture(

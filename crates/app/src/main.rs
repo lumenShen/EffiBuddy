@@ -15,6 +15,8 @@ mod chat_bench;
 #[cfg(test)]
 mod chat_scroll_tests;
 #[cfg(test)]
+mod chat_stream_stress;
+#[cfg(test)]
 mod sidebar_layout_tests;
 mod checkpoint;
 mod commands;
@@ -137,7 +139,11 @@ fn main() {
             {
                 WindowBounds::Fullscreen(bounds)
             } else if mobile_shell {
-                WindowBounds::Windowed(Bounds::centered(None, size(px(430.0), px(780.0)), cx))
+                WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(430.0), px(780.0)),
+                    cx,
+                ))
             } else {
                 WindowBounds::Windowed(bounds)
             };

@@ -28,6 +28,7 @@ pub(crate) struct Scene {
     pub(crate) shadows: Vec<Shadow>,
     pub(crate) quads: Vec<Quad>,
     pub(crate) paths: Vec<Path<ScaledPixels>>,
+    pub(crate) backdrop_filters: Vec<BackdropFilter>,
     pub(crate) underlines: Vec<Underline>,
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
@@ -42,6 +43,7 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.backdrop_filters.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
@@ -83,6 +85,10 @@ impl Scene {
             Primitive::Shadow(shadow) => {
                 shadow.order = order;
                 self.shadows.push(shadow.clone());
+            }
+            Primitive::BackdropFilter(filter) => {
+                filter.order = order;
+                self.backdrop_filters.push(filter.clone());
             }
             Primitive::Quad(quad) => {
                 quad.order = order;
@@ -128,6 +134,8 @@ impl Scene {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
         self.paths.sort_by_key(|path| path.order);
+        self.backdrop_filters
+            .sort_by_key(|filter| filter.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
@@ -154,6 +162,9 @@ impl Scene {
             paths: &self.paths,
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
+            backdrop_filters: &self.backdrop_filters,
+            backdrop_filters_start: 0,
+            backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
             underlines: &self.underlines,
             underlines_start: 0,
             underlines_iter: self.underlines.iter().peekable(),
@@ -180,6 +191,10 @@ impl Scene {
 )]
 pub(crate) enum PrimitiveKind {
     Shadow,
+    /// Sort key is deliberately *before* `Quad`: a backdrop filter must be
+    /// applied before the element's own background and content are drawn on
+    /// top of it.
+    BackdropFilter,
     #[default]
     Quad,
     Path,
@@ -198,6 +213,7 @@ pub(crate) enum PaintOperation {
 #[derive(Clone)]
 pub(crate) enum Primitive {
     Shadow(Shadow),
+    BackdropFilter(BackdropFilter),
     Quad(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
@@ -210,6 +226,7 @@ impl Primitive {
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
+            Primitive::BackdropFilter(filter) => &filter.bounds,
             Primitive::Quad(quad) => &quad.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
@@ -222,6 +239,7 @@ impl Primitive {
     pub fn content_mask(&self) -> &ContentMask<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
+            Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
@@ -243,6 +261,9 @@ struct BatchIterator<'a> {
     shadows: &'a [Shadow],
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
+    backdrop_filters: &'a [BackdropFilter],
+    backdrop_filters_start: usize,
+    backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
     quads: &'a [Quad],
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
@@ -271,6 +292,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
+            ),
+            (
+                self.backdrop_filters_iter.peek().map(|f| f.order),
+                PrimitiveKind::BackdropFilter,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
@@ -316,6 +341,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.shadows_start = shadows_end;
                 Some(PrimitiveBatch::Shadows(
                     &self.shadows[shadows_start..shadows_end],
+                ))
+            }
+            PrimitiveKind::BackdropFilter => {
+                let start = self.backdrop_filters_start;
+                let mut end = start + 1;
+                self.backdrop_filters_iter.next();
+                while self
+                    .backdrop_filters_iter
+                    .next_if(|filter| (filter.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    end += 1;
+                }
+                self.backdrop_filters_start = end;
+                Some(PrimitiveBatch::BackdropFilters(
+                    &self.backdrop_filters[start..end],
                 ))
             }
             PrimitiveKind::Quad => {
@@ -434,6 +475,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 )]
 pub(crate) enum PrimitiveBatch<'a> {
     Shadows(&'a [Shadow]),
+    BackdropFilters(&'a [BackdropFilter]),
     Quads(&'a [Quad]),
     Paths(&'a [Path<ScaledPixels>]),
     Underlines(&'a [Underline]),
@@ -446,6 +488,31 @@ pub(crate) enum PrimitiveBatch<'a> {
         sprites: &'a [PolychromeSprite],
     },
     Surfaces(&'a [PaintSurface]),
+}
+
+/// A request to draw the backdrop behind an element, blurred and tinted.
+///
+/// This is GPUI's equivalent of CSS `backdrop-filter: blur() <color>`: the
+/// renderer snapshots the framebuffer at this point in the paint order, blurs
+/// it on the GPU, and draws the result through the style's tint and corner
+/// radii. Everything painted *before* this primitive is inside the backdrop;
+/// everything after is not.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct BackdropFilter {
+    pub order: DrawOrder,
+    pub bounds: Bounds<ScaledPixels>,
+    pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Blur radius in physical pixels (CSS-equivalent).
+    pub blur_radius: f32,
+    /// Tint composited on top of the blurred backdrop.
+    pub tint: Hsla,
+}
+
+impl From<BackdropFilter> for Primitive {
+    fn from(filter: BackdropFilter) -> Self {
+        Primitive::BackdropFilter(filter)
+    }
 }
 
 #[derive(Default, Debug, Clone)]

@@ -352,3 +352,100 @@ fn routine_streaming_stays_glued_to_the_bottom(cx: &mut gpui::TestAppContext) {
         assert!(sim.chat.pinned(), "第 {index} 段后不再贴底");
     }
 }
+
+/// 贴底流式时，尾部行计划几乎每帧都会重排（reveal 分块表增长）。
+///
+/// `ListState::splice` 上游的保守行为是：如果当前逻辑滚动锚点落在被替换的
+/// 区间里，就把锚点重置到区间开头的第 0 像素。对虚拟化消息流来说，贴底时
+/// 视口恰好落在正在流式增长的那一行里，于是每次尾部重排都会把视口瞬移到该
+/// 行顶部，再由 `follow_bottom` 一帧 400px 地滑回底部——用户看到的就是周期性
+/// 的「突然上跳再滑下去」。
+///
+/// `ChatList` 用的是 [`gpui::ListState::splice_keep_anchor`]，行号与行内偏移
+/// 在重排后保持不变，因此贴底跟随不会被重置。
+#[gpui::test]
+fn pinned_tail_replan_keeps_the_viewport_inside_the_live_row(cx: &mut gpui::TestAppContext) {
+    let cx = cx.add_empty_window();
+    let mut sim = Sim::new("tail-anchor");
+    build_history(&mut sim, 4, 4);
+    sim.chat.rebuild(&sim.session, &sim.run);
+    sim.settle(cx, 3);
+    sim.chat.pin_to_bottom();
+    sim.settle(cx, 2);
+
+    sim.run.running = true;
+    sim.session.push_message(Message::user("把长结论写出来"));
+    let mut live = Message::assistant();
+    live.set_text("");
+    sim.session.push_message(live.clone());
+    sim.chat.begin_message(&live.id);
+    sim.chat.rebuild(&sim.session, &sim.run);
+    sim.settle(cx, 1);
+
+    // 先把实时行写长到远超一屏，让底部分块行本身就有几百像素高。这样锚点
+    // 一旦被重置到分块顶部，缺口会是肉眼可见的一大截。
+    // 正文分块：前面几段短文本负责把 fence 单独切出来，最后一块是一整段
+    // 未闭合的代码围栏（流式中围栏一直开着），高度远超一屏。贴底时视口顶部
+    // 落在这一块内部很深的位置，锚点一旦被重置到行首就是几千像素的上跳。
+    let mut text = String::new();
+    for index in 0..4 {
+        text.push_str(&paragraph(9, index));
+    }
+    text.push_str("```text\n");
+    for line in 0..500 {
+        text.push_str(&format!("fn streaming_line_{line}() {{ advance(); }}\n"));
+    }
+    let mut grown = Message::assistant();
+    grown.set_text(&text);
+    *sim.session.messages.last_mut().expect("live answer") = grown;
+    sim.chat.push_text(&live.id, &text);
+    sim.drain_reveal(cx);
+    // 多跑几帧让跟随追平：旧实现每帧最多 400px，缺口要大半天才补上。
+    sim.settle(cx, 20);
+
+    assert!(
+        sim.chat.list_state.item_count() >= 2,
+        "实时行没有被拆成分块，复现前提不成立"
+    );
+    let before = sim.chat.list_state.logical_scroll_top();
+    let gap = sim.max_offset() - sim.offset();
+    assert!(gap <= 2.0, "前置条件没贴底：缺口 {gap:.1}px");
+
+    // 一个字符的增量就会改变末块 key，触发一次只替换尾部的 splice。
+    sim.chat.push_text(&live.id, " ");
+    let mut grown = Message::assistant();
+    grown.set_text(&format!("{text} "));
+    *sim.session.messages.last_mut().expect("live answer") = grown;
+    sim.frame(cx);
+
+    let after = sim.chat.list_state.logical_scroll_top();
+    let gap = sim.max_offset() - sim.offset();
+    println!(
+        "[tail-anchor] 重排前锚点 {}({:.1}px) → 重排后 {}({:.1}px)，缺口 {gap:.1}px",
+        before.item_ix,
+        f32::from(before.offset_in_item),
+        after.item_ix,
+        f32::from(after.offset_in_item),
+    );
+    assert_eq!(
+        after.item_ix, before.item_ix,
+        "尾部重排把锚点从第 {} 行挪到了第 {} 行",
+        before.item_ix, after.item_ix
+    );
+    assert!(
+        f32::from(before.offset_in_item) > 200.0,
+        "复现前提不成立：锚点只落在行内 {:.1}px 处，重排后看不出差别",
+        f32::from(before.offset_in_item)
+    );
+    assert!(
+        (f32::from(after.offset_in_item) - f32::from(before.offset_in_item)).abs() <= 8.0,
+        "行内锚点从 {:.1}px 被重置到 {:.1}px：视口被挪到了被替换区间的开头",
+        f32::from(before.offset_in_item),
+        f32::from(after.offset_in_item)
+    );
+    assert!(
+        gap <= 64.0,
+        "尾部重排后离底部 {gap:.1}px：锚点被重置到被替换区间的开头了"
+    );
+    assert!(sim.chat.pinned(), "尾部重排后不再贴底");
+}

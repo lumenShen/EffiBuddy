@@ -786,6 +786,7 @@ fn render_assistant_block(
             &assistant.message.tool_calls,
             view,
             theme,
+            entity,
         ));
     }
     if !body.trim().is_empty() {
@@ -918,7 +919,12 @@ fn render_turn_block(
                 column = column.child(
                     div()
                         .pl(px(18.0))
-                        .child(render_tool_stack(&member.message.tool_calls, view, theme)),
+                        .child(render_tool_stack(
+                        &member.message.tool_calls,
+                        view,
+                        theme,
+                        entity,
+                    )),
                 );
             }
         }
@@ -1028,6 +1034,7 @@ fn render_tool_stack(
     calls: &[effibuddy_agent_core::ToolCall],
     view: &ChatViewState,
     theme: &Theme,
+    entity: &gpui::WeakEntity<AppView>,
 ) -> AnyElement {
     let results: &HashMap<String, Rc<effibuddy_agent_core::ToolResult>> = view.results.as_ref();
     let mut column = div()
@@ -1055,15 +1062,42 @@ fn render_tool_stack(
             // instead of the desktop's fixed 420×280 card.
             for index in 0..result.images.len() {
                 if let Some(image) = crate::chat::tool_image(view, &call.id, result, index) {
+                    let viewer_image = image.clone();
+                    let title = if result.images.len() > 1 {
+                        format!("{} · {}/{}", call.name, index + 1, result.images.len())
+                    } else {
+                        call.name.clone()
+                    };
+                    let viewer_entity = entity.clone();
                     column = column.child(
-                        img(image)
-                            .w_full()
-                            .max_h(px(260.0))
+                        div()
+                            .id(SharedString::from(format!(
+                                "tool-image-{}-{}",
+                                call.id, index
+                            )))
                             .mt(px(4.0))
                             .rounded(px(radius::SM))
+                            .overflow_hidden()
                             .border_1()
                             .border_color(theme.glass_border)
-                            .object_fit(gpui::ObjectFit::Contain),
+                            .cursor_pointer()
+                            .on_click(move |_, _, cx| {
+                                let _ = viewer_entity.update(cx, |this, cx| {
+                                    this.open_mobile_sheet(
+                                        crate::mobile::MobileSheet::Image {
+                                            image: viewer_image.clone(),
+                                            title: title.clone(),
+                                        },
+                                        cx,
+                                    );
+                                });
+                            })
+                            .child(
+                                img(image)
+                                    .w_full()
+                                    .max_h(px(260.0))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
                     );
                 }
             }

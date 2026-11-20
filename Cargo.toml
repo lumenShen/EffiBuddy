@@ -9,11 +9,12 @@ members = [
     "crates/ui",
     "crates/mobile",
     "crates/app",
+    "crates/backdrop",
     "crates/stress",
 ]
 
 [workspace.package]
-version = "0.2.15"
+version = "0.2.16"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -27,6 +28,7 @@ effibuddy-agent-js = { path = "crates/agent-js" }
 effibuddy-computer = { path = "crates/computer-use" }
 effibuddy-browser = { path = "crates/browser-use" }
 effibuddy-ui = { path = "crates/ui" }
+effibuddy-backdrop = { path = "crates/backdrop" }
 effibuddy-mobile = { path = "crates/mobile" }
 
 gpui = "0.2.2"
@@ -79,6 +81,12 @@ opt-level = 1
 # Vendored xattr is the fixed 0.2.3 variant whose Linux branch maps ENOATTR to
 # libc::ENODATA — the registry 0.2.3 references libc::ENOATTR, which modern
 # libc removed on Linux, breaking any fresh build (CI included). See vendor/xattr.
+# Vendored blade-graphics adds `Memory::Download` (HOST_ACCESS|DOWNLOAD) so
+# GPU results can be read back through host-cached memory; without it the
+# registry crate can only produce write-combined mappings (~0.04 GB/s memcpy)
+# or non-cached system memory (~0.3 GB/s). See vendor/blade-graphics and
+# crates/backdrop. The patch is additive: no existing API changes.
 [patch.crates-io]
 gpui = { path = "vendor/gpui" }
 xattr = { path = "vendor/xattr" }
+blade-graphics = { path = "vendor/blade-graphics" }

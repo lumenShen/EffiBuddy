@@ -84,9 +84,12 @@ pub enum HarnessEvent {
     },
     /// A retryable provider failure (a dropped SSE stream, a 429/5xx) is about
     /// to be retried. The host can show "正在重试" instead of an error card.
+    /// `unbounded` marks a rate-limit retry, which is not capped by
+    /// `max_retries`; the host then shows a counter instead of `attempt/max`.
     ProviderRetry {
         attempt: usize,
         max_retries: usize,
+        unbounded: bool,
         reason: String,
     },
     ApprovalRequested {
@@ -136,6 +139,15 @@ pub struct HarnessConfig {
     pub tool_timeout: Duration,
     pub max_retries: usize,
     pub retry_base_delay: Duration,
+    /// Ceiling for the bounded retry schedule (`max_retries` applies).
+    pub retry_max_delay: Duration,
+    /// Base backoff for rate-limit retries. Those are not capped by
+    /// `max_retries`, so they get their own, slower starting point.
+    pub rate_limit_base_delay: Duration,
+    /// Ceiling for rate-limit retries. The harness keeps re-issuing a
+    /// rate-limited request until it clears, so the delay has to plateau
+    /// instead of doubling forever.
+    pub rate_limit_max_delay: Duration,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     /// Reasoning effort requested from models that expose levels.
@@ -199,6 +211,9 @@ impl Default for HarnessConfig {
             tool_timeout: Duration::from_secs(180),
             max_retries: 2,
             retry_base_delay: Duration::from_millis(600),
+            retry_max_delay: Duration::from_secs(30),
+            rate_limit_base_delay: Duration::from_secs(2),
+            rate_limit_max_delay: Duration::from_secs(60),
             temperature: None,
             max_tokens: None,
             reasoning_effort: None,
@@ -1361,24 +1376,39 @@ impl AgentHarness {
     /// lets a dropped SSE stream (the common "chat stopped mid-sentence"
     /// failure) recover automatically instead of surfacing an error the user
     /// has to dismiss.
+    ///
+    /// Rate limits are the exception to the retry budget: the request is
+    /// valid and the limit always clears eventually, so a 429 keeps being
+    /// re-issued — second after second, until it succeeds — instead of burning
+    /// `max_retries` and dumping an error card on the user mid-turn. Only the
+    /// cancel token or a failure outside the retry rules stops that loop.
     async fn stream_with_retry(
         &self,
         request: ChatRequest,
         stream: &mut StreamState,
         cancel: &CancellationToken,
     ) -> Result<Option<Completion>, ProviderError> {
-        let mut attempt = 0usize;
+        // Two separate budgets. Rate-limit retries are open ended, everything
+        // else is capped by `max_retries`; counting them apart keeps a long 429
+        // spell from eating the budget a later transient 5xx still needs.
+        let mut rate_limit_retries = 0usize;
+        let mut bounded_retries = 0usize;
         loop {
-            attempt += 1;
             match self.stream_once(request.clone(), stream, cancel).await {
                 Ok(Some(completion)) => return Ok(Some(completion)),
                 Ok(None) => return Ok(None),
                 Err(error) if error.is_cancelled() => return Ok(None),
                 Err(error) => {
-                    let can_retry = attempt <= self.config.max_retries && error.is_retryable();
-                    if !can_retry {
+                    let rate_limited = error.is_rate_limited();
+                    let attempt = if rate_limited {
+                        rate_limit_retries += 1;
+                        rate_limit_retries
+                    } else if error.is_retryable() && bounded_retries < self.config.max_retries {
+                        bounded_retries += 1;
+                        bounded_retries
+                    } else {
                         return Err(error);
-                    }
+                    };
                     // Discard the truncated attempt before retrying. Without
                     // this the transcript would keep a half answer (and the UI
                     // a stale reveal buffer) next to the retried one.
@@ -1391,9 +1421,10 @@ impl AgentHarness {
                     self.emit(HarnessEvent::ProviderRetry {
                         attempt,
                         max_retries: self.config.max_retries,
+                        unbounded: rate_limited,
                         reason: error.to_string(),
                     });
-                    let delay = self.config.retry_base_delay * 2u32.pow((attempt - 1) as u32);
+                    let delay = self.retry_delay(attempt, rate_limited);
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(None),
                         _ = sleep(delay) => {}
@@ -1401,6 +1432,25 @@ impl AgentHarness {
                 }
             }
         }
+    }
+
+    /// Backoff for one retry. The bounded schedule doubles from
+    /// `retry_base_delay`; rate limits pace from `rate_limit_base_delay` and
+    /// plateau at `rate_limit_max_delay` so an unbounded retry loop cannot
+    /// overflow the shift or sleep for hours.
+    fn retry_delay(&self, attempt: usize, rate_limited: bool) -> Duration {
+        let (base, cap) = if rate_limited {
+            (
+                self.config.rate_limit_base_delay,
+                self.config.rate_limit_max_delay,
+            )
+        } else {
+            (self.config.retry_base_delay, self.config.retry_max_delay)
+        };
+        // `base * 2^(attempt - 1)` overflows `u32` after ~32 attempts, which an
+        // unbounded rate-limit loop reaches far too easily.
+        let shift = attempt.saturating_sub(1).min(16) as u32;
+        base.saturating_mul(1u32 << shift).min(cap)
     }
 
     /// Roll back the partially streamed assistant message of a failed attempt.
@@ -2042,6 +2092,43 @@ mod tests {
             )?;
             Ok(Completion {
                 text: "recovered answer".to_string(),
+                finish_reason: Some(FinishReason::Stop),
+                ..Completion::default()
+            })
+        }
+    }
+
+    /// Answers `HTTP 429` for the first `limit_hits` requests, then streams a
+    /// normal answer. Used to pin the open-ended rate-limit policy.
+    struct RateLimitedProvider {
+        limit_hits: usize,
+        attempts: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RateLimitedProvider {
+        fn name(&self) -> &str {
+            "rate-limited"
+        }
+
+        async fn stream(
+            &self,
+            _request: ChatRequest,
+            _cancel: CancellationToken,
+            events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+        ) -> Result<Completion, ProviderError> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) < self.limit_hits {
+                return Err(ProviderError::Http {
+                    status: 429,
+                    body: "Rate limit exceeded. Please try again later.".to_string(),
+                });
+            }
+            send_event(
+                &events,
+                ProviderEvent::TextDelta("after the limit".to_string()),
+            )?;
+            Ok(Completion {
+                text: "after the limit".to_string(),
                 finish_reason: Some(FinishReason::Stop),
                 ..Completion::default()
             })
@@ -3664,6 +3751,189 @@ mod tests {
                 .messages
                 .iter()
                 .all(|message| !message.id.eq(&discarded[0]))
+        );
+    }
+
+    /// A 429 is retried without consulting `max_retries`: the request is valid
+    /// and the limit clears on its own, so the turn must not die after the
+    /// bounded budget is spent (that is exactly the error card the user saw).
+    #[tokio::test]
+    async fn rate_limited_requests_retry_past_the_attempt_budget() {
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let provider = Arc::new(RateLimitedProvider {
+            limit_hits: 5,
+            attempts: AtomicUsize::new(0),
+        });
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider.clone(),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                // A budget of zero stops every bounded retry immediately, so a
+                // completed run proves the 429 loop ignored it.
+                max_retries: 0,
+                rate_limit_base_delay: Duration::from_millis(1),
+                rate_limit_max_delay: Duration::from_millis(1),
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+
+        let outcome = harness.run_turn("q").await.unwrap();
+        assert_eq!(outcome, RunOutcome::Completed);
+        assert_eq!(
+            provider.attempts.load(Ordering::SeqCst),
+            6,
+            "five 429s then the answer"
+        );
+
+        let mut unbounded = 0;
+        let mut bounded = 0;
+        while let Ok(event) = events.try_recv() {
+            if let HarnessEvent::ProviderRetry {
+                unbounded: is_unbounded,
+                ..
+            } = event
+            {
+                if is_unbounded {
+                    unbounded += 1;
+                } else {
+                    bounded += 1;
+                }
+            }
+        }
+        assert_eq!(unbounded, 5, "every 429 is announced as an open retry");
+        assert_eq!(bounded, 0);
+
+        let shared = harness.handle().session();
+        let session = lock_session(&shared);
+        let answers: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .map(|message| message.text())
+            .collect();
+        assert_eq!(answers, vec!["after the limit".to_string()]);
+    }
+
+    /// The open-ended loop is scoped to rate limits: an ordinary 5xx still
+    /// burns the bounded budget and then fails the turn.
+    #[tokio::test]
+    async fn server_errors_still_follow_the_bounded_retry_budget() {
+        struct FailingProvider {
+            attempts: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ModelProvider for FailingProvider {
+            fn name(&self) -> &str {
+                "server-error"
+            }
+
+            async fn stream(
+                &self,
+                _request: ChatRequest,
+                _cancel: CancellationToken,
+                _events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+            ) -> Result<Completion, ProviderError> {
+                self.attempts.fetch_add(1, Ordering::SeqCst);
+                Err(ProviderError::Http {
+                    status: 500,
+                    body: "internal error".to_string(),
+                })
+            }
+        }
+
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let provider = Arc::new(FailingProvider {
+            attempts: AtomicUsize::new(0),
+        });
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider.clone(),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                max_retries: 2,
+                retry_base_delay: Duration::from_millis(1),
+                rate_limit_base_delay: Duration::from_millis(1),
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+
+        let outcome = harness.run_turn("q").await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            provider.attempts.load(Ordering::SeqCst),
+            3,
+            "the first attempt plus max_retries"
+        );
+    }
+
+    /// A 429 spell does not spend the bounded budget: once the limit clears, a
+    /// transient 5xx still gets its own `max_retries` attempts instead of
+    /// failing the turn on its first appearance.
+    #[tokio::test]
+    async fn rate_limit_attempts_do_not_consume_the_bounded_budget() {
+        struct LimitedThenBroken {
+            requests: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl ModelProvider for LimitedThenBroken {
+            fn name(&self) -> &str {
+                "limited-then-broken"
+            }
+
+            async fn stream(
+                &self,
+                _request: ChatRequest,
+                _cancel: CancellationToken,
+                _events: tokio::sync::mpsc::UnboundedSender<ProviderEvent>,
+            ) -> Result<Completion, ProviderError> {
+                if self.requests.fetch_add(1, Ordering::SeqCst) < 2 {
+                    return Err(ProviderError::Http {
+                        status: 429,
+                        body: "Rate limit exceeded.".to_string(),
+                    });
+                }
+                Err(ProviderError::Http {
+                    status: 500,
+                    body: "internal error".to_string(),
+                })
+            }
+        }
+
+        let session = new_shared_session(SessionState::new(PathBuf::from("."), "test-model"));
+        let provider = Arc::new(LimitedThenBroken {
+            requests: AtomicUsize::new(0),
+        });
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let harness = AgentHarness::new(
+            session,
+            provider.clone(),
+            Arc::new(default_tools()),
+            Arc::new(AutoApprovalGate),
+            HarnessConfig {
+                max_retries: 1,
+                retry_base_delay: Duration::from_millis(1),
+                rate_limit_base_delay: Duration::from_millis(1),
+                rate_limit_max_delay: Duration::from_millis(1),
+                ..HarnessConfig::default()
+            },
+            tx,
+        );
+
+        let outcome = harness.run_turn("q").await.unwrap();
+        assert!(matches!(outcome, RunOutcome::Failed(_)), "{outcome:?}");
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            4,
+            "two 429s, then the first 500 and one bounded retry"
         );
     }
 }

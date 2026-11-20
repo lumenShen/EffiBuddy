@@ -8,8 +8,10 @@ description = "EffiBuddy design system built on GPUI primitives"
 
 [dependencies]
 anyhow.workspace = true
-effibuddy-mobile.workspace = true
+effibuddy-backdrop.workspace = true
 gpui.workspace = true
+image = { version = "0.25", default-features = false }
+effibuddy-mobile.workspace = true
 pulldown-cmark.workspace = true
 unicode-segmentation.workspace = true
 # Direct dependency (not via workspace) so parallel work packages never touch the root manifest.

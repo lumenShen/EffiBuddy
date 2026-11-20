@@ -494,6 +494,25 @@ struct PlanCache {
     collapsed_turns: HashSet<String>,
 }
 
+/// Per-frame scroll diagnostics for the stress/bench harnesses.
+///
+/// The real causes of a "scroll height jumped" symptom are invisible from the
+/// outside: a row-height reseed, a splice that re-measures a suffix of the
+/// list, or a plan miss that reorders rows all change the pixel coordinate
+/// system while the visible anchor stays put. Recording them next to the
+/// offset sample lets a run attribute every discontinuity to one of them.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FrameScrollTrace {
+    /// This frame reused the previous virtual-row plan (no structural work).
+    pub plan_hit: bool,
+    /// `(prefix, old_len, new_len)` when the list was spliced this frame.
+    pub splice: Option<(usize, usize, usize)>,
+    /// `calibrate_row_height` re-derived the estimate for unmeasured rows.
+    pub calibrated: bool,
+    /// Height currently assumed for never-measured rows.
+    pub seeded_row_height: f32,
+}
+
 pub(crate) struct ChatList {
     pub list_state: ListState,
     items: Rc<Vec<Rc<ChatItem>>>,
@@ -539,6 +558,13 @@ pub(crate) struct ChatList {
     /// [`Self::calibrate_row_height`]).
     seeded_row_height: f32,
     estimate_refreshed_at: Option<Instant>,
+    /// When `prepare_frame` last spliced more than a couple of rows (an
+    /// expansion invalidated the suffix, not just the streaming tail). Row-height
+    /// calibration waits a beat after that so the re-measure can land instead of
+    /// extrapolating from the handful of rows that stayed painted.
+    last_big_splice_at: Option<Instant>,
+    /// Last frame's structural scroll diagnostics (see [`FrameScrollTrace`]).
+    frame_trace: FrameScrollTrace,
     /// Test hook: the mouse-replay harness runs its own virtual clock, so a
     /// calibration throttled by real time would fire at an arbitrary point in
     /// the replay. Calibration has its own test.
@@ -607,6 +633,8 @@ impl ChatList {
             plan_cache: None,
             seeded_row_height: ESTIMATED_ROW_HEIGHT,
             estimate_refreshed_at: None,
+            last_big_splice_at: None,
+            frame_trace: FrameScrollTrace::default(),
             row_calibration_off: false,
             reveal_frame_scheduled: false,
             glide: ScrollGlide::new(),
@@ -673,6 +701,10 @@ impl ChatList {
         self.prompt_marks = Rc::new(Vec::new());
         self.first_slots.clear();
         self.plan_cache = None;
+        self.seeded_row_height = ESTIMATED_ROW_HEIGHT;
+        self.estimate_refreshed_at = None;
+        self.last_big_splice_at = None;
+        self.frame_trace = FrameScrollTrace::default();
         self.glide = ScrollGlide::new();
         self.turn_expand_at.clear();
         self.revealed_turns.clear();
@@ -1007,6 +1039,10 @@ impl ChatList {
     ) -> ChatViewState {
         let stream = self.reveal.snapshot();
         let streaming_id = stream.as_ref().map(|stream| stream.message_id.clone());
+        self.frame_trace = FrameScrollTrace {
+            seeded_row_height: self.seeded_row_height,
+            ..FrameScrollTrace::default()
+        };
         let streaming_chunks = if no_split() {
             None
         } else {
@@ -1047,6 +1083,7 @@ impl ChatList {
             });
         if plan_unchanged {
             PLAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.frame_trace.plan_hit = true;
             let markdown = markdown_interaction(&self.workspace, entity);
             return ChatViewState {
                 items: self.items.clone(),
@@ -1181,6 +1218,7 @@ impl ChatList {
         let new_len = new_slots.len();
         if self.first_sync {
             self.list_state.reset(new_len);
+            self.frame_trace.splice = Some((0, old_len, new_len));
             // `reset` clears the logical scroll top, so a transcript that was
             // following the tail would land on row 0 — a cold open of a long
             // session would show its opening instead of the newest messages.
@@ -1196,7 +1234,17 @@ impl ChatList {
                 .take_while(|(old, new)| old == new)
                 .count();
             if prefix < old_len || new_len != old_len {
-                self.list_state.splice(prefix..old_len, new_len - prefix);
+                // The chat re-plans its tail on almost every streaming frame
+                // (the reveal chunk table grows) and the viewport sits on that
+                // tail when following the bottom. Drops the anchor to the start
+                // of the replaced range would teleport the viewport up by the
+                // whole live turn; keep the row/offset instead.
+                self.list_state
+                    .splice_keep_anchor(prefix..old_len, new_len - prefix);
+                self.frame_trace.splice = Some((prefix, old_len, new_len));
+                if old_len.saturating_sub(prefix) > 4 {
+                    self.last_big_splice_at = Some(Instant::now());
+                }
             }
         }
         self.slots = new_slots;
@@ -1243,6 +1291,11 @@ impl ChatList {
     /// trace helper: how many logical rows the transcript has.
     pub fn trace_counts(&self) -> (usize, usize) {
         (self.items.len(), self.slots.len())
+    }
+
+    /// Structural scroll diagnostics for the frame `prepare_frame` just built.
+    pub(crate) fn frame_scroll_trace(&self) -> FrameScrollTrace {
+        self.frame_trace
     }
 
     /// Rasters the cache dropped since the last call, for the host to unload
@@ -1601,15 +1654,42 @@ impl ChatList {
     /// which moves the scrollbar and the pinned/follow logic even though the
     /// visible anchor is preserved. One pass over the height tree fixes the
     /// remaining rows; it is throttled because the walk is O(rows).
+    ///
+    /// A re-seed is a global rewrite of every unmeasured height, so it must be
+    /// based on a trustworthy sample and must not fight a structural change
+    /// that is still settling:
+    ///
+    /// * at least `MIN_SAMPLES` rows (or the whole list, when it is shorter)
+    ///   must be measured — a splice that re-plans the tail marks a whole
+    ///   suffix unmeasured and can leave two measured rows, one of them the
+    ///   giant live turn;    /// * the estimate is the *median* measured height, not the mean, because
+    ///   one expanded turn row is thousands of pixels and drags the mean by an
+    ///   order of magnitude;
+    /// * a splice that invalidated many rows starts a short cooldown, so the
+    ///   re-measure has a chance to land before the estimate is extrapolated;
+    /// * one calibration can at most double / halve the estimate, so even a
+    ///   bad sample degrades the scroll range gradually instead of exploding it.
     fn calibrate_row_height(&mut self) {
         const REFRESH: Duration = Duration::from_millis(400);
         const TOLERANCE: f32 = 12.0;
+        const MIN_SAMPLES: usize = 8;
+        const SPLICE_COOLDOWN: Duration = Duration::from_millis(800);
         // Only while the viewport is standing still: re-seeding rewrites every
         // unmeasured height, which moves the pixel coordinate system by tens of
         // thousands of pixels. The row anchor is preserved, so an idle
         // transcript does not visibly move — but a glide in flight would keep
         // chasing a target expressed in the old coordinates.
         if self.glide.active() || self.row_calibration_off {
+            return;
+        }
+        // Re-seeding rewrites the pixel coordinate system of every unmeasured
+        // row *above and below* the viewport. While the user is reading history
+        // (not pinned) that is visible as a scrollbar jump with no input behind
+        // it; only refine the estimate when the viewport is following the tail,
+        // where the same rewrite is absorbed by the pinned follow. A transcript
+        // opened at the bottom starts pinned, so the cold-open estimate still
+        // converges immediately.
+        if !self.pinned {
             return;
         }
         let now = Instant::now();
@@ -1619,22 +1699,33 @@ impl ChatList {
             return;
         }
         self.estimate_refreshed_at = Some(now);
-        let Some(mean) = self.list_state.measured_mean_height() else {
+        if let Some(spliced_at) = self.last_big_splice_at
+            && now.duration_since(spliced_at) < SPLICE_COOLDOWN
+        {
+            return;
+        }
+        let Some((samples, median)) = self.list_state.measured_median_height() else {
             return;
         };
-        let mean = f32::from(mean);
-        if (mean - self.seeded_row_height).abs() < TOLERANCE {
+        let need = MIN_SAMPLES.min(self.list_state.item_count()).max(1);
+        if samples < need {
+            return;
+        }
+        let median = f32::from(median);
+        let estimate = median.clamp(self.seeded_row_height * 0.5, self.seeded_row_height * 2.0);
+        if (estimate - self.seeded_row_height).abs() < TOLERANCE {
             return;
         }
         if std::env::var_os("EFFIBUDDY_ROW_CALIBRATE_TRACE").is_some() {
             println!(
-                "[calibrate] 行高估算 {:.1} → {:.1}px（已测量均值）",
-                self.seeded_row_height, mean
+                "[calibrate] 行高估算 {:.1} → {:.1}px（{samples} 行中位数 {median:.1}，估算值已限幅）",
+                self.seeded_row_height, estimate
             );
         }
-        self.seeded_row_height = mean;
-        self.list_state.set_estimated_item_height(px(mean));
-        self.list_state.reseed_unmeasured(px(mean));
+        self.seeded_row_height = estimate;
+        self.list_state.set_estimated_item_height(px(estimate));
+        self.list_state.reseed_unmeasured(px(estimate));
+        self.frame_trace.calibrated = true;
     }
 
     /// Turn off the real-time row-height calibration (tests that drive their

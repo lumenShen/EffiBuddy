@@ -226,6 +226,7 @@ sequenceDiagram
 - 逐块解析 SSE，支持 CRLF、跨块行边界与 `[DONE]`；
 - 累加 tool-call 参数片段，按 index/item 重组，参数非法时保留 `argument_parse_error`；
 - 解析 usage 与 prompt cache 命中；区分可重试错误（超时、连接失败、408/409/425/429/5xx）与永久错误（4xx 其他）；
+- 限流（429，或 503/529 表明 overload/capacity）单独归类：harness 对它**不设重试上限**，一直重投到限流结束或用户中断，只有换到其他错误码才按 `max_retries` 收手；退避按 `rate_limit_base_delay` 起步、`rate_limit_max_delay` 封顶，避免无限重试把延迟撑爆；
 - `ChatRequest.reasoning_effort` 只在模型显式配置推理档位时写入；
 - DeepSeek 方言端点的请求一旦携带 `tools`，所有 assistant 历史消息都会回传 `reasoning_content`（模型返回空串时也保留字段）；否则思考模式的工具回合会被 API 以 400 拒绝。其他 OpenAI 兼容端点不发送该字段。
 

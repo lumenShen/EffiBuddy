@@ -138,6 +138,37 @@ impl ObjectFit {
     }
 }
 
+/// A `backdrop-filter` for an element: blur what is drawn behind it, tint it,
+/// and clip it to the element's rounded corners.
+///
+/// Added by EffiBuddy on top of upstream GPUI. The renderer snapshots the
+/// framebuffer at the element's paint order, blurs it on the GPU at quarter
+/// resolution, and composites the result before the element's own background
+/// and children are drawn (so it behaves like CSS `backdrop-filter`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct BackdropFilterStyle {
+    /// CSS-equivalent blur radius, in physical pixels.
+    pub blur_radius: f32,
+    /// Colour laid over the blurred backdrop; alpha is the "milkiness".
+    pub tint: Hsla,
+}
+
+impl Default for BackdropFilterStyle {
+    fn default() -> Self {
+        Self {
+            blur_radius: 0.0,
+            tint: Hsla::transparent_black(),
+        }
+    }
+}
+
+impl BackdropFilterStyle {
+    /// True when the filter would be a no-op.
+    pub fn is_identity(&self) -> bool {
+        self.blur_radius <= 0.5 && self.tint.a == 0.0
+    }
+}
+
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
 #[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -250,6 +281,9 @@ pub struct Style {
 
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
+
+    /// Blur/tint the content behind this element, like CSS `backdrop-filter`.
+    pub backdrop_filter: Option<BackdropFilterStyle>,
 
     /// The text style of this element
     pub text: TextStyleRefinement,
@@ -626,6 +660,12 @@ impl Style {
 
         window.paint_shadows(bounds, corner_radii, &self.box_shadow);
 
+        if let Some(backdrop_filter) = self.backdrop_filter
+            && !backdrop_filter.is_identity()
+        {
+            window.paint_backdrop_filter(bounds, corner_radii, backdrop_filter);
+        }
+
         let background_color = self.background.as_ref().and_then(Fill::color);
         if background_color.is_some_and(|color| !color.is_transparent()) {
             let mut border_color = match background_color {
@@ -766,6 +806,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            backdrop_filter: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

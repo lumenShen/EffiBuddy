@@ -148,6 +148,18 @@ fn stress_requested() -> bool {
     }
 }
 
+/// Label for the in-flight retry banner.
+///
+/// A rate-limit retry is open ended, so showing `attempt/max_retries` would be
+/// a lie (there is no cap): it reports the running attempt count instead.
+fn provider_retry_text(attempt: usize, max_retries: usize, unbounded: bool) -> String {
+    if unbounded {
+        format!("请求被限流，持续重试中（第 {attempt} 次）…")
+    } else {
+        format!("连接中断，正在重试（{attempt}/{max_retries}）…")
+    }
+}
+
 #[derive(Clone)]
 enum PaletteAction {
     NewSession,
@@ -4146,9 +4158,10 @@ impl AppView {
             HarnessEvent::ProviderRetry {
                 attempt,
                 max_retries,
+                unbounded,
                 ..
             } => {
-                self.retry_status = Some(format!("连接中断，正在重试（{attempt}/{max_retries}）…"));
+                self.retry_status = Some(provider_retry_text(*attempt, *max_retries, *unbounded));
                 structural = true;
             }
             HarnessEvent::ApprovalRequested { request } => {
@@ -4350,12 +4363,13 @@ impl AppView {
             HarnessEvent::ProviderRetry {
                 attempt,
                 max_retries,
+                unbounded,
                 ..
             } => {
                 self.background_sessions
                     .entry(session_id.to_string())
                     .or_default()
-                    .retry_status = Some(format!("连接中断，正在重试（{attempt}/{max_retries}）…"));
+                    .retry_status = Some(provider_retry_text(*attempt, *max_retries, *unbounded));
             }
             // Deltas already landed in the shared transcript; the hidden
             // transcript's typewriter mirror is not running.
@@ -11201,13 +11215,17 @@ impl AppView {
     fn render_reward_dialog(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let backdrop_entity = cx.entity().downgrade();
+        // Frosted glass: the card blurs whatever is behind it (dimmed content)
+        // through a translucent veil, like CSS `backdrop-filter`. The veil keeps
+        // body text at the same contrast the opaque card had.
         let card = div()
             .id("reward-dialog")
             .w(px(396.0))
             .rounded(px(radius::XL))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.elevated)
+            .bg(theme.elevated.opacity(0.72))
+            .backdrop_filter(px(18.0), theme.elevated.opacity(0.22))
             .shadow(shadow_float(theme))
             .p(px(18.0))
             .flex()

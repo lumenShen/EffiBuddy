@@ -78,6 +78,11 @@ pub(crate) enum MobileSheet {
     },
     /// Archived conversations, with restore.
     Archived,
+    /// Full-screen image viewer for a tool screenshot.
+    Image {
+        image: std::sync::Arc<gpui::Image>,
+        title: String,
+    },
 }
 
 /// Mobile-shell UI state that outlives a frame (drawer position, filters,
@@ -1248,6 +1253,7 @@ impl AppView {
             MobileSheet::Agents => "子代理".to_string(),
             MobileSheet::Message { .. } => "消息操作".to_string(),
             MobileSheet::Archived => "归档会话".to_string(),
+            MobileSheet::Image { title, .. } => title.clone(),
         };
 
         let body: AnyElement = match &sheet {
@@ -1263,6 +1269,35 @@ impl AppView {
                 self.render_message_sheet(theme, &id, &text, user, window, cx)
             }
             MobileSheet::Archived => self.render_archived_sheet(theme, cx),
+            MobileSheet::Image { image, .. } => {
+                let image = image.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(space::SM))
+                    .child(
+                        div()
+                            .w_full()
+                            .rounded(px(geo::RADIUS_CARD))
+                            .border_1()
+                            .border_color(theme.glass_border)
+                            .bg(theme.code_bg)
+                            .p(px(4.0))
+                            .child(
+                                gpui::img(image)
+                                    .w_full()
+                                    .max_h(px(420.0))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child("点右上角 × 关闭；再次点缩略图可重开。"),
+                    )
+                    .into_any_element()
+            }
         };
 
         div()
@@ -1285,7 +1320,11 @@ impl AppView {
                     .left_0()
                     .right_0()
                     .bottom(px(-offset))
-                    .max_h(px(520.0))
+                    .max_h(px(if matches!(sheet, MobileSheet::Image { .. }) {
+                        620.0
+                    } else {
+                        520.0
+                    }))
                     .flex()
                     .flex_col()
                     .rounded_t(px(geo::RADIUS_SHEET))

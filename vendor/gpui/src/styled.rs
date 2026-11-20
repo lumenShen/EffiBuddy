@@ -1,8 +1,9 @@
 use crate::{
-    self as gpui, AbsoluteLength, AlignContent, AlignItems, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontStyle, FontWeight,
-    GridPlacement, Hsla, JustifyContent, Length, SharedString, StrikethroughStyle, StyleRefinement,
-    TextAlign, TextOverflow, TextStyleRefinement, UnderlineStyle, WhiteSpace, px, relative, rems,
+    self as gpui, AbsoluteLength, AlignContent, AlignItems, BackdropFilterStyle, BorderStyle,
+    CursorStyle, DefiniteLength, Display, Fill, FlexDirection, FlexWrap, Font, FontStyle,
+    FontWeight, GridPlacement, Hsla, JustifyContent, Length, Pixels, SharedString,
+    StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow, TextStyleRefinement,
+    UnderlineStyle, WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -31,6 +32,32 @@ pub trait Styled: Sized {
     gpui_macros::cursor_style_methods!();
     gpui_macros::border_style_methods!();
     gpui_macros::box_shadow_style_methods!();
+
+    /// Blurs and tints everything painted behind this element, clipped to its
+    /// rounded corners — the GPUI equivalent of CSS
+    /// `backdrop-filter: blur(<radius>)`.
+    ///
+    /// ```ignore
+    /// div()
+    ///     .rounded(px(14.0))
+    ///     .backdrop_filter(px(24.0), hsla(0.0, 0.0, 1.0, 0.16))
+    /// ```
+    fn backdrop_filter(mut self, blur_radius: Pixels, tint: Hsla) -> Self {
+        self.style().backdrop_filter = Some(BackdropFilterStyle {
+            blur_radius: blur_radius.0,
+            tint,
+        });
+        self
+    }
+
+    /// Same as [`Styled::backdrop_filter`] with the radius in raw pixels.
+    fn backdrop_filter_px(mut self, blur_radius: f32, tint: Hsla) -> Self {
+        self.style().backdrop_filter = Some(BackdropFilterStyle {
+            blur_radius,
+            tint,
+        });
+        self
+    }
 
     /// Sets the display type of the element to `block`.
     /// [Docs](https://tailwindcss.com/docs/display)

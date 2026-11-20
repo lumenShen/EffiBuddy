@@ -58,6 +58,31 @@ impl ProviderError {
         }
     }
 
+    /// True when the provider refused the request only because of rate
+    /// limiting (HTTP 429, "too many requests", an overload/capacity notice).
+    ///
+    /// The harness treats this class as open ended: the request itself is
+    /// valid and the limit always clears eventually, so counting attempts and
+    /// surfacing "HTTP 429" after two of them just turns a temporary limit
+    /// into a dead turn the user has to re-send by hand. Every other retryable
+    /// failure keeps the bounded retry budget.
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            // 429 is the canonical "come back later". 503/529 are what the
+            // OpenAI and Anthropic gateways use for overload, but they also
+            // cover real outages, so they only count when the body says the
+            // provider is shedding load.
+            ProviderError::Http { status, body } => {
+                *status == 429 || (matches!(*status, 503 | 529) && mentions_rate_limit(body))
+            }
+            ProviderError::Api(message) => mentions_rate_limit(message),
+            ProviderError::Cancelled
+            | ProviderError::Network(_)
+            | ProviderError::Parse(_)
+            | ProviderError::Other(_) => false,
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         matches!(self, ProviderError::Cancelled)
     }
@@ -98,6 +123,24 @@ impl ProviderError {
     }
 }
 
+/// Rate-limit / load-shedding phrasing shared by the provider adapters.
+fn mentions_rate_limit(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "overloaded",
+        "at capacity",
+        "over capacity",
+        "quota exceeded",
+        "slow down",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// A tool execution failure. Tool failures are *data*, not harness failures:
 /// they are appended to the transcript so the model can recover.
 #[derive(Debug, Clone, Error)]
@@ -117,5 +160,44 @@ impl ToolError {
 impl From<std::io::Error> for ToolError {
     fn from(value: std::io::Error) -> Self {
         Self::new(value.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limits_are_classified_separately_from_other_failures() {
+        assert!(
+            ProviderError::Http {
+                status: 429,
+                body: "Rate limit exceeded. Please try again later.".to_string(),
+            }
+            .is_rate_limited()
+        );
+        assert!(
+            ProviderError::Http {
+                status: 503,
+                body: "{\"error\":{\"type\":\"overloaded_error\"}}".to_string(),
+            }
+            .is_rate_limited()
+        );
+        assert!(
+            !ProviderError::Http {
+                status: 500,
+                body: "internal error".to_string(),
+            }
+            .is_rate_limited()
+        );
+        assert!(
+            !ProviderError::Http {
+                status: 400,
+                body: "bad request".to_string(),
+            }
+            .is_rate_limited()
+        );
+        assert!(ProviderError::Api("rate limit reached".to_string()).is_rate_limited());
+        assert!(!ProviderError::Network("connection reset".to_string()).is_rate_limited());
     }
 }

@@ -2,7 +2,8 @@
 use crate::Inspector;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
-    AsyncWindowContext, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow, Capslock,
+    AsyncWindowContext, AvailableSpace, BackdropFilter, BackdropFilterStyle, Background,
+    BorderStyle, Bounds, BoxShadow, Capslock,
     Context, Corners, CursorStyle, Decorations, DevicePixels, DispatchActionListener,
     DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity, EntityId, EventEmitter,
     FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs, Hsla, InputHandler, IsZero,
@@ -2931,6 +2932,36 @@ impl Window {
             corner_radii: quad.corner_radii.scale(scale_factor),
             border_widths: quad.border_widths.scale(scale_factor),
             border_style: quad.border_style,
+        });
+    }
+
+    /// Blur and tint everything painted so far behind `bounds`.
+    ///
+    /// This is the scene-level half of `backdrop-filter`: the renderer
+    /// snapshots the framebuffer when it reaches this primitive, blurs the
+    /// element's rectangle on the GPU and composites it through `tint` and
+    /// `corner_radii`. Anything painted after this call is drawn on top,
+    /// unblurred.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_backdrop_filter(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        style: BackdropFilterStyle,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        let scale_factor = self.scale_factor();
+        let content_mask = self.content_mask();
+        let opacity = self.element_opacity();
+        self.next_frame.scene.insert_primitive(BackdropFilter {
+            order: 0,
+            bounds: bounds.scale(scale_factor),
+            content_mask: content_mask.scale(scale_factor),
+            corner_radii: corner_radii.scale(scale_factor),
+            blur_radius: style.blur_radius * scale_factor,
+            tint: style.tint.opacity(opacity),
         });
     }
 

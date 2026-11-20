@@ -305,7 +305,21 @@ impl ListState {
     /// Inform the list state that the items in `old_range` have been replaced
     /// by `count` new items that must be recalculated.
     pub fn splice(&self, old_range: Range<usize>, count: usize) {
-        self.splice_focusable(old_range, (0..count).map(|_| None))
+        self.splice_focusable_with_anchor(old_range, (0..count).map(|_| None), false)
+    }
+
+    /// Like [`Self::splice`], but keeps the logical scroll anchor when it falls
+    /// inside the replaced range.
+    ///
+    /// Virtualized content re-plans the *tail* of its list every frame (a
+    /// streaming row grows, a chunk table re-chunks) and the viewport sits on
+    /// exactly those rows when the owner follows the tail. The conservative
+    /// upstream anchor reset — move to `(old_range.start, 0)` — then teleports
+    /// the viewport to the top of the replaced range on every re-plan, and the
+    /// owner's follow logic has to slide it back down. Keeping the anchor row
+    /// and its in-row offset makes a same-position replacement invisible.
+    pub fn splice_keep_anchor(&self, old_range: Range<usize>, count: usize) {
+        self.splice_focusable_with_anchor(old_range, (0..count).map(|_| None), true)
     }
 
     /// Register with the list state that the items in `old_range` have been replaced
@@ -316,6 +330,15 @@ impl ListState {
         &self,
         old_range: Range<usize>,
         focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+    ) {
+        self.splice_focusable_with_anchor(old_range, focus_handles, false)
+    }
+
+    fn splice_focusable_with_anchor(
+        &self,
+        old_range: Range<usize>,
+        focus_handles: impl IntoIterator<Item = Option<FocusHandle>>,
+        keep_anchor: bool,
     ) {
         let state = &mut *self.0.borrow_mut();
 
@@ -394,8 +417,18 @@ impl ListState {
         }) = state.logical_scroll_top.as_mut()
         {
             if old_range.contains(item_ix) {
-                *item_ix = old_range.start;
-                *offset_in_item = px(0.);
+                if keep_anchor && spliced_count > 0 {
+                    // Same-position re-plan: the row index still names a row in
+                    // the replacement, so stay on it instead of jumping to the
+                    // start of the replaced range.
+                    if *item_ix >= old_range.start + spliced_count {
+                        *item_ix = old_range.start + spliced_count - 1;
+                        *offset_in_item = px(0.);
+                    }
+                } else {
+                    *item_ix = old_range.start;
+                    *offset_in_item = px(0.);
+                }
             } else if old_range.end <= *item_ix {
                 *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
             }
@@ -605,6 +638,32 @@ impl ListState {
             }
         }
         (count > 0).then(|| total / count as f32)
+    }
+
+    /// `(measured_row_count, median_height)` over the rows that have actually
+    /// been measured.
+    ///
+    /// The transcript's row heights are bimodal: folded turn headers are tens
+    /// of pixels, while a chunk of an expanded turn can exceed a thousand.
+    /// The arithmetic mean is dominated by whichever giant row happens to be
+    /// measured, so re-seeding every unmeasured row with it can inflate the
+    /// scroll range by an order of magnitude. The median ignores that tail and
+    /// is what a "typical row" estimate wants; the count lets callers refuse to
+    /// extrapolate from two painted rows.
+    pub fn measured_median_height(&self) -> Option<(usize, Pixels)> {
+        let state = self.0.borrow();
+        let mut cursor = state.items.cursor::<Count>(());
+        let mut heights = Vec::new();
+        for item in cursor.by_ref() {
+            if let ListItem::Measured { size, .. } = item {
+                heights.push(size.height);
+            }
+        }
+        if heights.is_empty() {
+            return None;
+        }
+        heights.sort_by(|left, right| f32::from(*left).total_cmp(&f32::from(*right)));
+        Some((heights.len(), heights[heights.len() / 2]))
     }
 
     /// Re-seed the estimate of every row that has never been measured, keeping

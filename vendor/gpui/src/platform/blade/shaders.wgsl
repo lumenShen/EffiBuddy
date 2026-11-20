@@ -1294,3 +1294,91 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// ---------------------------------------------------------------------------
+// Backdrop filter (EffiBuddy addition).
+//
+// Two offscreen passes blur a snapshot of the framebuffer at quarter
+// resolution, then `fs_backdrop` composites the blurred result through the
+// element's tint and corner radii. `fs_backdrop` reuses `vs_quad` and the same
+// instance layout as ordinary quads, so clipping and rounded corners behave
+// exactly like a normal element background.
+// ---------------------------------------------------------------------------
+
+struct BackdropParams {
+    /// Fragment position (framebuffer pixels) -> texture uv.
+    uv_scale: vec2<f32>,
+    /// Clamp window, in uv, so bilinear taps never leave the captured region.
+    uv_min: vec2<f32>,
+    uv_max: vec2<f32>,
+    pad: vec2<f32>,
+}
+
+struct BlurParams {
+    uv_scale: vec2<f32>,
+    tap_step: vec2<f32>,
+    uv_min: vec2<f32>,
+    uv_max: vec2<f32>,
+    /// Nine Gaussian weights, padded to twelve for uniform alignment.
+    weights: array<vec4<f32>, 3>,
+}
+
+var<uniform> backdrop: BackdropParams;
+var<uniform> blur: BlurParams;
+var t_backdrop: texture_2d<f32>;
+var s_backdrop: sampler;
+var t_blur_source: texture_2d<f32>;
+var s_blur_source: sampler;
+
+struct BlurVarying {
+    @builtin(position) position: vec4<f32>,
+}
+
+@vertex
+fn vs_fullscreen(@builtin(vertex_index) vertex_id: u32) -> BlurVarying {
+    var out = BlurVarying();
+    // Oversized triangle: (0,0) (2,0) (0,2) in uv space covers the whole
+    // viewport, unlike a (0,0) (1,0) (0,1) triangle that only covers half.
+    let uv = vec2<f32>(f32((vertex_id << 1u) & 2u), f32(vertex_id & 2u));
+    out.position = vec4<f32>(uv * 2.0 - 1.0, 0.0, 1.0);
+    return out;
+}
+
+@fragment
+fn fs_blur(input: BlurVarying) -> @location(0) vec4<f32> {
+    let uv = input.position.xy * blur.uv_scale;
+    var color = vec4<f32>(0.0);
+    for (var i = 0u; i < 9u; i = i + 1u) {
+        let tap = f32(i) - 4.0;
+        let sample_uv = clamp(uv + blur.tap_step * tap, blur.uv_min, blur.uv_max);
+        color = color + textureSampleLevel(t_blur_source, s_blur_source, sample_uv, 0.0)
+            * blur.weights[i / 4u][i % 4u];
+    }
+    return color;
+}
+
+@fragment
+fn fs_backdrop(input: QuadVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+
+    let quad = b_quads[input.quad_id];
+    let uv = clamp(input.position.xy * backdrop.uv_scale, backdrop.uv_min, backdrop.uv_max);
+    let blurred = textureSampleLevel(t_backdrop, s_backdrop, uv, 0.0);
+    let tint = hsla_to_rgba(quad.background.solid);
+    let color = over(blurred, tint);
+
+    // Rounded-rect coverage only: borders stay a separate quad.
+    let half_size = quad.bounds.size * 0.5;
+    let center_to_point = (input.position.xy - quad.bounds.origin) - half_size;
+    let corner_to_point = abs(center_to_point) - half_size;
+    let radius = pick_corner_radius(center_to_point, quad.corner_radii);
+    let corner_center_to_point = corner_to_point + radius;
+    let outer_sdf = select(
+        max(corner_to_point.x, corner_to_point.y),
+        quad_sdf_impl(corner_center_to_point, radius),
+        radius > 0.0,
+    );
+    return blend_color(color, saturate(0.5 - outer_sdf));
+}

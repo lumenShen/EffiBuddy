@@ -17,6 +17,7 @@
 - **PTC 工具编排**：模型写一段同步 JavaScript，通过 `tools.*` 一次编排多次工具调用，只把聚合结果带回上下文。
 - **子代理与智能体组**：代理可命名、可通信、可派生；DAG 工作流带类型化输入输出，关系图可平移缩放。
 - **Computer Use**：截图、找窗口、模拟键鼠；与其它工具共用权限矩阵，顶部悬浮条可随时接管或停止。
+- **毛玻璃面板**：[`crates/backdrop`](crates/backdrop) 按 CSS `backdrop-filter` 的语义模糊、调色并裁圆角，CPU / Vulkan Compute 双后端逐像素一致；设计系统侧由 `effibuddy_ui::glass` 提供预设（见 [`docs/BACKDROP_FILTER.md`](docs/BACKDROP_FILTER.md)）。
 - **本地优先**：会话、检查点、模型注册表都留在本机；11 家预置供应商、三种流式协议。
 
 ## 快速开始
@@ -150,6 +151,16 @@ crates/
 
 依赖方向：`app → agent-tools → agent-js`，`app / agent-tools → agent-core`，`app → ui`。
 
+各 crate 的 Rust 源码规模（`.rs` 文件数，不含 `target/`，共 153 个）：
+
+| crate | 文件数 | crate | 文件数 |
+| --- | --- | --- | --- |
+| `app` | 51 | `browser-use` | 13 |
+| `agent-core` | 27 | `computer-use` | 12 |
+| `agent-tools` | 21 | `backdrop` | 10 |
+| `ui` | 14 | `mobile` | 3 |
+| `agent-js` | 1 | `stress` | 1 |
+
 ## 开发
 
 ```bash
@@ -166,6 +177,7 @@ cargo build --workspace
 - [Computer Use 与平台矩阵](docs/COMPUTER_USE.md)
 - [发布与更新](docs/RELEASING.md)
 - [压测实验室](docs/STRESS_LAB.md)
+- [毛玻璃背景滤镜（backdrop-filter）](docs/BACKDROP_FILTER.md)
 - [ZCode 学习笔记与移植清单](docs/ZCODE_NOTES.md)
 - [环境变量示例](.env.example)
 
@@ -176,7 +188,7 @@ cargo build --workspace
 - 写文件、改文件、shell、电脑操作与浏览器操作默认需要显式批准；审批超时按拒绝处理。
 - Wayland 仅支持全屏读图/输入；macOS 发布包未签名，且暂不支持 Computer Use。
 - 默认 DeepSeek 模型不支持视觉输入，使用 Computer Use 截图前需要切换到支持图片的模型。
-- 项目仍在早期（0.2.15），接口与数据格式可能变化。
+- 项目仍在早期（0.2.16），接口与数据格式可能变化。
 
 ## 许可证
 

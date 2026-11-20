@@ -8,6 +8,7 @@ pub mod accent;
 pub mod assets;
 pub mod button;
 pub mod clipboard_paths;
+pub mod glass;
 pub mod markdown;
 pub mod motion;
 pub mod primitives;
